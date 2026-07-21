@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+
+# 模型资产（体积大，不进版本控制，由本地拷贝或下载脚本获取）
+assets/models/
+
+# 本地工具与变更记录
+.zcode/
+.ai_docs/
+logs/
+*.log
