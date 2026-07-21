@@ -1,0 +1,465 @@
+"""ApplicationController 单元测试（fake asr / recorder / backend / paste_func）。
+
+测试目标 (AGENTS.md 5.1 / 5.2 / 5.4 / 13.1)：
+- 完整流水线 dictate_zh：press -> release -> worker -> on_text_ready(text, True) -> IDLE。
+- dictate_en 翻译：用任务创建时的 profile 快照（运行时切换不影响进行中任务）。
+- 处理期间拒绝新任务（RECORDING 中再 press -> recorder.start 只调一次）。
+- 录音中禁用：discard + DISABLED + 无粘贴。
+- 推理中禁用：阻塞 transcribe -> toggle -> 释放 -> 不粘贴、无 on_text_ready。
+- 推理中取消（Esc）：不粘贴、状态最终 IDLE。
+- 禁用状态按 dictate：不录音。
+- DISABLED 时 toggle 可恢复 -> IDLE + enabled=True。
+- 空录音：直接回 IDLE，asr.transcribe 未被调用。
+- 粘贴失败：paste_func 返回 False -> on_text_ready(text, False)。
+- worker 异常：asr.transcribe raise -> ERROR + on_error。
+- dictate_en 无活动 profile 时不录音。
+
+worker 是后台线程，测试用 threading.Event 等待回调（超时 5s）。
+本文件不依赖任何外部资源。
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable
+
+import numpy as np
+import pytest
+
+from dictashift.core.controller import ApplicationController, ControllerCallbacks
+from dictashift.core.state import AppState
+from dictashift.translation import TranslationProfile
+
+
+# ==================== Fakes ====================
+
+
+@dataclass
+class FakeTranscriptionResult:
+    """模拟 asr.sensevoice_onnx.TranscriptionResult 的最小接口（含 .text）。"""
+
+    text: str = ""
+
+
+class FakeAsrService:
+    """记录调用、可控制 transcribe 阻塞与异常的 fake ASR 服务。"""
+
+    def __init__(
+        self,
+        text: str = "你好世界",
+        raise_on_transcribe: Exception | None = None,
+        block_event: threading.Event | None = None,
+    ) -> None:
+        self._text = text
+        self._raise = raise_on_transcribe
+        self._block = block_event
+        self.transcribe_calls: list[dict] = []
+        self.switch_device_calls: list[tuple] = []
+
+    def transcribe(self, audio: np.ndarray, lid: str = "auto", itn: bool = True):
+        self.transcribe_calls.append(
+            {"audio_len": len(audio) if audio is not None else 0, "lid": lid, "itn": itn}
+        )
+        if self._block is not None:
+            self._block.wait(timeout=5.0)
+        if self._raise is not None:
+            raise self._raise
+        return FakeTranscriptionResult(text=self._text)
+
+    def switch_device(self, device, device_id: int = 0) -> None:
+        self.switch_device_calls.append((device, device_id))
+
+
+class FakeRecorder:
+    """记录 start/stop/discard、可控 stop 返回内容的 fake 录音器。"""
+
+    def __init__(self, stop_audio: np.ndarray | None = None) -> None:
+        self._stop_audio = (
+            stop_audio if stop_audio is not None else np.ones(1600, dtype=np.float32)
+        )
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.discard_calls = 0
+
+    def start(self) -> None:
+        self.start_calls += 1
+
+    def stop(self) -> np.ndarray:
+        self.stop_calls += 1
+        return self._stop_audio
+
+    def discard(self) -> None:
+        self.discard_calls += 1
+
+
+class FakeTranslationBackend:
+    """记录 translate 调用与所用 profile 的 fake 翻译后端。"""
+
+    def __init__(self, result: str = "hello world") -> None:
+        self._result = result
+        self.translate_calls: list[tuple[str, TranslationProfile]] = []
+
+    def translate_stream(self, text: str, profile: TranslationProfile):
+        # 实现生成器接口，但控制器走 translate() 便捷方法（拼接）。
+        yield from self.translate(text, profile)
+
+    def translate(self, text: str, profile: TranslationProfile) -> str:
+        self.translate_calls.append((text, profile))
+        return self._result
+
+
+@dataclass
+class RecordedCallbacks:
+    """收集控制器回调的简单容器。"""
+
+    states: list[AppState] = field(default_factory=list)
+    texts: list[tuple[str, bool]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    enabled: list[bool] = field(default_factory=list)
+    # 用于跨线程等待的事件
+    state_event: threading.Event = field(default_factory=threading.Event)
+    text_event: threading.Event = field(default_factory=threading.Event)
+    error_event: threading.Event = field(default_factory=threading.Event)
+
+    def as_callbacks(self) -> ControllerCallbacks:
+        def _on_state(s: AppState) -> None:
+            self.states.append(s)
+            self.state_event.set()
+
+        def _on_text(text: str, pasted: bool) -> None:
+            self.texts.append((text, pasted))
+            self.text_event.set()
+
+        def _on_error(msg: str) -> None:
+            self.errors.append(msg)
+            self.error_event.set()
+
+        def _on_enabled(en: bool) -> None:
+            self.enabled.append(en)
+
+        return ControllerCallbacks(
+            on_state_changed=_on_state,
+            on_text_ready=_on_text,
+            on_error=_on_error,
+            on_enabled_changed=_on_enabled,
+        )
+
+
+def _make_controller(
+    asr: FakeAsrService | None = None,
+    recorder: FakeRecorder | None = None,
+    backend: FakeTranslationBackend | None = None,
+    paste_func: Callable[[str], bool] | None = None,
+    callbacks: RecordedCallbacks | None = None,
+) -> tuple[ApplicationController, RecordedCallbacks, FakeAsrService, FakeRecorder, FakeTranslationBackend]:
+    asr = asr or FakeAsrService()
+    recorder = recorder or FakeRecorder()
+    backend = backend or FakeTranslationBackend()
+    cb = callbacks or RecordedCallbacks()
+    ctrl = ApplicationController(
+        asr_service=asr,
+        recorder=recorder,
+        translation_backend=backend,
+        paste_func=paste_func if paste_func is not None else (lambda t: True),
+        callbacks=cb.as_callbacks(),
+    )
+    ctrl.start(enabled=True)
+    return ctrl, cb, asr, recorder, backend
+
+
+def _wait(event: threading.Event, timeout: float = 5.0) -> bool:
+    """等待事件，避免挂死。"""
+    return event.wait(timeout=timeout)
+
+
+# ==================== 完整流水线 dictate_zh ====================
+
+
+def test_dictate_zh_full_pipeline() -> None:
+    """press -> release -> worker -> on_text_ready(text, True) -> IDLE。"""
+    ctrl, cb, asr, recorder, _ = _make_controller()
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.RECORDING
+    assert recorder.start_calls == 1
+
+    cb.state_event.clear()
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+
+    # 等待 worker 完成（最终回 IDLE，并产出文本）
+    assert _wait(cb.text_event)
+    assert _wait(cb.state_event)
+    # 最终状态应为 IDLE
+    _wait_for_state(cb, AppState.IDLE)
+
+    assert recorder.stop_calls == 1
+    assert len(asr.transcribe_calls) == 1
+    # lid 应为 zh
+    assert asr.transcribe_calls[0]["lid"] == "zh"
+    assert cb.texts == [("你好世界", True)]
+    assert ctrl.state == AppState.IDLE
+
+
+def _wait_for_state(cb: RecordedCallbacks, target: AppState, timeout: float = 5.0) -> None:
+    """轮询回调状态列表，直到出现 target 或超时。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if target in cb.states:
+            return
+        cb.state_event.clear()
+        cb.state_event.wait(timeout=0.05)
+    assert target in cb.states, f"未在 {timeout}s 内观测到状态 {target}；states={cb.states}"
+
+
+# ==================== dictate_en 翻译 + 快照语义 ====================
+
+
+_PROFILE_OLD = TranslationProfile(
+    name="old", base_url="http://old/v1", model="m-old", api_key=None, temperature=0.3
+)
+_PROFILE_NEW = TranslationProfile(
+    name="new", base_url="http://new/v1", model="m-new", api_key=None, temperature=0.3
+)
+
+
+def test_dictate_en_uses_snapshot_profile() -> None:
+    """任务进行中切换 profile，worker 仍收到任务创建时的快照。"""
+    ctrl, cb, asr, recorder, backend = _make_controller()
+    ctrl.set_translation_profiles([_PROFILE_OLD], active_name="old")
+
+    ctrl.handle_hotkey_press("dictate_en")
+    assert ctrl.state == AppState.RECORDING
+    assert recorder.start_calls == 1
+
+    # 任务进行中切换到新 profile（任务已创建，快照已冻结）
+    ctrl.set_translation_profiles([_PROFILE_NEW], active_name="new")
+
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_en")
+
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+
+    # 翻译被调用，且用的是旧 profile 快照
+    assert len(backend.translate_calls) == 1
+    _text, used_profile = backend.translate_calls[0]
+    assert used_profile.name == "old"
+    assert used_profile.base_url == "http://old/v1"
+    assert used_profile.model == "m-old"
+    # lid 应为 auto
+    assert asr.transcribe_calls[0]["lid"] == "auto"
+    # 译文被作为最终文本输出
+    assert cb.texts == [("hello world", True)]
+
+
+# ==================== 处理期间拒绝新任务 ====================
+
+
+def test_new_task_rejected_while_recording() -> None:
+    """RECORDING 中再 press dictate_en -> recorder.start 只被调用一次。"""
+    ctrl, cb, asr, recorder, _ = _make_controller()
+    ctrl.set_translation_profiles([_PROFILE_OLD], active_name="old")
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.RECORDING
+    assert recorder.start_calls == 1
+
+    # 在 RECORDING 中再按 dictate_en，应被拒绝
+    ctrl.handle_hotkey_press("dictate_en")
+    assert recorder.start_calls == 1  # 仍未再次 start
+    assert ctrl.state == AppState.RECORDING
+
+    # 清理：松开原 zh 任务
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+
+
+# ==================== 录音中禁用 ====================
+
+
+def test_disable_while_recording_discards_no_paste() -> None:
+    """RECORDING 时 toggle -> discard + DISABLED + 后续无粘贴。"""
+    paste_calls: list[str] = []
+    ctrl, cb, asr, recorder, _ = _make_controller(
+        paste_func=lambda t: paste_calls.append(t) or True
+    )
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.RECORDING
+
+    ctrl.handle_hotkey_press("toggle_enabled")
+    assert recorder.discard_calls == 1
+    assert ctrl.state == AppState.DISABLED
+    assert ctrl.enabled is False
+
+    # 等待一小段时间确认没有 worker / paste
+    time.sleep(0.2)
+    assert paste_calls == []
+    assert cb.texts == []
+    assert asr.transcribe_calls == []
+
+
+# ==================== 推理中禁用 ====================
+
+
+def test_disable_while_transcribing_no_paste() -> None:
+    """推理中禁用：transcribe 阻塞 -> toggle -> 释放 -> 不粘贴、无 on_text_ready。"""
+    block = threading.Event()
+    paste_calls: list[str] = []
+    asr = FakeAsrService(text="some text", block_event=block)
+    ctrl, cb, _asr, recorder, _ = _make_controller(
+        asr=asr, paste_func=lambda t: paste_calls.append(t) or True
+    )
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+    # 等 worker 进入 TRANSCRIBING
+    _wait_for_state(cb, AppState.TRANSCRIBING)
+
+    # 推理中禁用
+    ctrl.handle_hotkey_press("toggle_enabled")
+    assert ctrl.enabled is False
+
+    # 释放 transcribe，让 worker 继续
+    block.set()
+
+    # 等待 worker 结束
+    _wait_for_state(cb, AppState.DISABLED, timeout=5.0)
+    time.sleep(0.2)
+
+    # 关键断言：不粘贴、无 on_text_ready
+    assert paste_calls == []
+    assert cb.texts == []
+
+
+# ==================== 推理中取消（Esc）====================
+
+
+def test_cancel_while_transcribing_no_paste_idle() -> None:
+    """推理中 cancel -> 不粘贴、状态最终 IDLE。"""
+    block = threading.Event()
+    paste_calls: list[str] = []
+    asr = FakeAsrService(text="some text", block_event=block)
+    ctrl, cb, _asr, recorder, _ = _make_controller(
+        asr=asr, paste_func=lambda t: paste_calls.append(t) or True
+    )
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+    _wait_for_state(cb, AppState.TRANSCRIBING)
+
+    ctrl.handle_hotkey_press("cancel")
+
+    # 释放 transcribe
+    block.set()
+
+    # 最终状态应为 IDLE
+    _wait_for_state(cb, AppState.IDLE, timeout=5.0)
+    time.sleep(0.2)
+
+    assert paste_calls == []
+    assert cb.texts == []
+
+
+# ==================== 禁用状态按 dictate ====================
+
+
+def test_dictate_in_disabled_does_not_record() -> None:
+    """DISABLED 时 press dictate_zh -> recorder.start 未被调用。"""
+    ctrl, cb, asr, recorder, _ = _make_controller()
+    ctrl.handle_hotkey_press("toggle_enabled")
+    assert ctrl.state == AppState.DISABLED
+    assert ctrl.enabled is False
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert recorder.start_calls == 0
+    assert ctrl.state == AppState.DISABLED
+
+
+# ==================== DISABLED 时 toggle 恢复 ====================
+
+
+def test_toggle_recovers_from_disabled() -> None:
+    """DISABLED -> toggle -> IDLE 且 enabled=True。"""
+    ctrl, cb, asr, recorder, _ = _make_controller()
+    ctrl.handle_hotkey_press("toggle_enabled")
+    assert ctrl.state == AppState.DISABLED
+    assert ctrl.enabled is False
+
+    ctrl.handle_hotkey_press("toggle_enabled")
+    assert ctrl.state == AppState.IDLE
+    assert ctrl.enabled is True
+
+
+# ==================== 空录音 ====================
+
+
+def test_empty_recording_returns_to_idle_no_transcribe() -> None:
+    """recorder.stop 返回空 np 数组 -> 直接回 IDLE，asr.transcribe 未被调用。"""
+    empty_recorder = FakeRecorder(stop_audio=np.empty(0, dtype=np.float32))
+    ctrl, cb, asr, recorder, _ = _make_controller(recorder=empty_recorder)
+
+    cb.state_event.clear()
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.RECORDING
+
+    ctrl.handle_hotkey_release("dictate_zh")
+    # 空录音应快速回 IDLE，不进入流水线
+    _wait(cb.state_event)
+    assert ctrl.state == AppState.IDLE
+    assert asr.transcribe_calls == []
+    assert cb.texts == []
+
+
+# ==================== 粘贴失败 ====================
+
+
+def test_paste_failure_reports_not_pasted() -> None:
+    """paste_func 返回 False -> on_text_ready(text, False)。"""
+    ctrl, cb, asr, recorder, _ = _make_controller(paste_func=lambda t: False)
+
+    cb.text_event.clear()
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+    assert cb.texts == [("你好世界", False)]
+
+
+# ==================== worker 异常 ====================
+
+
+def test_worker_exception_goes_to_error() -> None:
+    """asr.transcribe raise -> 状态 ERROR + on_error 被调用。"""
+    asr = FakeAsrService(raise_on_transcribe=RuntimeError("boom"))
+    ctrl, cb, _asr, recorder, _ = _make_controller(asr=asr)
+
+    cb.error_event.clear()
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+
+    assert _wait(cb.error_event)
+    _wait_for_state(cb, AppState.ERROR)
+    assert ctrl.state == AppState.ERROR
+    assert len(cb.errors) == 1
+    # 错误消息脱敏：不含敏感长串（这里只是类型名+消息）
+    assert "boom" in cb.errors[0] or "RuntimeError" in cb.errors[0]
+
+
+# ==================== dictate_en 无活动 profile ====================
+
+
+def test_dictate_en_without_active_profile_does_not_record() -> None:
+    """dictate_en 无活动 profile 时 press -> 不录音。"""
+    ctrl, cb, asr, recorder, _ = _make_controller()
+    # 不设置任何 profile，active 为空
+
+    ctrl.handle_hotkey_press("dictate_en")
+    assert recorder.start_calls == 0
+    assert ctrl.state == AppState.IDLE
