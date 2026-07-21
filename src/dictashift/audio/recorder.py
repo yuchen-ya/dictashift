@@ -140,7 +140,11 @@ class AudioRecorder:
         """
         try:
             # 必须 copy()：indata 是 sounddevice 复用的内部缓冲，回调返回后会被覆盖。
-            self._frames.append(indata.copy())
+            # 用局部引用抓取当前缓冲列表：若 stop()/discard() 恰好在此刻换走了
+            # self._frames，本帧会落入已被丢弃的旧列表（即"停止后的尾帧被丢弃"），
+            # 而不会污染新一次录音的缓冲。
+            buf = self._frames
+            buf.append(indata.copy())
             self._samples_recorded += int(frames)
 
             # 自动停止判定：累计采样数达到上限即通知上层。

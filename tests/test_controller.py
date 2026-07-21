@@ -337,6 +337,36 @@ def test_disable_while_transcribing_no_paste() -> None:
     assert cb.texts == []
 
 
+def test_disable_while_inserting_no_paste() -> None:
+    """INSERTING 窗口禁用：进入 INSERTING 后、执行粘贴前 toggle -> 不粘贴。"""
+    paste_calls: list[str] = []
+    asr = FakeAsrService(text="some text")
+    ctrl, cb, _asr, recorder, _ = _make_controller(
+        asr=asr, paste_func=lambda t: paste_calls.append(t) or True
+    )
+
+    # 在进入 INSERTING 的瞬间（worker 线程内）触发禁用，
+    # 精确命中「进入 INSERTING -> 执行粘贴」之间的窗口。
+    original_goto_safe = ctrl._goto_safe
+
+    def goto_safe_with_toggle(target: AppState) -> None:
+        original_goto_safe(target)
+        if target == AppState.INSERTING:
+            ctrl.handle_hotkey_press("toggle_enabled")
+
+    ctrl._goto_safe = goto_safe_with_toggle
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+
+    _wait_for_state(cb, AppState.DISABLED, timeout=5.0)
+    time.sleep(0.2)
+
+    assert ctrl.enabled is False
+    assert paste_calls == []
+    assert cb.texts == []
+
+
 # ==================== 推理中取消（Esc）====================
 
 

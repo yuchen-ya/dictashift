@@ -276,27 +276,24 @@ class DictaShiftApplication:
     def _on_auto_stop(self) -> None:
         """recorder 达到最长录音时回调（PortAudio 线程）。
 
-        只做最小工作：把结束事件转交主线程，避免在音频线程回调 controller。
-        用一次性 QTimer.singleShot 投递到主线程。
+        只做最小工作：把结束事件转交一个一次性后台线程执行。
+        注意不能投递到 UI 主线程——handle_hotkey_release 会同步调用
+        recorder.stop()（PortAudio 关流是阻塞调用），主线程执行会违反
+        AGENTS.md 11「UI 主线程不做阻塞等待」。controller 的回调经
+        _bridge 的 QueuedConnection 回主线程，因此后台线程调用是安全的。
         """
-        # 直接调用 controller.handle_hotkey_release 是安全的——controller 内部
-        # 用锁保护，且 recorder.stop 在 worker 线程路径执行；但为遵守「音频回调
-        # 不做阻塞工作」的铁律，这里仍通过 QMetaObject 投递到主线程，
-        # 由主线程触发 release。
         action = self._current_action
         if action is None:
             return
-        # 用 QApplication.instance().postEvent 风格不如直接用信号；这里复用
-        # 一个临时 queued 调用：借助 _bridge 没有合适 signal，直接通过
-        # QTimer.singleShot(0, ...) 把回调投到主线程。
-        from PySide6.QtCore import QTimer
 
-        def _release_in_main() -> None:
+        def _release_in_worker() -> None:
             with self._action_lock:
                 self._current_action = None
             self._controller.handle_hotkey_release(action)
 
-        QTimer.singleShot(0, _release_in_main)
+        threading.Thread(
+            target=_release_in_worker, name="dictashift-auto-stop", daemon=True
+        ).start()
 
     # ==================== 托盘槽 ====================
 
@@ -338,29 +335,20 @@ class DictaShiftApplication:
         # overlay 显隐
         self._overlay.set_visible_enabled(self.settings.ui.show_overlay)
 
-        # ASR 设备变化：后台 switch
+        # ASR 设备变化：后台 switch，完成后经 on_done 刷新实际设备标签
         if old_device != new_device or old_device_id != new_device_id:
             self._settings_window.set_recheck_loading(True)
             self._controller.switch_asr_device(
-                AsrDevice(new_device), device_id=int(new_device_id)
+                AsrDevice(new_device),
+                device_id=int(new_device_id),
+                on_done=self._on_asr_switch_done,
             )
-            # switch_asr_device 内部失败经 on_error 上报；完成后 UI 标签更新
-            # 依赖 asr_ready 信号——switch 不发 asr_ready，这里在切换线程里
-            # 完成后手动 emit。为简化，复用 _start_asr_init_thread 不合适
-            # （它调 initialize 会再建一次）。改用一个轻量后台线程 + asr_ready。
-            self._emit_asr_ready_after_switch()
 
-    def _emit_asr_ready_after_switch(self) -> None:
-        """switch_asr_device 完成后 emit asr_ready 刷新实际设备标签。
+    def _on_asr_switch_done(self, success: bool) -> None:
+        """controller.switch_asr_device 完成后回调（切换线程内）。
 
-        controller.switch_asr_device 已是后台线程，但它不通知完成。这里启动
-        一个额外线程等待片刻并 emit；actual_device 在 switch 成功后即已更新，
-        emit 后 UI 读取最新值即可。保守做法：直接 emit（switch 已在后台启动，
-        实际设备会在其完成后更新；UI 下次 on_error/asr_ready 时同步）。
-
-        为了及时反映，启动一个轻量线程 join 等待并不现实（switch 线程未暴露）。
-        折中：直接 emit 当前 actual_device；若 switch 仍在进行，标签会随后续
-        on_error 触发时被覆盖。可接受。
+        emit asr_ready（QueuedConnection 回主线程）刷新"实际运行设备"标签；
+        失败时 on_error 已另行上报，这里仍刷新标签以显示保留的旧设备。
         """
         self._bridge.asr_ready.emit()
 

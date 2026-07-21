@@ -81,7 +81,12 @@ class ASRService:
             providers=providers,
         )
         engine = SenseVoiceInference(config)
-        engine.warmup()
+        try:
+            engine.warmup()
+        except Exception:
+            # warmup 失败时显式释放已创建的 Session（CUDA 显存不能依赖 GC 延迟回收）。
+            engine.release()
+            raise
         return engine
 
     def _resolve_auto(self, device_id: int) -> tuple[SenseVoiceInference, AsrDevice, list]:

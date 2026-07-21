@@ -292,15 +292,20 @@ class ApplicationController:
                 self._force_state(AppState.IDLE)
             self._fire_enabled_changed(True)
         else:
-            # 禁用：录音中 discard；推理中设置标记（任务自然结束但不粘贴）。
+            # 禁用：录音中 discard；推理/插入中设置标记（任务自然结束但不粘贴）。
+            # 读状态 + 决策在同一个临界区内完成，避免 check-then-act 竞态。
             with self._lock:
                 self._enabled = False
-                if current_state in (AppState.TRANSCRIBING, AppState.TRANSLATING):
-                    # 推理中：不打断，标记任务结束后不得粘贴。
+                current_state = self._sm.state
+                if current_state in (
+                    AppState.RECORDING,
+                    AppState.TRANSCRIBING,
+                    AppState.TRANSLATING,
+                    AppState.INSERTING,
+                ):
+                    # RECORDING 也置标记作为竞态安全网：若 release 恰好在本决策
+                    # 之后抢先启动了 worker，worker 仍会被抑制，不会粘贴。
                     self._disabled_mid_task = True
-                elif current_state == AppState.RECORDING:
-                    # 录音中：稍后 discard 并迁移。
-                    pass
             if current_state == AppState.RECORDING:
                 try:
                     self._recorder.discard()
@@ -311,13 +316,9 @@ class ApplicationController:
                 # RECORDING -> DISABLED 合法。
                 self._goto(AppState.DISABLED)
             elif current_state in (AppState.TRANSCRIBING, AppState.TRANSLATING, AppState.INSERTING):
-                # 推理/插入中：让任务自然结束。状态先不迁移（worker 结束时
-                # 检查 _disabled_mid_task 决定是否 force 到 DISABLED）。
-                # 但为了对外反映禁用语义，这里仍然把状态迁到 DISABLED。
-                # 注意：worker 内部后续的状态迁移会因此变得非法，
-                # 故 worker 在结束时用 force 兜底。这里用 force 立即反映禁用。
-                with self._lock:
-                    self._enabled = False
+                # 推理/插入中：让任务自然结束（_disabled_mid_task 已置位，
+                # worker 结束时跳过粘贴）。状态立即 force 到 DISABLED 以对外
+                # 反映禁用语义；worker 后续迁移用 force 兜底。
                 self._force_state(AppState.DISABLED)
             elif current_state == AppState.IDLE:
                 # IDLE -> DISABLED 合法。
@@ -427,6 +428,11 @@ class ApplicationController:
                 self._finish_suppressed()
                 return
 
+            # 粘贴前最后检查：覆盖进入 INSERTING 到执行粘贴之间的禁用窗口。
+            if self._should_suppress_output():
+                self._finish_suppressed()
+                return
+
             pasted = self._paste(text)
             # 粘贴成功与否都通过 on_text_ready 通知；pasted=False 表示剪贴板已保留。
             self._fire_text_ready(text, bool(pasted))
@@ -460,17 +466,30 @@ class ApplicationController:
 
     # ==================== ASR 设备切换 ====================
 
-    def switch_asr_device(self, device: AsrDevice, device_id: int = 0) -> None:
+    def switch_asr_device(
+        self,
+        device: AsrDevice,
+        device_id: int = 0,
+        on_done: Callable[[bool], None] | None = None,
+    ) -> None:
         """在新线程中切换 ASR 设备，完成后通过 on_error 报告失败。
 
-        不阻塞调用方（hotkey / UI 线程）。
+        不阻塞调用方（hotkey / UI 线程）。on_done(success) 在切换结束后调用
+        （无论成败），供 UI 刷新"实际运行设备"显示。
         """
         def _worker() -> None:
+            success = False
             try:
                 self._asr.switch_device(device, device_id=device_id)
+                success = True
             except Exception as e:  # noqa: BLE001
                 logger.exception("[ApplicationController] ASR 设备切换失败")
                 self._report_error(self._safe_error_message(e))
+            if on_done is not None:
+                try:
+                    on_done(success)
+                except Exception:  # noqa: BLE001
+                    logger.exception("[ApplicationController] switch_asr_device on_done 回调异常")
 
         t = threading.Thread(
             target=_worker, name="dictashift-asr-switch", daemon=True
