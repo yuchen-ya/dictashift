@@ -2,8 +2,8 @@
 
 职责 (AGENTS.md 5.1 / 5.3 / 5.5 / 11)：
 - 持有 QApplication、SettingsRepository、AppSettings、ASRService、AudioRecorder、
-  OpenAICompatibleBackend、ApplicationController、HotkeyService、TrayIcon、Overlay、
-  SettingsWindow。
+  DispatcherBackend、ApplicationController、HotkeyService、TrayIcon、Overlay、
+  SettingsWindow、ResultPopup。
 - ControllerCallbacks 在 worker/pynput 线程触发，必须用 Qt queued signal 桥接到
   主线程；本层用内部 _Bridge QObject 定义 signals，回调 emit 这些 signal，
   并以 Qt.QueuedConnection 连接到主线程槽。
@@ -27,9 +27,10 @@ from .core import ApplicationController, AppState, ControllerCallbacks
 from .hotkeys.matcher import HotkeyBinding, parse_hotkey
 from .hotkeys.service import HotkeyService
 from .output.typing import type_text_at_cursor
-from .settings import AppSettings, SettingsRepository, default_cloud_profile
-from .translation import OpenAICompatibleBackend, TranslationProfile
+from .settings import AppSettings, SettingsRepository
+from .translation import DispatcherBackend, TranslationProfile
 from .ui.overlay import StateOverlay
+from .ui.result_popup import ResultPopup
 from .ui.settings_window import SettingsWindow
 from .ui.tray import TrayIcon
 
@@ -86,7 +87,7 @@ class DictaShiftApplication:
 
         # ---- 服务（ASR 先不初始化，后台 initialize）----
         self._asr = ASRService()
-        self._backend = OpenAICompatibleBackend()
+        self._backend = DispatcherBackend()
         # recorder 的 on_auto_stop 在 PortAudio 线程触发；只做最小工作：
         # 触发 _on_auto_stop（通过 queued signal 转主线程，避免在音频线程回调 controller）。
         self._recorder = AudioRecorder(
@@ -125,6 +126,8 @@ class DictaShiftApplication:
         self._tray = TrayIcon()
         self._settings_window = SettingsWindow()
         self._settings_window.load_from_settings(self.settings)
+        # 直输失败的结果弹窗：主线程创建，经 queued signal 调用 show_result。
+        self._result_popup = ResultPopup()
 
         # ---- ASR 初始化/重检测/翻译测试 的线程引用（daemon，不 join）----
         self._asr_init_thread: threading.Thread | None = None
@@ -235,11 +238,12 @@ class DictaShiftApplication:
         self._overlay.set_state(state)
 
     def _on_text_ready(self, text: str, pasted: bool) -> None:
-        # pasted=False：剪贴板已保留但注入失败，提示用户手动粘贴 (AGENTS.md 5.5)。
-        if not pasted:
-            self._tray.show_message(
-                "DictaShift", "已复制到剪贴板，请手动 Ctrl+V 粘贴"
-            )
+        # pasted=True：直输成功，不打扰用户。
+        # pasted=False：直输失败（无聚焦控件或 UIPI 拦截），弹窗显示全文供用户
+        # 手动复制 (AGENTS.md 5.5：输出失败必须给可操作兜底，且不默认覆盖剪贴板)。
+        if pasted:
+            return
+        self._result_popup.show_result(text)
 
     def _on_error(self, message: str) -> None:
         self._tray.show_message("DictaShift", message)

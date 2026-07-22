@@ -46,6 +46,20 @@ _DEVICE_LABELS: list[tuple[str, AsrDevice]] = [
     ("CPU", AsrDevice.CPU),
 ]
 
+# 翻译服务类型 ComboBox 显示文案与 TranslationProfile.backend_type 的双向映射。
+# 顺序即 ComboBox addItem 顺序；第一项为默认。
+_BACKEND_TYPE_LABELS: list[tuple[str, str]] = [
+    ("OpenAI 兼容 API（云端/本地 llama-server）", "openai_compatible"),
+    ("Google 翻译（免费）", "google"),
+    ("Bing 翻译（免费）", "bing"),
+]
+
+# 免费服务默认配置名建议（保存为新配置时使用）。
+_DEFAULT_NAME_BY_BACKEND: dict[str, str] = {
+    "google": "Google 免费",
+    "bing": "Bing 免费",
+}
+
 
 class SettingsWindow(QWidget):
     """设置窗口。
@@ -196,6 +210,13 @@ class SettingsWindow(QWidget):
         self._name_edit = QLineEdit(page)
         form.addRow("配置名称：", self._name_edit)
 
+        # 服务类型：决定 base_url/model/api_key/temperature 的可用性。
+        self._backend_type_combo = QComboBox(page)
+        for _label, _value in _BACKEND_TYPE_LABELS:
+            self._backend_type_combo.addItem(_label, _value)
+        self._backend_type_combo.currentIndexChanged.connect(self._on_backend_type_changed)
+        form.addRow("服务类型：", self._backend_type_combo)
+
         self._base_url_edit = QLineEdit(page)
         self._base_url_edit.setPlaceholderText("https://api.openai.com/v1 或 http://127.0.0.1:19120/v1")
         form.addRow("Base URL：", self._base_url_edit)
@@ -345,17 +366,26 @@ class SettingsWindow(QWidget):
 
     def _on_test_conn_clicked(self) -> None:
         profile = self._profile_from_edit()
-        if not profile.base_url or not profile.model:
-            self._test_result_label.setText("请填写 Base URL 和模型")
-            return
+        if profile.backend_type == "openai_compatible":
+            if not profile.base_url or not profile.model:
+                self._test_result_label.setText("请填写 Base URL 和模型")
+                return
         self._test_conn_btn.setEnabled(False)
         self._test_conn_btn.setText("测试中…")
         self._test_result_label.setText("测试中…")
         self.test_connection_requested.emit(profile)
 
     def _on_save_new_clicked(self) -> None:
-        """把当前编辑区内容保存为一个新配置（追加到 profiles）。"""
-        profile = self._profile_from_edit()
+        """把当前编辑区内容保存为一个新配置（追加到 profiles）。
+
+        免费服务且配置名为空时，使用建议默认名（"Google 免费"/"Bing 免费"）。
+        """
+        backend_type = self._current_backend_type()
+        name = self._name_edit.text().strip()
+        if not name and backend_type in _DEFAULT_NAME_BY_BACKEND:
+            name = _DEFAULT_NAME_BY_BACKEND[backend_type]
+            self._name_edit.setText(name)
+        profile = self._profile_from_edit(name=name)
         if not profile.name.strip():
             self._test_result_label.setText("请填写配置名称")
             return
@@ -411,20 +441,41 @@ class SettingsWindow(QWidget):
 
     def _load_profile_to_edit(self, profile: TranslationProfile) -> None:
         self._name_edit.setText(profile.name)
+        # backend_type 兜底：旧配置无该字段时按 openai_compatible 回填。
+        self._select_backend_type(profile.backend_type or "openai_compatible")
         self._base_url_edit.setText(profile.base_url)
         self._model_edit.setText(profile.model)
         self._api_key_edit.setText(profile.api_key or "")
         self._temperature_spin.setValue(float(profile.temperature))
+        self._apply_backend_field_state()
 
     def _clear_edit(self) -> None:
         self._name_edit.clear()
+        self._select_backend_type("openai_compatible")
         self._base_url_edit.clear()
         self._model_edit.clear()
         self._api_key_edit.clear()
         self._temperature_spin.setValue(0.3)
+        self._apply_backend_field_state()
 
     def _profile_from_edit(self, name: str | None = None) -> TranslationProfile:
-        """从编辑区控件构造 TranslationProfile。"""
+        """从编辑区控件构造 TranslationProfile。
+
+        免费服务（google/bing）时 base_url/model/api_key 存空串/None，
+        temperature 保持默认 0.3（免费服务不支持该参数）。
+        """
+        backend_type = self._current_backend_type()
+        is_free = backend_type in ("google", "bing")
+        if is_free:
+            return TranslationProfile(
+                name=(name if name is not None else self._name_edit.text().strip()),
+                base_url="",
+                model="",
+                api_key=None,
+                temperature=0.3,
+                timeout=60.0,
+                backend_type=backend_type,
+            )
         return TranslationProfile(
             name=(name if name is not None else self._name_edit.text().strip()),
             base_url=self._base_url_edit.text().strip(),
@@ -432,7 +483,56 @@ class SettingsWindow(QWidget):
             api_key=self._api_key_edit.text() or None,
             temperature=float(self._temperature_spin.value()),
             timeout=60.0,
+            backend_type=backend_type,
         )
+
+    # ==================== 翻译服务类型辅助 ====================
+
+    def _on_backend_type_changed(self, _index: int) -> None:
+        """服务类型切换：更新编辑框禁用态与占位提示。
+
+        免费服务（google/bing）禁用 base_url/model/api_key/temperature，
+        并把占位文案改为「无需配置」；切回 openai_compatible 时恢复编辑行为。
+        切到免费服务时不主动清空已有输入（用户可能在切换前误填），只在保存时
+        由 _profile_from_edit 忽略。
+        """
+        self._apply_backend_field_state()
+
+    def _apply_backend_field_state(self) -> None:
+        """按当前服务类型设置编辑框的启用态与占位提示。"""
+        is_free = self._current_backend_type() in ("google", "bing")
+        for w in (
+            self._base_url_edit,
+            self._model_edit,
+            self._api_key_edit,
+            self._temperature_spin,
+        ):
+            w.setEnabled(not is_free)
+        if is_free:
+            self._base_url_edit.setPlaceholderText("无需配置")
+            self._model_edit.setPlaceholderText("无需配置")
+            self._api_key_edit.setPlaceholderText("无需配置")
+        else:
+            self._base_url_edit.setPlaceholderText(
+                "https://api.openai.com/v1 或 http://127.0.0.1:19120/v1"
+            )
+            self._model_edit.setPlaceholderText("")
+            self._api_key_edit.setPlaceholderText("")
+
+    def _current_backend_type(self) -> str:
+        data = self._backend_type_combo.currentData()
+        if isinstance(data, str) and data:
+            return data
+        return "openai_compatible"
+
+    def _select_backend_type(self, backend_type: str) -> None:
+        """按 backend_type 值选中 ComboBox；未知值回退 openai_compatible。"""
+        target = backend_type if backend_type in ("openai_compatible", "google", "bing") else "openai_compatible"
+        for i, (_label, value) in enumerate(_BACKEND_TYPE_LABELS):
+            if value == target:
+                self._backend_type_combo.setCurrentIndex(i)
+                return
+        self._backend_type_combo.setCurrentIndex(0)
 
     # ==================== ASR 控件辅助 ====================
 
