@@ -83,3 +83,13 @@ def test_get_clipboard_text_none_when_no_text_format(monkeypatch) -> None:
     time.sleep(0.05)
     val = get_clipboard_text()
     assert isinstance(val, (str, type(None)))
+
+
+def test_input_struct_size_is_win32_abi() -> None:
+    """SendInput 结构必须符合 Win32 ABI：sizeof(INPUT)==40（64 位）。
+
+    SendInput 对 cbSize 校验严格，不符时返回 0 且 GetLastError=87。
+    该错误曾导致真实环境粘贴失败（ERROR_INVALID_PARAMETER）。
+    """
+    assert ctypes.sizeof(win32_paste._KEYBDINPUT) == 24
+    assert ctypes.sizeof(win32_paste._INPUT) == 40

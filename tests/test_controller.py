@@ -482,6 +482,40 @@ def test_worker_exception_goes_to_error() -> None:
     assert "boom" in cb.errors[0] or "RuntimeError" in cb.errors[0]
 
 
+def test_dictate_press_recovers_from_error() -> None:
+    """ERROR 状态下按 dictate：先恢复 IDLE 再正常开始录音（不卡死）。"""
+    asr = FakeAsrService(raise_on_transcribe=RuntimeError("boom"))
+    ctrl, cb, _asr, recorder, _ = _make_controller(asr=asr)
+
+    cb.error_event.clear()
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert _wait(cb.error_event)
+    _wait_for_state(cb, AppState.ERROR)
+
+    # ERROR 后再次按 dictate：应恢复并开始新一次录音
+    starts_before = recorder.start_calls
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.RECORDING
+    assert recorder.start_calls == starts_before + 1
+    ctrl.handle_hotkey_release("dictate_zh")
+
+
+def test_cancel_recovers_from_error() -> None:
+    """ERROR 状态下按 Esc：恢复 IDLE。"""
+    asr = FakeAsrService(raise_on_transcribe=RuntimeError("boom"))
+    ctrl, cb, _asr, recorder, _ = _make_controller(asr=asr)
+
+    cb.error_event.clear()
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert _wait(cb.error_event)
+    _wait_for_state(cb, AppState.ERROR)
+
+    ctrl.handle_hotkey_press("cancel")
+    assert ctrl.state == AppState.IDLE
+
+
 # ==================== dictate_en 无活动 profile ====================
 
 

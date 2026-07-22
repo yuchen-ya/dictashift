@@ -334,9 +334,18 @@ class ApplicationController:
         with self._lock:
             if not self._enabled:
                 return
-            if self._sm.state != AppState.IDLE:
+            if self._sm.state == AppState.ERROR:
+                # ERROR 是上一次任务的终态提示，不应卡死后续输入：
+                # ERROR -> IDLE 是合法迁移，恢复后继续走正常 IDLE 流程。
+                recover = True
+            elif self._sm.state != AppState.IDLE:
                 # 处理期间不接受新任务。
                 return
+            else:
+                recover = False
+        if recover:
+            self._goto(AppState.IDLE)
+        with self._lock:
             # 创建任务并冻结翻译快照。
             snapshot: TranslationProfile | None = None
             if action == "dictate_en":
@@ -385,7 +394,10 @@ class ApplicationController:
             with self._lock:
                 self._cancel_requested = True
             self._force_state(AppState.IDLE)
-        # 其他状态（IDLE/DISABLED/INSERTING/ERROR）忽略。
+        elif current == AppState.ERROR:
+            # ERROR -> IDLE 合法迁移：Esc 可清除错误状态。
+            self._goto(AppState.IDLE)
+        # 其他状态（IDLE/DISABLED/INSERTING）忽略。
 
     # ==================== worker 流水线 ====================
 

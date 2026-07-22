@@ -42,7 +42,11 @@ class _KEYBDINPUT(ctypes.Structure):
 
 
 class _INPUT_UNION(ctypes.Union):
-    _fields_ = (("ki", _KEYBDINPUT), ("padding", ctypes.c_byte * 64))
+    # Win32 INPUT 的 union 最大成员是 MOUSEINPUT（64 位下 32 字节），
+    # 因此 padding 必须按 32 字节补齐：sizeof(INPUT) = type 4 + 对齐 4 + union 32 = 40。
+    # SendInput 要求 cbSize 严格等于 sizeof(INPUT)=40，
+    # 否则返回 0 且 GetLastError=87 (ERROR_INVALID_PARAMETER)。
+    _fields_ = (("ki", _KEYBDINPUT), ("padding", ctypes.c_byte * 32))
 
 
 class _INPUT(ctypes.Structure):
@@ -82,7 +86,9 @@ def paste_via_sendinput() -> None:
     inputs[3].ki.wVk = _VK_CONTROL
     inputs[3].ki.dwFlags = _KEYEVENTF_KEYUP
 
-    sent = _user32.SendInput(4, ctypes.byref(inputs), ctypes.sizeof(_INPUT))
+    # 数组本身即可衰减为 POINTER(_INPUT)；byref(数组) 会得到
+    # "pointer to _INPUT_Array_4"，与 argtypes 声明不符而抛 ArgumentError。
+    sent = _user32.SendInput(4, inputs, ctypes.sizeof(_INPUT))
     if sent != 4:
         err = ctypes.get_last_error()
         # 常见原因：目标窗口完整性级别更高 (UIPI 阻止注入)。
