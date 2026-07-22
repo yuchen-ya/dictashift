@@ -40,10 +40,10 @@ from .hotkey_editor import HotkeyEdit
 
 
 # 设备 ComboBox 显示文案与 AsrDevice 值的双向映射。
+# 注：当前只支持 CPU（AUTO 与 CPU 行为等价），保留两项结构为后续 DirectML 留位。
 _DEVICE_LABELS: list[tuple[str, AsrDevice]] = [
     ("自动选择", AsrDevice.AUTO),
     ("CPU", AsrDevice.CPU),
-    ("NVIDIA CUDA", AsrDevice.CUDA),
 ]
 
 

@@ -5,9 +5,7 @@ SenseVoice ONNX 数据类型定义
 """
 
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Any
-import numpy as np
-from pathlib import Path
+from typing import List, Optional
 
 
 # ==================== 识别结果相关 ====================
@@ -25,39 +23,6 @@ class RecognitionResult:
     text: str
     start: float
     is_hotword: bool = False
-
-
-@dataclass
-class RecognitionStream:
-    """
-    识别流对象
-
-    用于承载音频数据和识别结果 (兼容风格设计)
-
-    Attributes:
-        sample_rate: 音频采样率
-        audio_data: 音频数据 (numpy array, float32)
-        results: 识别结果列表
-    """
-    sample_rate: int = 16000
-    audio_data: Optional[np.ndarray] = None
-    results: List[RecognitionResult] = field(default_factory=list)
-
-    def accept_waveform(self, sample_rate: int, audio: np.ndarray):
-        """接受音频数据"""
-        self.sample_rate = sample_rate
-        # 统一转为 float32
-        if audio.dtype != np.float32:
-            if audio.dtype == np.int16:
-                audio = audio.astype(np.float32) / 32768.0
-            else:
-                audio = audio.astype(np.float32)
-        self.audio_data = audio
-
-    @property
-    def text(self) -> str:
-        """获取合并后的完整文本"""
-        return "".join([r.text for r in self.results])
 
 
 @dataclass
@@ -127,7 +92,6 @@ class ASREngineConfig:
 
 __all__ = [
     'RecognitionResult',
-    'RecognitionStream',
     'TranscriptionResult',
     'ASREngineConfig',
     'Timings',

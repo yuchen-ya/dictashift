@@ -1,36 +1,31 @@
 import threading
-import logging
 from pathlib import Path
 
 import numpy as np
 
 from .providers import (
     AsrDevice,
-    MODEL_VARIANT,
     default_model_dir,
     resolve_providers,
     model_paths,
 )
 from .sensevoice_onnx import SenseVoiceInference, ASREngineConfig, TranscriptionResult
 
-logger = logging.getLogger(__name__)
-
 
 class ASRService:
     """
-    ASR 服务：负责设备探测、引擎生命周期与线程安全的推理调度。
+    ASR 服务：负责引擎生命周期与线程安全的推理调度。
 
     不变量：
-    1. AUTO 流程：先尝试 CUDA 创建引擎 + warmup，任何异常则落回 CPU 创建 + warmup；
-       都失败则抛出带原始错误信息的 RuntimeError。
-    2. 显式 CUDA：创建或 warmup 失败必须抛出异常且不破坏当前可用引擎。
-    3. switch_device：在没有正在进行的 transcribe 时，先完整构建新引擎 (含 warmup)，
+    1. AUTO 与 CPU 等价：直接构建 CPU 引擎 (int8 模型) + warmup，失败则抛出
+       带原始错误信息的 RuntimeError。
+    2. switch_device：在没有正在进行的 transcribe 时，先完整构建新引擎 (含 warmup)，
        成功后用锁原子替换旧引擎并 release 旧引擎；失败时保留旧引擎、
        user_device 恢复原值、异常抛给调用方。
-    4. 用户设置 (user_device) 与实际运行 (actual_device / actual_providers) 分开记录。
-    5. 引擎构建 (含 warmup) 可能耗时，由调用方负责放到后台线程；
+    3. 用户设置 (user_device) 与实际运行 (actual_device / actual_providers) 分开记录。
+    4. 引擎构建 (含 warmup) 可能耗时，由调用方负责放到后台线程；
        ASRService 自身用 threading.Lock 保证 transcribe 与 switch 互斥。
-    6. 线程安全：transcribe 持有锁期间调用引擎；引擎不可用时抛 RuntimeError。
+    5. 线程安全：transcribe 持有锁期间调用引擎；引擎不可用时抛 RuntimeError。
     """
 
     def __init__(self, model_dir: Path | None = None):
@@ -71,13 +66,11 @@ class ASRService:
         返回 (engine, effective_providers)：engine 已通过 warmup 验证，
         effective_providers 为 Session 实际生效的 provider 名列表。
 
-        关键校验 (AGENTS.md 5.3)：onnxruntime 在 CUDA 依赖缺失时可能只警告
-        并静默回退 CPU 而不抛异常，因此显式请求 CUDA 时必须核实
-        get_providers() 里 CUDAExecutionProvider 真实生效，否则释放引擎并抛错。
+        第一版只支持 CPU 推理 (int8 模型)，AUTO 与 CPU 等价，均构建 CPU 引擎。
+        warmup 失败时显式释放已创建的 Session，避免遗留资源。
         """
-        variant = MODEL_VARIANT[device]
         model_dir = self._model_dir
-        encoder_path, decoder_path, tokenizer_path = model_paths(model_dir, variant)
+        encoder_path, decoder_path, tokenizer_path = model_paths(model_dir)
         providers = resolve_providers(device, device_id=device_id)
         config = ASREngineConfig(
             encoder_path=str(encoder_path),
@@ -89,38 +82,25 @@ class ASRService:
         try:
             engine.warmup()
             effective = engine.active_providers()
-            if device == AsrDevice.CUDA and "CUDAExecutionProvider" not in effective:
-                raise RuntimeError(
-                    f"CUDAExecutionProvider 未生效（实际生效：{effective}）。"
-                    "通常是 cuDNN/CUDA 运行库缺失，onnxruntime 静默回退到了 CPU。"
-                )
         except Exception:
-            # warmup/校验失败时显式释放已创建的 Session（CUDA 显存不能依赖 GC 延迟回收）。
+            # warmup 失败时显式释放已创建的 Session。
             engine.release()
             raise
         return engine, effective
 
     def _resolve_auto(self, device_id: int) -> tuple[SenseVoiceInference, AsrDevice, list]:
         """
-        AUTO 解析：先 CUDA 创建 + warmup，失败则 CPU 创建 + warmup；
-        都失败则抛出带原始错误信息的 RuntimeError。
+        AUTO 解析：第一版只支持 CPU，直接构建 CPU 引擎 + warmup；
+        失败则抛出带原始错误信息的 RuntimeError。
 
         返回 (engine, actual_device, actual_providers)。
         """
-        cuda_error: Exception | None = None
-        try:
-            engine, effective = self._build_engine(AsrDevice.CUDA, device_id)
-            return engine, AsrDevice.CUDA, effective
-        except Exception as e:  # noqa: BLE001 - 设备探测需捕获任意失败
-            cuda_error = e
-            logger.warning(f"[ASRService] AUTO 探测 CUDA 失败，落回 CPU: {e!r}")
-
         try:
             engine, effective = self._build_engine(AsrDevice.CPU, device_id)
             return engine, AsrDevice.CPU, effective
         except Exception as cpu_error:  # noqa: BLE001
             raise RuntimeError(
-                f"ASR 引擎初始化失败 (AUTO)：CUDA 失败={cuda_error!r}；CPU 失败={cpu_error!r}"
+                f"ASR 引擎初始化失败 (AUTO)：CPU 失败={cpu_error!r}"
             ) from cpu_error
 
     # ==================== 生命周期 ====================
@@ -139,7 +119,8 @@ class ASRService:
 
     def _create_for(self, device: AsrDevice, device_id: int):
         """
-        根据用户设置创建引擎。AUTO 走运行时探测；显式 CPU/CUDA 失败直接抛出。
+        根据用户设置创建引擎。AUTO 走 _resolve_auto (与 CPU 等价)；
+        显式 CPU 失败直接抛出。
         不触碰现有 self._engine，调用方负责原子替换。
         """
         if device == AsrDevice.AUTO:

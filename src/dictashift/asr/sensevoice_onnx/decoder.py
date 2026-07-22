@@ -75,7 +75,7 @@ class SenseVoiceDecoder:
         for tid, fidx in collapsed:
             if tid == blank_id: continue
             char = sp.id_to_piece(int(tid)).replace("\u2581", " ")
-            if not char.strip() and char != " ": ignore_char = True
+            if not char.strip() and char != " ": pass
             else:
                 greedy_results.append({
                     "text": char,

@@ -5,29 +5,16 @@ from pathlib import Path
 class AsrDevice(StrEnum):
     AUTO = "auto"
     CPU = "cpu"
-    CUDA = "cuda"
-
-
-MODEL_VARIANT = {
-    AsrDevice.CUDA: "fp16",
-    AsrDevice.CPU: "int8",
-}
 
 
 def resolve_providers(device: AsrDevice, device_id: int = 0) -> list:
     """
     将 AsrDevice 解析为 ort 格式的 provider 列表。
-    AUTO 不做静态解析，由 ASRService 运行时探测。
+
+    第一版只支持 CPU 推理（int8 模型）：AUTO 与 CPU 均返回
+    CPUExecutionProvider。device_id 参数仅为保持调用方接口稳定。
     """
-    if device == AsrDevice.CPU:
-        return ["CPUExecutionProvider"]
-    if device == AsrDevice.CUDA:
-        return [
-            ("CUDAExecutionProvider", {"device_id": device_id}),
-            "CPUExecutionProvider",
-        ]
-    # AUTO: 不在此处静态解析
-    return []
+    return ["CPUExecutionProvider"]
 
 
 def default_model_dir() -> Path:
@@ -39,12 +26,12 @@ def default_model_dir() -> Path:
     return repo_root / "assets" / "models" / "sensevoice_onnx"
 
 
-def model_paths(model_dir: Path, variant: str):
+def model_paths(model_dir: Path):
     """
-    根据 variant 返回 (encoder_path, decoder_path, tokenizer_path)。
-    variant 形如 "fp16" / "int8"。
+    返回 (encoder_path, decoder_path, tokenizer_path)。
+    模型文件名固定 int8（第一版只支持 CPU 推理）。
     """
-    encoder_path = model_dir / f"SenseVoice-Encoder.{variant}.onnx"
-    decoder_path = model_dir / f"SenseVoice-CTC.{variant}.onnx"
+    encoder_path = model_dir / "SenseVoice-Encoder.int8.onnx"
+    decoder_path = model_dir / "SenseVoice-CTC.int8.onnx"
     tokenizer_path = model_dir / "Tokenizer.bpe.model"
     return encoder_path, decoder_path, tokenizer_path

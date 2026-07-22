@@ -126,7 +126,7 @@ def test_repo_save_load_round_trip(tmp_path: Path) -> None:
     s = AppSettings(
         enabled=False,
         hotkeys=HotkeySettings(dictate_zh="f1"),
-        asr=AsrSettings(device="cuda", device_id=3),
+        asr=AsrSettings(device="cpu", device_id=3),
     )
     repo.save(s)
     assert repo.path.exists()

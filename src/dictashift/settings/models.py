@@ -122,8 +122,13 @@ class AsrSettings:
     def from_dict(cls, d: dict | None = None) -> "AsrSettings":
         if not d:
             return cls()
+        device = d.get("device", "auto")
+        # 配置迁移：第一版移除了 GPU 路线（CUDA/DirectML），旧配置中的
+        # 已移除设备值静默归一为 "auto"，不报错。
+        if device in {"cuda", "directml"}:
+            device = "auto"
         return cls(
-            device=d.get("device", "auto"),
+            device=device,
             device_id=d.get("device_id", 0),
             max_record_seconds=d.get("max_record_seconds", 60),
             mic_device_index=d.get("mic_device_index", None),
