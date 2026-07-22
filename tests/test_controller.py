@@ -527,3 +527,46 @@ def test_dictate_en_without_active_profile_does_not_record() -> None:
     ctrl.handle_hotkey_press("dictate_en")
     assert recorder.start_calls == 0
     assert ctrl.state == AppState.IDLE
+
+
+# ==================== controller 默认 paste_func 语义 ====================
+
+
+def test_default_paste_func_is_type_text_at_cursor() -> None:
+    """ApplicationController.__init__ 的默认 paste_func 为
+    dictashift.output.typing.type_text_at_cursor。
+
+    断言语义（由主会话确定）：controller 在调用方不显式传 paste_func 时，
+    默认走 type_text_at_cursor 直输路径，而非旧的剪贴板粘贴。
+    用 inspect.signature 检查默认参数值（定义时绑定，最准确）。
+    """
+    import inspect
+
+    from dictashift.core import controller as controller_mod
+    from dictashift.output.typing import type_text_at_cursor
+
+    sig = inspect.signature(controller_mod.ApplicationController.__init__)
+    param = sig.parameters["paste_func"]
+    # 默认值必须是 typing 模块里的 type_text_at_cursor（同一函数对象）
+    assert param.default is type_text_at_cursor
+
+
+def test_controller_instance_default_paste_is_typing_function() -> None:
+    """不传 paste_func 构造 controller，实例 _paste 绑定为 type_text_at_cursor。
+
+    补充 inspect 断言：确保运行期实例确实持有了默认 paste 函数对象，
+    而非 None 或其它占位。
+    """
+    from dictashift.output.typing import type_text_at_cursor
+
+    asr = FakeAsrService()
+    recorder = FakeRecorder()
+    backend = FakeTranslationBackend()
+    # 不传 paste_func
+    ctrl = ApplicationController(
+        asr_service=asr,
+        recorder=recorder,
+        translation_backend=backend,
+        callbacks=RecordedCallbacks().as_callbacks(),
+    )
+    assert ctrl._paste is type_text_at_cursor
