@@ -308,7 +308,7 @@ class SettingsWindow(QWidget):
         if device is None:
             self._actual_device_label.setText("（未初始化）")
             return
-        providers_str = ", ".join(providers) if providers else str(device)
+        providers_str = ", ".join(str(p) for p in providers) if providers else str(device)
         self._actual_device_label.setText(f"{device.value} · {providers_str}")
 
     def set_recheck_loading(self, loading: bool) -> None:

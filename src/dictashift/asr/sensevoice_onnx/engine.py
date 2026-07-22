@@ -61,6 +61,22 @@ class SenseVoiceInference:
         if hasattr(self, 'decoder') and hasattr(self.decoder, 'release'):
             self.decoder.release()
 
+    def active_providers(self) -> List[str]:
+        """返回 encoder/decoder Session 实际生效的 provider 名（去重，保持顺序）。
+
+        onnxruntime 在 CUDA 依赖缺失时可能只警告并静默回退 CPU 而不抛异常，
+        因此不能仅凭"创建没报错"判断设备，必须用 get_providers() 核实。
+        """
+        seen: List[str] = []
+        for component in (self.encoder, self.decoder):
+            session = getattr(component, 'session', None)
+            if session is None:
+                continue
+            for name in session.get_providers():
+                if name not in seen:
+                    seen.append(name)
+        return seen
+
     def update_hotwords(self, hotwords: List[str]):
         """更新热词列表 (仅接受字符串列表)"""
         # 动态更新现有雷达的热词模型

@@ -65,10 +65,15 @@ class ASRService:
 
     # ==================== 引擎构建 ====================
 
-    def _build_engine(self, device: AsrDevice, device_id: int) -> SenseVoiceInference:
+    def _build_engine(self, device: AsrDevice, device_id: int) -> tuple[SenseVoiceInference, list[str]]:
         """
         根据 device 构建并 warmup 一个新引擎。失败时抛出异常。
-        返回的引擎已通过 warmup 验证 Session 真实可用。
+        返回 (engine, effective_providers)：engine 已通过 warmup 验证，
+        effective_providers 为 Session 实际生效的 provider 名列表。
+
+        关键校验 (AGENTS.md 5.3)：onnxruntime 在 CUDA 依赖缺失时可能只警告
+        并静默回退 CPU 而不抛异常，因此显式请求 CUDA 时必须核实
+        get_providers() 里 CUDAExecutionProvider 真实生效，否则释放引擎并抛错。
         """
         variant = MODEL_VARIANT[device]
         model_dir = self._model_dir
@@ -83,11 +88,17 @@ class ASRService:
         engine = SenseVoiceInference(config)
         try:
             engine.warmup()
+            effective = engine.active_providers()
+            if device == AsrDevice.CUDA and "CUDAExecutionProvider" not in effective:
+                raise RuntimeError(
+                    f"CUDAExecutionProvider 未生效（实际生效：{effective}）。"
+                    "通常是 cuDNN/CUDA 运行库缺失，onnxruntime 静默回退到了 CPU。"
+                )
         except Exception:
-            # warmup 失败时显式释放已创建的 Session（CUDA 显存不能依赖 GC 延迟回收）。
+            # warmup/校验失败时显式释放已创建的 Session（CUDA 显存不能依赖 GC 延迟回收）。
             engine.release()
             raise
-        return engine
+        return engine, effective
 
     def _resolve_auto(self, device_id: int) -> tuple[SenseVoiceInference, AsrDevice, list]:
         """
@@ -98,17 +109,15 @@ class ASRService:
         """
         cuda_error: Exception | None = None
         try:
-            engine = self._build_engine(AsrDevice.CUDA, device_id)
-            providers = resolve_providers(AsrDevice.CUDA, device_id=device_id)
-            return engine, AsrDevice.CUDA, providers
+            engine, effective = self._build_engine(AsrDevice.CUDA, device_id)
+            return engine, AsrDevice.CUDA, effective
         except Exception as e:  # noqa: BLE001 - 设备探测需捕获任意失败
             cuda_error = e
             logger.warning(f"[ASRService] AUTO 探测 CUDA 失败，落回 CPU: {e!r}")
 
         try:
-            engine = self._build_engine(AsrDevice.CPU, device_id)
-            providers = resolve_providers(AsrDevice.CPU, device_id=device_id)
-            return engine, AsrDevice.CPU, providers
+            engine, effective = self._build_engine(AsrDevice.CPU, device_id)
+            return engine, AsrDevice.CPU, effective
         except Exception as cpu_error:  # noqa: BLE001
             raise RuntimeError(
                 f"ASR 引擎初始化失败 (AUTO)：CUDA 失败={cuda_error!r}；CPU 失败={cpu_error!r}"
@@ -135,9 +144,8 @@ class ASRService:
         """
         if device == AsrDevice.AUTO:
             return self._resolve_auto(device_id)
-        engine = self._build_engine(device, device_id)
-        providers = resolve_providers(device, device_id=device_id)
-        return engine, device, providers
+        engine, effective = self._build_engine(device, device_id)
+        return engine, device, effective
 
     def switch_device(self, device: AsrDevice, device_id: int = 0) -> None:
         """

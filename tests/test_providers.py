@@ -65,6 +65,19 @@ class FakeEngine:
         self._warmup_raises = FakeEngine._next_warmup_raises
         FakeEngine._instances.append(self)
 
+    def active_providers(self) -> list[str]:
+        """按 config.providers 推导"生效" provider 名；可被 _next_active_providers 覆盖。"""
+        if FakeEngine._next_active_providers is not None:
+            effective = FakeEngine._next_active_providers
+            FakeEngine._next_active_providers = None
+            return effective
+        names: list[str] = []
+        for p in self.config.providers:
+            name = p[0] if isinstance(p, tuple) else p
+            if name not in names:
+                names.append(name)
+        return names
+
     def warmup(self) -> None:
         self.warmup_calls += 1
         if self._warmup_raises is not None:
@@ -86,6 +99,8 @@ class FakeEngine:
 
 # 通过类属性控制下一个被创建实例的 warmup 行为，模拟"CUDA 构建抛异常"
 FakeEngine._next_warmup_raises = None
+# 控制下一个实例 active_providers 的返回值，模拟"CUDA 静默回退 CPU"
+FakeEngine._next_active_providers = None
 
 
 @pytest.fixture
@@ -93,6 +108,7 @@ def patched_engine(monkeypatch):
     """monkeypatch SenseVoiceInference 为 FakeEngine，并重置记录。"""
     FakeEngine._instances = []
     FakeEngine._next_warmup_raises = None
+    FakeEngine._next_active_providers = None
     monkeypatch.setattr(service_mod, "SenseVoiceInference", FakeEngine)
     return FakeEngine
 
@@ -152,6 +168,37 @@ def test_initialize_auto_all_fail_raises(patched_engine) -> None:
         assert not s.is_ready
     finally:
         svc_mod.SenseVoiceInference = orig
+
+
+def test_initialize_auto_cuda_silent_fallback_detected(patched_engine) -> None:
+    """AUTO：CUDA 创建/warmup 未抛错但 get_providers 无 CUDA（静默回退）-> 判定失败落 CPU。
+
+    对应 onnxruntime 在 cuDNN 缺失时只警告不抛异常的真实行为 (AGENTS.md 5.3)。
+    """
+    # 第一个实例（CUDA）warmup 通过，但生效 providers 只有 CPU
+    FakeEngine._next_active_providers = ["CPUExecutionProvider"]
+    svc = _make_service()
+    svc.initialize(AsrDevice.AUTO, device_id=0)
+    assert svc.is_ready
+    assert svc.actual_device == AsrDevice.CPU
+    assert svc.actual_providers == ["CPUExecutionProvider"]
+    # CUDA 假成功的引擎应被 release，共创建两个实例
+    assert len(FakeEngine._instances) == 2
+    assert FakeEngine._instances[0].release_calls == 1
+
+
+def test_initialize_cuda_explicit_silent_fallback_raises(patched_engine) -> None:
+    """显式 CUDA：静默回退（生效 providers 无 CUDA）-> 抛异常且不破坏旧引擎。"""
+    svc = _make_service()
+    svc.initialize(AsrDevice.CPU, device_id=0)
+    old_engine = FakeEngine._instances[-1]
+
+    FakeEngine._next_active_providers = ["CPUExecutionProvider"]
+    with pytest.raises(RuntimeError, match="CUDAExecutionProvider 未生效"):
+        svc.initialize(AsrDevice.CUDA, device_id=0)
+
+    assert svc.actual_device == AsrDevice.CPU
+    assert old_engine.release_calls == 0
 
 
 # ==================== initialize(CUDA) 显式失败 ====================
