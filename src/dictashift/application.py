@@ -26,7 +26,7 @@ from .audio.recorder import AudioRecorder
 from .core import ApplicationController, AppState, ControllerCallbacks
 from .hotkeys.matcher import HotkeyBinding, parse_hotkey
 from .hotkeys.service import HotkeyService
-from .output.win32_paste import paste_text
+from .output.typing import type_text_at_cursor
 from .settings import AppSettings, SettingsRepository, default_cloud_profile
 from .translation import OpenAICompatibleBackend, TranslationProfile
 from .ui.overlay import StateOverlay
@@ -105,7 +105,7 @@ class DictaShiftApplication:
             asr_service=self._asr,
             recorder=self._recorder,
             translation_backend=self._backend,
-            paste_func=paste_text,
+            paste_func=type_text_at_cursor,
             callbacks=callbacks,
         )
 

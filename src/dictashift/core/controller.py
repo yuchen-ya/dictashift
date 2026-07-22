@@ -22,7 +22,7 @@ from typing import Callable, Protocol
 import numpy as np
 
 from ..asr.providers import AsrDevice
-from ..output.win32_paste import paste_text
+from ..output.typing import type_text_at_cursor
 from ..translation import TranslationBackend, TranslationProfile
 from .jobs import VoiceTask
 from .state import AppState, InvalidTransition, StateMachine
@@ -40,8 +40,8 @@ class ControllerCallbacks:
     所有回调允许在 worker 线程触发；Qt 层负责用 queued signal 桥接到主线程。
 
     - on_state_changed(state)：状态迁移后触发。
-    - on_text_ready(text, pasted)：文本准备就绪。pasted=False 表示 SendInput
-      注入失败但剪贴板已保留，需提示用户手动 Ctrl+V。
+    - on_text_ready(text, pasted)：文本准备就绪。pasted=False 表示直输失败
+      (无聚焦 caret 或 SendInput 被拦截)，需提示用户在弹窗中查看/复制文本。
     - on_error(message)：出错；消息已脱敏，不含 api_key 等敏感信息。
     - on_enabled_changed(enabled)：启用/禁用状态变化。
     """
@@ -96,7 +96,7 @@ class ApplicationController:
         asr_service: _SupportsTranscribe,
         recorder: _SupportsRecording,
         translation_backend: TranslationBackend,
-        paste_func: Callable[[str], bool] = paste_text,
+        paste_func: Callable[[str], bool] = type_text_at_cursor,
         callbacks: ControllerCallbacks | None = None,
     ) -> None:
         self._asr = asr_service
@@ -446,7 +446,7 @@ class ApplicationController:
                 return
 
             pasted = self._paste(text)
-            # 粘贴成功与否都通过 on_text_ready 通知；pasted=False 表示剪贴板已保留。
+            # 粘贴成功与否都通过 on_text_ready 通知；pasted=False 表示直输失败，由上层弹窗展示文本。
             self._fire_text_ready(text, bool(pasted))
             self._goto_safe(AppState.IDLE)
         except Exception as e:  # noqa: BLE001
