@@ -19,6 +19,9 @@ class TranslationProfile:
     api_key: str | None = None
     temperature: float = 0.3
     timeout: float = 60.0
+    # 后端类型路由：openai_compatible | google | bing
+    # 默认 openai_compatible 保证旧配置/旧代码构造不受影响。
+    backend_type: str = "openai_compatible"
 
 
 class TranslationError(Exception):

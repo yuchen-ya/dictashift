@@ -32,6 +32,7 @@ def profile_to_dict(profile: TranslationProfile) -> dict:
         "api_key": profile.api_key,
         "temperature": profile.temperature,
         "timeout": profile.timeout,
+        "backend_type": profile.backend_type,
     }
 
 
@@ -44,6 +45,8 @@ def profile_from_dict(d: dict) -> TranslationProfile:
         api_key=d.get("api_key"),
         temperature=d.get("temperature", 0.3),
         timeout=d.get("timeout", 60.0),
+        # 缺失时默认 openai_compatible（旧配置无感迁移）
+        backend_type=d.get("backend_type", "openai_compatible"),
     )
 
 
