@@ -1,8 +1,8 @@
 """设置窗口（四页 QTabWidget）。
 
 页面结构：
-1. 常规：启用语音输入、开机启动(仅保存设置)、显示状态悬浮窗、全局禁用快捷键、
-   恢复默认设置按钮（重置常规/快捷键/语音识别/界面，不影响翻译配置）。
+1. 常规：启用语音输入、开机启动(仅保存设置)、结果展示方式(右下角弹窗/常驻悬浮窗)、
+   全局禁用快捷键、恢复默认设置按钮（重置常规/快捷键/语音识别/界面，不影响翻译配置）。
 2. 快捷键：中文输入(f8)、中文→英文(f9)、取消当前任务(esc)。
 3. 语音识别：模型(只读)、实际运行设备(只读)、麦克风、最长录音秒数、
    重新检测硬件、测试识别(禁用占位)。
@@ -110,8 +110,14 @@ class SettingsWindow(QWidget):
         self._autostart_check = QCheckBox("开机启动（将在后续版本生效）", page)
         form.addRow(self._autostart_check)
 
-        self._overlay_check = QCheckBox("显示状态悬浮窗", page)
-        form.addRow(self._overlay_check)
+        self._result_ui_combo = QComboBox(page)
+        self._result_ui_combo.addItem(
+            "右下角弹窗（失败时弹出，平时无悬浮窗）", "popup"
+        )
+        self._result_ui_combo.addItem(
+            "常驻悬浮窗（置顶显示状态与结果）", "overlay"
+        )
+        form.addRow("结果展示方式：", self._result_ui_combo)
 
         form.addRow(QLabel("全局禁用快捷键：", page))
         self._toggle_hotkey = HotkeyEdit(page)
@@ -253,7 +259,7 @@ class SettingsWindow(QWidget):
         # 常规
         self._enable_check.setChecked(settings.enabled)
         self._autostart_check.setChecked(settings.ui.launch_at_login)
-        self._overlay_check.setChecked(settings.ui.show_overlay)
+        self._set_result_ui(settings.ui.result_ui)
         self._toggle_hotkey.set_config_text(settings.hotkeys.toggle_enabled)
         self._reset_status_label.setText("")
         # 快捷键
@@ -280,7 +286,7 @@ class SettingsWindow(QWidget):
         ui = dataclasses.replace(
             settings.ui,
             launch_at_login=self._autostart_check.isChecked(),
-            show_overlay=self._overlay_check.isChecked(),
+            result_ui=self._current_result_ui(),
         )
         settings.ui = ui
         # 快捷键
@@ -329,7 +335,7 @@ class SettingsWindow(QWidget):
         # 常规
         self._enable_check.setChecked(True)
         self._autostart_check.setChecked(default_ui.launch_at_login)
-        self._overlay_check.setChecked(default_ui.show_overlay)
+        self._set_result_ui(default_ui.result_ui)
         self._toggle_hotkey.set_config_text(default_hk.toggle_enabled)
         # 快捷键
         self._dictate_zh_edit.set_config_text(default_hk.dictate_zh)
@@ -550,6 +556,20 @@ class SettingsWindow(QWidget):
             self._test_result_label.setText("请填写 Base URL 和模型")
             return None
         return profile
+
+    # ==================== 结果展示方式辅助 ====================
+
+    def _set_result_ui(self, value: str) -> None:
+        """把 result_ui 值同步到 ComboBox；非法值回退到 popup。"""
+        idx = self._result_ui_combo.findData(value)
+        if idx < 0:
+            idx = self._result_ui_combo.findData("popup")
+        if idx >= 0:
+            self._result_ui_combo.setCurrentIndex(idx)
+
+    def _current_result_ui(self) -> str:
+        data = self._result_ui_combo.currentData()
+        return data if data in ("popup", "overlay") else "popup"
 
     # ==================== ASR 控件辅助 ====================
 

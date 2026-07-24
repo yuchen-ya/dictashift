@@ -93,7 +93,9 @@ class DictaShiftApplication:
         self._recorder = AudioRecorder(
             sample_rate=16000,
             max_seconds=self.settings.asr.max_record_seconds,
+            device_index=self.settings.asr.mic_device_index,
             on_auto_stop=self._on_auto_stop,
+            on_stream_error=self._on_stream_error,
         )
 
         callbacks = ControllerCallbacks(
@@ -168,8 +170,8 @@ class DictaShiftApplication:
         self._controller.start(enabled=self.settings.enabled)
         self._tray.show()
         self._tray.set_enabled(self.settings.enabled)
-        # overlay 显隐由设置控制
-        self._overlay.set_visible_enabled(self.settings.ui.show_overlay)
+        # overlay 显隐由设置控制：仅 result_ui=="overlay" 时常驻显示。
+        self._overlay.set_visible_enabled(self.settings.ui.result_ui == "overlay")
         self._overlay.set_state(self._controller.state)
         # 启动 hotkey 监听（pynput Listener 后台线程）
         try:
@@ -237,11 +239,16 @@ class DictaShiftApplication:
 
     def _on_text_ready(self, text: str, pasted: bool) -> None:
         # pasted=True：直输成功，不打扰用户。
-        # pasted=False：直输失败（无聚焦控件或 UIPI 拦截），弹窗显示全文供用户
-        # 手动复制 (AGENTS.md 5.5：输出失败必须给可操作兜底，且不默认覆盖剪贴板)。
+        # pasted=False：直输失败（无聚焦控件或 UIPI 拦截），按 result_ui 路由：
+        #   "popup"  -> 右下角弹通知式卡片（平时无悬浮窗）；
+        #   "overlay"-> 转译内容+复制按钮显示在常驻悬浮窗里（不弹 ResultPopup）。
+        # AGENTS.md 5.5：输出失败必须给可操作兜底，且不默认覆盖剪贴板。
         if pasted:
             return
-        self._result_popup.show_result(text)
+        if self.settings.ui.result_ui == "overlay":
+            self._overlay.show_result(text)
+        else:
+            self._result_popup.show_result(text)
 
     def _on_error(self, message: str) -> None:
         self._tray.show_message("DictaShift", message)
@@ -297,6 +304,23 @@ class DictaShiftApplication:
             target=_release_in_worker, name="dictashift-auto-stop", daemon=True
         ).start()
 
+    def _on_stream_error(self, msg: str) -> None:
+        """recorder 录音中途严重 status 回调（PortAudio 线程）。
+
+        与 _on_auto_stop 同模式：PortAudio 线程只做最小工作——把事件转交一次性
+        后台线程执行 controller._on_stream_error。后者会 discard（关流阻塞）+
+        on_error + 回 IDLE，不能在音频回调线程内阻塞执行。
+        """
+        def _handle_in_worker() -> None:
+            try:
+                self._controller._on_stream_error(msg)
+            except Exception:  # noqa: BLE001
+                logger.exception("[DictaShiftApplication] on_stream_error 异常")
+
+        threading.Thread(
+            target=_handle_in_worker, name="dictashift-stream-error", daemon=True
+        ).start()
+
     # ==================== 托盘槽 ====================
 
     def _on_tray_toggle(self) -> None:
@@ -320,6 +344,14 @@ class DictaShiftApplication:
         except Exception:  # noqa: BLE001
             logger.exception("[DictaShiftApplication] 保存设置失败")
 
+        # 麦克风/最长录音变更应用到 recorder（录音中更换会抛 RuntimeError，
+        # 此时设置窗口不可能在录音中打开应用，保守 try 包住）。
+        try:
+            self._recorder.device_index = self.settings.asr.mic_device_index
+            self._recorder.max_seconds = self.settings.asr.max_record_seconds
+        except RuntimeError:
+            logger.warning("[DictaShiftApplication] 录音中，录音设备/时长变更将在下次生效")
+
         # 更新热键绑定（无需重启 listener）
         self._hotkeys.update_bindings(self._bindings_from_settings(self.settings))
 
@@ -329,8 +361,8 @@ class DictaShiftApplication:
             self.settings.translation.active_profile,
         )
 
-        # overlay 显隐
-        self._overlay.set_visible_enabled(self.settings.ui.show_overlay)
+        # overlay 显隐：仅 result_ui=="overlay" 时显示，切换即时生效。
+        self._overlay.set_visible_enabled(self.settings.ui.result_ui == "overlay")
         # ASR 设备不再可变（GPU 路线已移除）：设置应用时不触发设备切换。
 
     def _translation_profiles_for_controller(self) -> list[TranslationProfile]:

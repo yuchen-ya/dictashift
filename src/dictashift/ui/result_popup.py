@@ -6,7 +6,7 @@
 - 内容：标题行 + 只读文本区（可选中、超长滚动、高度受限）+
   「复制」按钮（点击才写剪贴板）+ 「关闭」按钮。
 - 弹窗显示本身不碰剪贴板；只有用户点击「复制」才调 set_clipboard_text。
-- 位置：QCursor.pos() 附近，避开屏幕边缘。
+- 位置：屏幕右下角，留 16px 边距（_place_bottom_right）。
 - 15 秒无操作自动关闭（QTimer）；show_result 重复调用时更新文本、
   重新显示并重置自动关闭计时。
 
@@ -103,10 +103,10 @@ class ResultPopup(QWidget):
     # ==================== 公共接口 ====================
 
     def show_result(self, text: str) -> None:
-        """更新文本、重新定位（光标附近避边缘）、显示并重置自动关闭计时。"""
+        """更新文本、重新定位（屏幕右下角）、显示并重置自动关闭计时。"""
         self._text_edit.setPlainText(text)
         self._reset_copy_button_text()
-        self._place_near_cursor()
+        self._place_bottom_right()
         self.show()
         self.raise_()
         self.activateWindow()
@@ -136,36 +136,32 @@ class ResultPopup(QWidget):
 
     # ==================== 内部：定位 ====================
 
-    def _place_near_cursor(self) -> None:
-        """把窗口左上角放在 QCursor.pos() 附近，避开屏幕边缘。"""
-        cursor_pos = self._cursor_global_pos()
-        x = cursor_pos.x() + 8
-        y = cursor_pos.y() + 8
+    def _place_bottom_right(self) -> None:
+        """把窗口定位到鼠标所在屏幕（否则主屏）的右下角，留 16px 边距。"""
+        from PySide6.QtGui import QGuiApplication, QCursor
 
-        # 评估尺寸：用 maximumSize 作为预估上下界（实际由布局决定）。
+        screen = QGuiApplication.screenAt(QCursor.pos())
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return  # 无屏幕可用（极端 offscreen），放弃定位。
+
+        geo = screen.availableGeometry()
+
+        # 评估尺寸：用 sizeHint 上下界（实际由布局决定）。
         w = self.sizeHint().width() or _MAX_WIDTH
         h = self.sizeHint().height() or _MAX_HEIGHT
         w = min(w, _MAX_WIDTH)
         h = min(h, _MAX_HEIGHT)
 
-        screen = self.screen()
-        if screen is not None:
-            geo = screen.availableGeometry()
-            if x + w > geo.right():
-                x = geo.right() - w
-            if y + h > geo.bottom():
-                y = geo.bottom() - h
-            if x < geo.left():
-                x = geo.left()
-            if y < geo.top():
-                y = geo.top()
+        # 右下角，留 16px 边距。窗口右下角对齐 geo.right()-16 / geo.bottom()-16。
+        x = geo.right() - w - 16
+        y = geo.bottom() - h - 16
+        if x < geo.left():
+            x = geo.left()
+        if y < geo.top():
+            y = geo.top()
         self.move(x, y)
-
-    @staticmethod
-    def _cursor_global_pos():
-        """QCursor 全局位置；封装以便 offscreen / 无鼠标环境下退化。"""
-        from PySide6.QtGui import QCursor
-        return QCursor.pos()
 
     # ==================== 用户交互重置自动关闭计时 ====================
 

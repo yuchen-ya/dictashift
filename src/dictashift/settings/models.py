@@ -194,15 +194,26 @@ class TranslationSettings:
 class UiSettings:
     """UI 配置。
 
-    默认值：show_overlay=True（显示录音悬浮提示），launch_at_login=False。
+    result_ui：直输失败时的结果展示方式。
+    - "popup"（默认）：平时无悬浮窗；失败时在屏幕右下角弹通知式卡片（ResultPopup）。
+    - "overlay"：常驻状态悬浮窗置顶显示状态；失败时转译内容+复制按钮直接显示在
+      悬浮窗里（不弹 ResultPopup）。
+
+    迁移（from_dict）：
+    - 读到合法 result_ui（"popup"/"overlay"）直接使用。
+    - 读不到 result_ui 时看旧键 show_overlay：True -> "overlay"，False/缺失 -> "popup"。
+    - result_ui 值非法（非两者）-> 归一为 "popup"。
+    to_dict 只写 result_ui（不再写 show_overlay）。
+
+    launch_at_login 默认 False。
     """
 
-    show_overlay: bool = True
+    result_ui: str = "popup"
     launch_at_login: bool = False
 
     def to_dict(self) -> dict:
         return {
-            "show_overlay": self.show_overlay,
+            "result_ui": self.result_ui,
             "launch_at_login": self.launch_at_login,
         }
 
@@ -210,8 +221,17 @@ class UiSettings:
     def from_dict(cls, d: dict | None = None) -> "UiSettings":
         if not d:
             return cls()
+        result_ui = d.get("result_ui")
+        if result_ui in ("popup", "overlay"):
+            pass
+        elif result_ui is None:
+            # 旧键迁移：show_overlay=True -> overlay；否则 popup。
+            result_ui = "overlay" if d.get("show_overlay") is True else "popup"
+        else:
+            # 非法值归一为 popup。
+            result_ui = "popup"
         return cls(
-            show_overlay=d.get("show_overlay", True),
+            result_ui=result_ui,
             launch_at_login=d.get("launch_at_login", False),
         )
 

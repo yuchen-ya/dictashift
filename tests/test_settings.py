@@ -50,7 +50,7 @@ def test_app_settings_defaults() -> None:
     assert s.asr.mic_device_index is None
     assert s.translation.active_profile == ""
     assert s.translation.profiles == []
-    assert s.ui.show_overlay is True
+    assert s.ui.result_ui == "popup"
     assert s.ui.launch_at_login is False
 
 
@@ -68,7 +68,7 @@ def test_app_settings_round_trip() -> None:
                 TranslationProfile(name="p1", base_url="http://x/v1", model="m", api_key="k", temperature=0.5),
             ],
         ),
-        ui=UiSettings(show_overlay=False, launch_at_login=True),
+        ui=UiSettings(result_ui="overlay", launch_at_login=True),
     )
     d = s.to_dict()
     s2 = AppSettings.from_dict(d)
@@ -92,7 +92,7 @@ def test_from_dict_missing_keys_uses_defaults() -> None:
     assert s.hotkeys.dictate_zh == "f8"
     assert s.asr.max_record_seconds == 60
     assert s.translation.active_profile == ""
-    assert s.ui.show_overlay is True
+    assert s.ui.result_ui == "popup"
 
 
 def test_from_dict_none_uses_defaults() -> None:
@@ -275,4 +275,51 @@ def test_translation_settings_round_trip_after_migration() -> None:
     assert t2 == t
     assert t2.active_profile == BUILTIN_GOOGLE.name
     assert [p.name for p in t2.profiles] == ["myLLM"]
+
+
+# ==================== UiSettings result_ui 迁移 ====================
+
+
+def test_ui_settings_legacy_show_overlay_true_migrates_to_overlay() -> None:
+    """旧键 show_overlay=True -> result_ui="overlay"。"""
+    u = UiSettings.from_dict({"show_overlay": True})
+    assert u.result_ui == "overlay"
+
+
+def test_ui_settings_legacy_show_overlay_false_migrates_to_popup() -> None:
+    """旧键 show_overlay=False -> result_ui="popup"。"""
+    u = UiSettings.from_dict({"show_overlay": False})
+    assert u.result_ui == "popup"
+
+
+def test_ui_settings_missing_result_ui_and_show_overlay_defaults_popup() -> None:
+    """既无 result_ui 也无 show_overlay -> 默认 popup。"""
+    u = UiSettings.from_dict({"launch_at_login": True})
+    assert u.result_ui == "popup"
+    assert u.launch_at_login is True
+
+
+def test_ui_settings_invalid_result_ui_normalizes_to_popup() -> None:
+    """非法 result_ui 值 -> 归一 popup。"""
+    u = UiSettings.from_dict({"result_ui": "weird"})
+    assert u.result_ui == "popup"
+
+
+def test_ui_settings_valid_result_ui_preserved() -> None:
+    """合法 result_ui 直接保留。"""
+    assert UiSettings.from_dict({"result_ui": "overlay"}).result_ui == "overlay"
+    assert UiSettings.from_dict({"result_ui": "popup"}).result_ui == "popup"
+
+
+def test_ui_settings_to_dict_omits_show_overlay() -> None:
+    """to_dict 只写 result_ui，不写旧键 show_overlay。"""
+    d = UiSettings(result_ui="overlay").to_dict()
+    assert d == {"result_ui": "overlay", "launch_at_login": False}
+    assert "show_overlay" not in d
+
+
+def test_ui_settings_round_trip() -> None:
+    """result_ui 往返稳定。"""
+    u = UiSettings(result_ui="overlay", launch_at_login=True)
+    assert UiSettings.from_dict(u.to_dict()) == u
 

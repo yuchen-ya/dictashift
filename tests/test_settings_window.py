@@ -162,12 +162,12 @@ class TestResetToDefaults:
     def test_general_and_ui_reset(self, win) -> None:
         s = AppSettings()
         s.enabled = False
-        s.ui = UiSettings(show_overlay=False, launch_at_login=True)
+        s.ui = UiSettings(result_ui="overlay", launch_at_login=True)
         win.load_from_settings(s)
         win.reset_to_defaults()
-        # enabled 默认 True，show_overlay 默认 True
+        # enabled 默认 True，result_ui 默认 popup
         assert win._enable_check.isChecked() is True
-        assert win._overlay_check.isChecked() is True
+        assert win._current_result_ui() == "popup"
 
     def test_asr_reset_to_defaults(self, win) -> None:
         s = AppSettings()
@@ -190,6 +190,52 @@ class TestResetToDefaults:
     def test_reset_shows_status_label(self, win) -> None:
         win.reset_to_defaults()
         assert win._reset_status_label.text()  # 非空提示
+
+
+# ==================== 常规页：结果展示方式 ComboBox ====================
+
+
+class TestResultUiCombo:
+    def test_combo_has_two_items_with_data(self, win) -> None:
+        items = {
+            win._result_ui_combo.itemData(i)
+            for i in range(win._result_ui_combo.count())
+        }
+        assert items == {"popup", "overlay"}
+        assert win._result_ui_combo.itemData(0) == "popup"  # 默认项在前
+
+    def test_no_legacy_overlay_check(self, win) -> None:
+        # 旧 CheckBox 控件已移除
+        assert not hasattr(win, "_overlay_check")
+
+    def test_load_popup(self, win) -> None:
+        s = AppSettings()
+        s.ui = UiSettings(result_ui="popup")
+        win.load_from_settings(s)
+        assert win._current_result_ui() == "popup"
+
+    def test_load_overlay(self, win) -> None:
+        s = AppSettings()
+        s.ui = UiSettings(result_ui="overlay")
+        win.load_from_settings(s)
+        assert win._current_result_ui() == "overlay"
+
+    def test_apply_writes_result_ui(self, win) -> None:
+        s = AppSettings()
+        s.ui = UiSettings(result_ui="popup")
+        win.load_from_settings(s)
+        # 切换到 overlay
+        idx = win._result_ui_combo.findData("overlay")
+        win._result_ui_combo.setCurrentIndex(idx)
+        out = win.apply_to_settings(s)
+        assert out.ui.result_ui == "overlay"
+
+    def test_reset_to_defaults_sets_popup(self, win) -> None:
+        s = AppSettings()
+        s.ui = UiSettings(result_ui="overlay")
+        win.load_from_settings(s)
+        win.reset_to_defaults()
+        assert win._current_result_ui() == UiSettings().result_ui == "popup"
 
 
 # ==================== recheck 信号无参 ====================
