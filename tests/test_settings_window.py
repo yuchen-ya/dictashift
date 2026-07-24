@@ -252,3 +252,129 @@ def test_recheck_sets_loading_state(win) -> None:
     win._recheck_btn.click()
     assert not win._recheck_btn.isEnabled()
     assert win._recheck_btn.text() == "加载中…"
+
+
+# ==================== 模型状态 / 下载 UI ====================
+
+
+class TestModelDownloadUi:
+    def test_model_status_label_and_download_button_exist(self, win) -> None:
+        assert hasattr(win, "_model_status_label")
+        assert hasattr(win, "_download_model_btn")
+        assert hasattr(win, "_model_progress")
+
+    def test_progress_bar_hidden_by_default(self, win) -> None:
+        assert win._model_progress.isHidden()
+
+    def test_refresh_model_status_shows_installed_when_ready(self, win) -> None:
+        # 仓库 assets 齐全（开发环境），应为"已安装"。
+        win.refresh_model_status()
+        assert "已安装" in win._model_status_label.text()
+        assert win._download_model_btn.isHidden()
+
+    def test_refresh_model_status_shows_not_installed_when_missing(
+        self, win, monkeypatch
+    ) -> None:
+        from dictashift.asr import providers as prov
+
+        monkeypatch.setattr(prov, "models_ready", lambda d: False)
+        win.refresh_model_status()
+        assert win._model_status_label.text() == "未安装"
+        assert not win._download_model_btn.isHidden()
+
+    def test_download_button_emits_signal(self, win) -> None:
+        got = {}
+        win.model_download_requested.connect(lambda: got.__setitem__("fired", True))
+        win._download_model_btn.show()  # 确保可见
+        win._download_model_btn.click()
+        assert got.get("fired") is True
+        # 点击后按钮禁用、进度条显示。
+        assert not win._download_model_btn.isEnabled()
+        assert not win._model_progress.isHidden()
+
+    def test_set_progress_percent(self, win) -> None:
+        win.set_model_download_progress(42)
+        assert win._model_progress.value() == 42
+        assert not win._download_model_btn.isEnabled()
+
+    def test_set_progress_busy_when_unknown(self, win) -> None:
+        win.set_model_download_progress(-1)
+        # 忙碌态：min==max==0
+        assert win._model_progress.minimum() == 0
+        assert win._model_progress.maximum() == 0
+
+    def test_on_complete_restores_and_refreshes(self, win) -> None:
+        win.set_model_download_progress(50)
+        win.on_model_download_complete()
+        assert win._model_progress.isHidden()
+        assert win._download_model_btn.isEnabled()
+        assert win._download_model_btn.text() == "下载模型"
+        # 状态刷新为已安装（开发环境 assets 齐全）。
+        assert "已安装" in win._model_status_label.text()
+
+    def test_on_failed_shows_error_and_restores_button(self, win, monkeypatch) -> None:
+        from dictashift.asr import providers as prov
+
+        monkeypatch.setattr(prov, "models_ready", lambda d: False)
+        win.on_model_download_failed("网络错误")
+        assert win._model_progress.isHidden()
+        assert win._download_model_btn.isEnabled()
+        assert "网络错误" in win._model_status_label.text()
+
+
+# ==================== 开机启动：勾选状态来自注册表 ====================
+
+
+class TestLaunchAtLoginCheckbox:
+    def test_load_reads_registry_not_settings(self, win, monkeypatch) -> None:
+        """load_from_settings 时勾选状态来自 is_launch_at_login_enabled。"""
+        from dictashift.ui import settings_window as sw_mod
+
+        monkeypatch.setattr(sw_mod, "is_launch_at_login_enabled", lambda: True)
+        s = AppSettings()
+        s.ui = UiSettings(launch_at_login=False)  # settings 值与注册表相反
+        win.load_from_settings(s)
+        assert win._autostart_check.isChecked() is True
+
+    def test_apply_writes_registry(self, win, monkeypatch) -> None:
+        from dictashift.ui import settings_window as sw_mod
+
+        calls = {}
+
+        def _set(enabled: bool) -> None:
+            calls["enabled"] = enabled
+
+        monkeypatch.setattr(sw_mod, "set_launch_at_login", _set)
+        monkeypatch.setattr(sw_mod, "is_launch_at_login_enabled", lambda: True)
+        win._autostart_check.setChecked(True)
+        win.apply_to_settings(AppSettings())
+        assert calls.get("enabled") is True
+
+    def test_apply_registry_failure_warns_and_rolls_back(
+        self, win, monkeypatch
+    ) -> None:
+        """注册表写入失败 -> 不抛、回滚复选框为注册表实际值。"""
+        from dictashift.ui import settings_window as sw_mod
+
+        def _raise(enabled: bool) -> None:
+            raise OSError("denied")
+
+        # 禁用 QMessageBox 的真实弹窗。
+        monkeypatch.setattr(
+            "PySide6.QtWidgets.QMessageBox.warning",
+            lambda *a, **kw: 0,
+        )
+        monkeypatch.setattr(sw_mod, "set_launch_at_login", _raise)
+        monkeypatch.setattr(sw_mod, "is_launch_at_login_enabled", lambda: False)
+        win._autostart_check.setChecked(True)
+        # 不应抛
+        win.apply_to_settings(AppSettings())
+        # 回滚为注册表实际值 False
+        assert win._autostart_check.isChecked() is False
+
+
+def test_autostart_checkbox_label_has_no_future_version_note(win) -> None:
+    """「将在后续版本生效」标注已被移除。"""
+    text = win._autostart_check.text()
+    assert "后续版本" not in text
+    assert "生效" not in text

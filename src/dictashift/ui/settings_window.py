@@ -4,8 +4,8 @@
 1. 常规：启用语音输入、开机启动(仅保存设置)、结果展示方式(右下角弹窗/常驻悬浮窗)、
    全局禁用快捷键、恢复默认设置按钮（重置常规/快捷键/语音识别/界面，不影响翻译配置）。
 2. 快捷键：中文输入(f8)、中文→英文(f9)、取消当前任务(esc)。
-3. 语音识别：模型(只读)、实际运行设备(只读)、麦克风、最长录音秒数、
-   重新检测硬件、测试识别(禁用占位)。
+3. 语音识别：模型(已安装/未安装 状态 + 下载按钮 + 进度条)、实际运行设备(只读)、
+   麦克风、最长录音秒数、重新检测硬件、测试识别(禁用占位)。
    注：推理设备/GPU 设备控件已随 GPU 路线移除（设备固定为 AUTO/CPU，等价）。
 4. 翻译：当前配置 ComboBox（内置免登录 Google/Bing + 用户 LLM profiles）、
    编辑区(base_url/model/api_key/temperature，仅作用于用户 LLM 配置)、
@@ -13,8 +13,11 @@
 
 线程模型：
 - 控件值 <-> AppSettings 双向绑定（load_from_settings / apply_to_settings）。
-- 重后台工作（ASR initialize、翻译测试连接）通过 Qt signal 交给 application 层
-  在后台线程执行，结果再 queued 回 UI；UI 线程不做网络/模型工作。
+- 重后台工作（ASR initialize、翻译测试连接、模型下载）通过 Qt signal 交给
+  application 层在后台线程执行，结果再 queued 回 UI；UI 线程不做网络/模型工作。
+- 「开机启动」勾选状态直接读写注册表（is_launch_at_login_enabled），与
+  settings.ui.launch_at_login 解耦（后者仅作记录）；apply 时调用
+  set_launch_at_login 真正写注册表，失败弹 QMessageBox 警告。
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -39,6 +43,10 @@ from PySide6.QtWidgets import (
 from ..asr.providers import AsrDevice
 from ..audio.devices import list_input_devices
 from ..settings import AppSettings
+from ..settings.launch_at_login import (
+    is_launch_at_login_enabled,
+    set_launch_at_login,
+)
 from ..settings.models import (
     AsrSettings,
     HotkeySettings,
@@ -60,11 +68,13 @@ class SettingsWindow(QWidget):
     - applied(settings)：用户点击「应用」或「确定」时发出，携带最新设置副本。
     - recheck_hardware_requested()：用户点击「重新检测硬件」（无参，固定重新初始化）。
     - test_connection_requested(profile)：用户点击「测试连接」（后台执行）。
+    - model_download_requested()：用户点击「下载模型」（后台执行，无参）。
     """
 
     applied = Signal(AppSettings)
     recheck_hardware_requested = Signal()
     test_connection_requested = Signal(object)  # TranslationProfile
+    model_download_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -98,6 +108,14 @@ class SettingsWindow(QWidget):
         self._apply_btn.clicked.connect(self._on_apply)
         self._cancel_btn.clicked.connect(self.hide)
 
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        """窗口显示时刷新一次模型状态（用户可能刚下载完模型）。"""
+        super().showEvent(event)
+        try:
+            self.refresh_model_status()
+        except Exception:  # noqa: BLE001
+            pass
+
     # ==================== 常规页 ====================
 
     def _build_general_tab(self) -> QWidget:
@@ -107,7 +125,7 @@ class SettingsWindow(QWidget):
         self._enable_check = QCheckBox("启用语音输入", page)
         form.addRow(self._enable_check)
 
-        self._autostart_check = QCheckBox("开机启动（将在后续版本生效）", page)
+        self._autostart_check = QCheckBox("开机启动", page)
         form.addRow(self._autostart_check)
 
         self._result_ui_combo = QComboBox(page)
@@ -158,7 +176,19 @@ class SettingsWindow(QWidget):
         page = QWidget(self)
         form = QFormLayout(page)
 
-        form.addRow("模型：", QLabel("SenseVoiceSmall ONNX", page))
+        # 模型区：状态标签 + 下载按钮 + 进度条（默认隐藏）。
+        self._model_status_label = QLabel("（检测中…）", page)
+        self._model_status_label.setWordWrap(True)
+        self._download_model_btn = QPushButton("下载模型", page)
+        self._download_model_btn.clicked.connect(self._on_download_model_clicked)
+        self._model_progress = QProgressBar(page)
+        self._model_progress.setRange(0, 100)
+        self._model_progress.hide()
+        model_row = QHBoxLayout()
+        model_row.addWidget(self._model_status_label, stretch=1)
+        model_row.addWidget(self._download_model_btn)
+        form.addRow("模型：", model_row)
+        form.addRow("", self._model_progress)
 
         self._actual_device_label = QLabel("（未初始化）", page)
         form.addRow("实际运行设备：", self._actual_device_label)
@@ -253,12 +283,21 @@ class SettingsWindow(QWidget):
     # ==================== 双向绑定 ====================
 
     def load_from_settings(self, settings: AppSettings) -> None:
-        """从 AppSettings 填充所有控件值，并缓存基底副本。"""
+        """从 AppSettings 填充所有控件值，并缓存基底副本。
+
+        「开机启动」勾选状态从注册表实时读取（is_launch_at_login_enabled），
+        不使用 settings.ui.launch_at_login（后者仅作记录）。
+        """
         import dataclasses
         self._last_loaded = dataclasses.replace(settings)
         # 常规
         self._enable_check.setChecked(settings.enabled)
-        self._autostart_check.setChecked(settings.ui.launch_at_login)
+        # 开机启动：以注册表实际状态为准。
+        try:
+            self._autostart_check.setChecked(is_launch_at_login_enabled())
+        except Exception:  # noqa: BLE001
+            # 注册表读取异常保守置为未勾选。
+            self._autostart_check.setChecked(False)
         self._set_result_ui(settings.ui.result_ui)
         self._toggle_hotkey.set_config_text(settings.hotkeys.toggle_enabled)
         self._reset_status_label.setText("")
@@ -269,6 +308,8 @@ class SettingsWindow(QWidget):
         # ASR
         self._max_record_spin.setValue(int(settings.asr.max_record_seconds))
         self._select_mic(settings.asr.mic_device_index)
+        # 模型状态刷新一次。
+        self.refresh_model_status()
         # 翻译
         self._profiles = list(settings.translation.profiles)
         self._rebuild_profile_combo(settings.translation.active_profile)
@@ -277,15 +318,34 @@ class SettingsWindow(QWidget):
         """把控件当前值写回 settings 并返回。
 
         在副本上修改，避免污染传入对象。
+
+        「开机启动」勾选会真正写注册表（set_launch_at_login）；失败弹
+        QMessageBox 警告，并把勾选状态回滚为注册表实际值。settings.ui.
+        launch_at_login 仅作记录写入（无副作用）。
         """
         import dataclasses
 
         settings = dataclasses.replace(settings)
         settings.enabled = self._enable_check.isChecked()
-        # UI 子配置
+        # 开机启动：真正写注册表。
+        autostart_checked = self._autostart_check.isChecked()
+        try:
+            set_launch_at_login(autostart_checked)
+        except OSError:
+            QMessageBox.warning(
+                self,
+                "开机启动",
+                "无法修改开机启动设置（注册表写入失败），请检查权限或手动配置。",
+            )
+            # 回滚复选框为注册表实际值。
+            try:
+                self._autostart_check.setChecked(is_launch_at_login_enabled())
+            except Exception:  # noqa: BLE001
+                self._autostart_check.setChecked(False)
+        # UI 子配置（launch_at_login 仅作记录）
         ui = dataclasses.replace(
             settings.ui,
-            launch_at_login=self._autostart_check.isChecked(),
+            launch_at_login=autostart_checked,
             result_ui=self._current_result_ui(),
         )
         settings.ui = ui
@@ -382,6 +442,67 @@ class SettingsWindow(QWidget):
         self._test_conn_btn.setEnabled(True)
         self._test_conn_btn.setText("测试连接")
 
+    # ==================== 模型状态 / 下载 ====================
+
+    def refresh_model_status(self) -> None:
+        """刷新模型状态标签与下载按钮可见性。
+
+        已安装：显示「已安装（<路径>）」并隐藏下载按钮；
+        未安装：显示「未安装」并显示下载按钮（除非下载进行中）。
+        """
+        from ..asr.providers import default_model_dir, models_ready
+
+        # 下载进行中：不刷新（避免覆盖进度文案）。
+        if self._model_progress.isVisible():
+            return
+        model_dir = default_model_dir()
+        if models_ready(model_dir):
+            self._model_status_label.setText(f"已安装（{model_dir}）")
+            self._download_model_btn.hide()
+        else:
+            self._model_status_label.setText("未安装")
+            self._download_model_btn.show()
+
+    def set_model_download_progress(self, percent: int) -> None:
+        """由 application 层在下载进度回调（queued 主线程）中调用。
+
+        percent<0 表示总大小未知，进度条以忙碌态呈现。
+        """
+        if percent < 0:
+            # 忙碌态：范围 0,0。
+            self._model_progress.setRange(0, 0)
+        else:
+            self._model_progress.setRange(0, 100)
+            self._model_progress.setValue(max(0, min(100, percent)))
+        self._model_progress.show()
+        self._download_model_btn.setEnabled(False)
+        self._download_model_btn.setText("下载中…")
+
+    def on_model_download_complete(self) -> None:
+        """下载成功（queued 主线程）：刷新状态、复位按钮与进度条。"""
+        self._model_progress.hide()
+        self._model_progress.setRange(0, 100)
+        self._model_progress.setValue(0)
+        self._download_model_btn.setEnabled(True)
+        self._download_model_btn.setText("下载模型")
+        self.refresh_model_status()
+
+    def on_model_download_failed(self, message: str) -> None:
+        """下载失败（queued 主线程）：恢复按钮、隐藏进度条、显示错误文案。"""
+        self._model_progress.hide()
+        self._model_progress.setRange(0, 100)
+        self._model_progress.setValue(0)
+        self._download_model_btn.setEnabled(True)
+        self._download_model_btn.setText("下载模型")
+        self._model_status_label.setText("下载失败：" + message)
+        # 失败后仍按实际就绪态决定按钮可见性。
+        from ..asr.providers import default_model_dir, models_ready
+
+        if models_ready(default_model_dir()):
+            self._download_model_btn.hide()
+        else:
+            self._download_model_btn.show()
+
     # ==================== 按钮事件 ====================
 
     def _on_ok(self) -> None:
@@ -398,6 +519,19 @@ class SettingsWindow(QWidget):
         self._recheck_btn.setText("加载中…")
         # 重新检测 = 重新初始化（设备固定 AUTO/0）。
         self.recheck_hardware_requested.emit()
+
+    def _on_download_model_clicked(self) -> None:
+        """点击「下载模型」：禁用按钮、显示进度条、发信号给 application 后台下载。
+
+        UI 自身不发网络请求（AGENTS.md 11）。
+        """
+        self._download_model_btn.setEnabled(False)
+        self._download_model_btn.setText("下载中…")
+        # 忙碌态（总大小未知时保持），application 收到 Content-Length 后会切到百分比。
+        self._model_progress.setRange(0, 0)
+        self._model_progress.setValue(0)
+        self._model_progress.show()
+        self.model_download_requested.emit()
 
     def _on_test_conn_clicked(self) -> None:
         profile = self._current_test_profile()

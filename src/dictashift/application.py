@@ -53,6 +53,8 @@ class _Bridge(QObject):
     enabled_changed = Signal(bool)
     asr_ready = Signal()               # ASR 后台 initialize 完成（无论成败）
     test_conn_result = Signal(bool, str)  # 翻译测试连接结果（ok, message）
+    model_progress = Signal(int)       # 模型下载进度百分比（<0 表示总大小未知）
+    model_download_done = Signal(bool, str)  # 模型下载完成（ok, message）
 
 
 # ==================== action 名称 <-> settings hotkeys 字段 ====================
@@ -148,6 +150,12 @@ class DictaShiftApplication:
         self._bridge.test_conn_result.connect(
             self._settings_window.set_test_connection_result, Qt.QueuedConnection
         )
+        self._bridge.model_progress.connect(
+            self._settings_window.set_model_download_progress, Qt.QueuedConnection
+        )
+        self._bridge.model_download_done.connect(
+            self._on_model_download_done, Qt.QueuedConnection
+        )
 
         # 托盘
         self._tray.toggle_enabled_requested.connect(self._on_tray_toggle, Qt.QueuedConnection)
@@ -161,6 +169,9 @@ class DictaShiftApplication:
         )
         self._settings_window.test_connection_requested.connect(
             self._on_test_connection, Qt.QueuedConnection
+        )
+        self._settings_window.model_download_requested.connect(
+            self._on_model_download_requested, Qt.QueuedConnection
         )
 
     # ==================== 生命周期 ====================
@@ -211,6 +222,7 @@ class DictaShiftApplication:
         """在后台线程执行 asr_service.initialize；完成后 emit asr_ready。
 
         AGENTS.md 5.1 / 11：initialize 同步且耗时，绝不在 UI 线程。
+        若失败原因是模型文件缺失，给出专门的下载引导提示。
         """
 
         def _worker() -> None:
@@ -218,8 +230,15 @@ class DictaShiftApplication:
                 self._asr.initialize(device, device_id=device_id)
             except Exception:  # noqa: BLE001
                 logger.exception("[DictaShiftApplication] ASR initialize 失败")
+                # 模型文件缺失 -> 专门提示去设置页下载。
+                from .asr.providers import default_model_dir, models_ready
+
+                if not models_ready(default_model_dir()):
+                    msg = "语音识别模型未安装，请在设置-语音识别页下载模型"
+                else:
+                    msg = "语音识别引擎初始化失败，请检查硬件或重试"
                 # 失败通过 on_error 提示，但不阻止应用运行。
-                self._bridge.error.emit("语音识别引擎初始化失败，请检查硬件或重试")
+                self._bridge.error.emit(msg)
             finally:
                 self._bridge.asr_ready.emit()
 
@@ -396,6 +415,48 @@ class DictaShiftApplication:
 
         t = threading.Thread(target=_worker, name="dictashift-test-conn", daemon=True)
         t.start()
+
+    def _on_model_download_requested(self) -> None:
+        """设置窗口「下载模型」：后台线程下载到 user_model_dir()。
+
+        AGENTS.md 11：网络/解压在后台线程；进度经 queued signal 更新 UI。
+        """
+        from .asr.model_download import download_models
+        from .asr.providers import user_model_dir
+
+        dest = user_model_dir()
+
+        def _progress(downloaded: int, total: int) -> None:
+            if total <= 0:
+                # 总大小未知。
+                self._bridge.model_progress.emit(-1)
+                return
+            percent = int(downloaded * 100 / total)
+            self._bridge.model_progress.emit(percent)
+
+        def _worker() -> None:
+            try:
+                download_models(dest, progress_cb=_progress)
+                self._bridge.model_download_done.emit(True, "")
+            except Exception as e:  # noqa: BLE001
+                logger.exception("[DictaShiftApplication] 模型下载失败")
+                # 不泄露 URL/响应头；e 消息可能含本地路径，截断。
+                msg = f"{type(e).__name__}: {str(e)[:160]}"
+                self._bridge.model_download_done.emit(False, msg)
+
+        threading.Thread(
+            target=_worker, name="dictashift-model-download", daemon=True
+        ).start()
+
+    def _on_model_download_done(self, ok: bool, message: str) -> None:
+        """模型下载完成（queued 主线程）：刷新 UI，成功则重新初始化 ASR。"""
+        if ok:
+            self._settings_window.on_model_download_complete()
+            # 重新初始化 ASR（复用现有后台 recheck 路径）。
+            self._settings_window.set_recheck_loading(True)
+            self._start_asr_init_thread(AsrDevice.AUTO, 0)
+        else:
+            self._settings_window.on_model_download_failed(message)
 
     # ==================== 工具：bindings 构造 ====================
 
