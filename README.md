@@ -78,6 +78,10 @@ uv run python -m dictashift
 - 音频**仅在本地处理**：录音、SenseVoice ONNX 推理全部在本地完成，不上传音频。
 - 翻译文本会发送到你所选择的翻译服务（Google / Bing / 你配置的 OpenAI 兼容服务）。如需完全离线，请使用本地 llama-server。
 - 配置文件与模型存放在 `%APPDATA%\DictaShift\`，不收集任何遥测。
+- **API Key 存储**：OpenAI 兼容配置的 API Key 以明文保存在 `%APPDATA%\DictaShift\settings.json`（与本类桌面客户端的普遍做法一致）。请确保系统账户安全，不要在共享机器上存放高权限 Key。
+- **日志**：诊断日志写入 `%APPDATA%\DictaShift\logs\dictashift.log`，不包含 API Key、Authorization 头与翻译响应内容；出错时仅记录错误类型与状态码。
+- **全局键盘钩子**：本应用通过全局快捷键（F8/F9 等）工作，需要监听键盘按下/松开事件（pynput）。应用只在快捷键边沿触发动作，不记录、不存储、不外传任何按键序列；部分杀毒软件可能对键盘钩子行为告警，属正常现象。
+- **模型下载完整性**：语音识别模型从本仓库 GitHub Releases 下载，应用会校验文件大小与 SHA256。
 
 ## 开发
 

@@ -40,6 +40,16 @@ def _good_zip_bytes() -> bytes:
     return _make_zip(entries)
 
 
+def _good_hashes() -> dict[str, str]:
+    """与 _good_zip_bytes 的假内容匹配的 SHA256（成功路径测试注入用）。"""
+    import hashlib
+
+    return {
+        name: hashlib.sha256(b"a" * md.EXPECTED_SIZES[name]).hexdigest()
+        for name in REQUIRED_MODEL_FILES
+    }
+
+
 class _FakeStreamResponse:
     """模拟 httpx stream GET 的响应。"""
 
@@ -101,7 +111,11 @@ def test_download_success_extracts_three_files(tmp_path, patch_httpx) -> None:
     patch_httpx(200, body, content_length=len(body))
 
     progress = []
-    md.download_models(tmp_path, progress_cb=lambda d, t: progress.append((d, t)))
+    md.download_models(
+        tmp_path,
+        progress_cb=lambda d, t: progress.append((d, t)),
+        expected_hashes=_good_hashes(),
+    )
 
     for name in REQUIRED_MODEL_FILES:
         f = tmp_path / name
@@ -125,7 +139,11 @@ def test_download_progress_total_unknown_when_no_content_length(
     patch_httpx(200, body, content_length=None)
 
     progress = []
-    md.download_models(tmp_path, progress_cb=lambda d, t: progress.append((d, t)))
+    md.download_models(
+        tmp_path,
+        progress_cb=lambda d, t: progress.append((d, t)),
+        expected_hashes=_good_hashes(),
+    )
 
     assert progress
     assert all(t == -1 for _, t in progress)
@@ -142,6 +160,22 @@ def test_download_size_mismatch_cleans_up_and_raises(tmp_path, patch_httpx) -> N
 
     with pytest.raises(md.ModelDownloadError):
         md.download_models(tmp_path)
+
+    # 半成品已清理。
+    for name in REQUIRED_MODEL_FILES:
+        assert not (tmp_path / name).exists()
+
+
+def test_download_hash_mismatch_cleans_up_and_raises(tmp_path, patch_httpx) -> None:
+    """SHA256 不匹配（内容被篡改但大小相同）-> 抛错并清理半成品。"""
+    body = _good_zip_bytes()
+    patch_httpx(200, body, content_length=len(body))
+
+    bad_hashes = _good_hashes()
+    bad_hashes[REQUIRED_MODEL_FILES[0]] = "0" * 64  # 故意不匹配的哈希
+
+    with pytest.raises(md.ModelDownloadError, match="SHA256"):
+        md.download_models(tmp_path, expected_hashes=bad_hashes)
 
     # 半成品已清理。
     for name in REQUIRED_MODEL_FILES:
@@ -218,7 +252,7 @@ def test_download_cleans_temp_zip_on_success(tmp_path, patch_httpx, monkeypatch)
         return p
 
     monkeypatch.setattr(md.tempfile, "mktemp", _spy)
-    md.download_models(tmp_path)
+    md.download_models(tmp_path, expected_hashes=_good_hashes())
 
     import os
 

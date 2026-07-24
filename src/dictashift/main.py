@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -14,14 +15,26 @@ from PySide6.QtWidgets import QApplication
 from .application import DictaShiftApplication
 
 
-def _setup_logging() -> None:
-    """配置顶层 logging：INFO 级别 + logs/dictashift.log FileHandler。
+def _default_log_dir() -> Path:
+    """日志目录：%APPDATA%\\DictaShift\\logs（无 APPDATA 回退 ~/.dictashift/logs）。
 
-    日志目录在仓库根 logs/ 下，自动创建；创建失败时仅用 stderr 兜底。
+    开源安全审查 M2：不使用相对 cwd 的 logs/（打包版 cwd 不可预测，
+    且日志可能含敏感诊断信息，应落在用户数据目录）。
+    """
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "DictaShift" / "logs"
+    return Path.home() / ".dictashift" / "logs"
+
+
+def _setup_logging() -> None:
+    """配置顶层 logging：INFO 级别 + FileHandler。
+
+    日志目录自动创建；创建失败时仅用 stderr 兜底。
     """
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
     try:
-        log_dir = Path("logs")
+        log_dir = _default_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_dir / "dictashift.log", encoding="utf-8"))
     except OSError:

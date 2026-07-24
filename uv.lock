@@ -88,19 +88,19 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "numpy", specifier = ">=1.26" },
-    { name = "onnxruntime", specifier = ">=1.18" },
-    { name = "pynput", specifier = ">=1.7" },
-    { name = "pyside6", specifier = ">=6.7" },
-    { name = "sentencepiece", specifier = ">=0.2" },
-    { name = "sounddevice", specifier = ">=0.5" },
+    { name = "httpx", specifier = ">=0.27,<1.0" },
+    { name = "numpy", specifier = ">=1.26,<3.0" },
+    { name = "onnxruntime", specifier = ">=1.18,<2.0" },
+    { name = "pynput", specifier = ">=1.7,<2.0" },
+    { name = "pyside6", specifier = ">=6.7,<7.0" },
+    { name = "sentencepiece", specifier = ">=0.2,<1.0" },
+    { name = "sounddevice", specifier = ">=0.5,<1.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "pyinstaller", specifier = ">=6.0" },
-    { name = "pytest", specifier = ">=8.0" },
+    { name = "pyinstaller", specifier = ">=6.0,<7.0" },
+    { name = "pytest", specifier = ">=8.0,<10.0" },
 ]
 
 [[package]]

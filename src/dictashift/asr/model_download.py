@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import shutil
 import tempfile
 import zipfile
@@ -36,6 +37,18 @@ EXPECTED_SIZES = {
     "SenseVoice-CTC.int8.onnx": 13073048,
     "Tokenizer.bpe.model": 377341,
 }
+
+# 下载后完整性校验（SHA256）。防止 Release 资产被替换为同大小的篡改文件
+# （开源安全审查 H2）。发布新模型包时必须同步更新。
+EXPECTED_HASHES = {
+    "SenseVoice-Encoder.int8.onnx": "efecf25c231268c11f23a0431cec92f4570003efdefc9c97530891298ebe2772",
+    "SenseVoice-CTC.int8.onnx": "8a2217e07324a394575af470f2045add2eb2d1dc898ff8610fdef9936f4c18d9",
+    "Tokenizer.bpe.model": "aa87f86064c3730d799ddf7af3c04659151102cba548bce325cf06ba4da4e6a8",
+}
+
+# 下载阶段累积字节上限：期望总大小的 1.5 倍（约 363MB），
+# 防止异常响应耗尽磁盘（开源安全审查 M1）。
+_MAX_DOWNLOAD_BYTES = int(sum(EXPECTED_SIZES.values()) * 1.5)
 
 # 桌面 UA，避免某些 CDN 的默认拦截。
 _DESKTOP_UA = (
@@ -66,17 +79,21 @@ def _is_unsafe_name(name: str) -> bool:
 def download_models(
     dest_dir: Path,
     progress_cb: ProgressCb | None = None,
+    expected_hashes: dict[str, str] | None = None,
 ) -> None:
     """从 MODEL_DOWNLOAD_URL 流式下载 zip 到临时文件 -> 解压到 dest_dir ->
-    校验三个文件存在且大小匹配 -> 清理临时文件。
+    校验三个文件存在且大小、SHA256 匹配 -> 清理临时文件。
 
     progress_cb(downloaded_bytes, total_bytes)；total 未知（响应无
     Content-Length）时传 -1。
+    expected_hashes：默认使用模块常量 EXPECTED_HASHES（测试可注入）。
 
     任何失败抛 ModelDownloadError，并清理半成品：
     - 已解压但校验失败/拒绝条目的文件会被删除。
     - 临时下载文件始终清理。
     """
+    if expected_hashes is None:
+        expected_hashes = EXPECTED_HASHES
     dest_dir = Path(dest_dir)
     tmp_zip: Path | None = None
     extracted: list[Path] = []
@@ -110,13 +127,21 @@ def download_models(
                 cl = resp.headers.get("Content-Length")
                 if cl is not None and cl.isdigit():
                     total = int(cl)
+                    if total > _MAX_DOWNLOAD_BYTES:
+                        raise ModelDownloadError(
+                            f"下载中止：声明大小 {total} 字节超出安全上限"
+                        )
                 _emit(0, total)
                 with open(tmp_zip, "wb") as f:
                     for chunk in resp.iter_bytes(chunk_size=64 * 1024):
                         if not chunk:
                             continue
-                        f.write(chunk)
                         downloaded += len(chunk)
+                        if downloaded > _MAX_DOWNLOAD_BYTES:
+                            raise ModelDownloadError(
+                                "下载中止：累积大小超出安全上限（文件异常）"
+                            )
+                        f.write(chunk)
                         _emit(downloaded, total)
 
         # 2. 解压目标文件（仅 EXPECTED_SIZES 里的三个文件名）。
@@ -147,7 +172,7 @@ def download_models(
                     shutil.copyfileobj(src, dst)
                 extracted.append(target)
 
-        # 3. 校验：三个文件存在且大小匹配。
+        # 3. 校验：三个文件存在且大小、SHA256 匹配。
         for name in REQUIRED_MODEL_FILES:
             target = dest_dir / name
             if not target.exists():
@@ -158,6 +183,13 @@ def download_models(
                 raise ModelDownloadError(
                     f"文件大小校验失败：{name} 实际 {actual}，期望 {expected}"
                 )
+            expected_hash = expected_hashes.get(name)
+            if expected_hash:
+                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                if digest != expected_hash:
+                    raise ModelDownloadError(
+                        f"文件完整性校验失败（SHA256 不匹配）：{name}"
+                    )
 
     except ModelDownloadError:
         # 清理半成品。

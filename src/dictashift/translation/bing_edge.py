@@ -213,9 +213,14 @@ class BingEdgeBackend(TranslationBackend):
             return None
 
         if response.status_code != 200:
-            error_body = response.text[:500]
+            # 安全（开源审查 H1）：错误消息不回显响应体，避免服务端错误页
+            # 回显的用户转写文本进入异常消息/日志。
+            logger.debug(
+                "[Translation/Bing] HTTP %s 响应体（截断）：%s",
+                response.status_code, response.text[:200],
+            )
             raise TranslationError(
-                f"Bing 翻译请求失败：HTTP {response.status_code}，响应：{error_body}",
+                f"Bing 翻译请求失败：HTTP {response.status_code}",
                 status_code=response.status_code,
             )
 
