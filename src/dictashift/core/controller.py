@@ -345,23 +345,32 @@ class ApplicationController:
                 recover = False
         if recover:
             self._goto(AppState.IDLE)
+        # 创建任务并冻结翻译快照。no_profile_msg 非空表示 dictate_en 无活动
+        # profile：临界区内只置标记，_report_error 在锁外调用（避免在持锁时
+        # 触发可能间接触发其他锁/UI 的 on_error 通道）。
+        no_profile_msg: str | None = None
         with self._lock:
-            # 创建任务并冻结翻译快照。
             snapshot: TranslationProfile | None = None
             if action == "dictate_en":
                 snap = self._get_active_profile_locked()
                 if snap is not None:
                     snapshot = snap
                 else:
-                    # 无可用翻译档案，dictate_en 无法进行；静默忽略并报错。
+                    # 无可用翻译档案，dictate_en 无法进行；记 warning，锁外再
+                    # 通过 on_error 给用户可见提示。行为仍是不开始录音。
                     logger.warning(
                         "[ApplicationController] dictate_en 缺少活动翻译档案，忽略"
                     )
-                    return
-            self._current_task = VoiceTask(action=action, profile_snapshot=snapshot)
-            # 清除上一轮的中断标记。
-            self._cancel_requested = False
-            self._disabled_mid_task = False
+                    no_profile_msg = "未配置翻译服务：请先在设置中选择翻译配置"
+            if no_profile_msg is None:
+                self._current_task = VoiceTask(action=action, profile_snapshot=snapshot)
+                # 清除上一轮的中断标记。
+                self._cancel_requested = False
+                self._disabled_mid_task = False
+
+        if no_profile_msg is not None:
+            self._report_error(no_profile_msg)
+            return
 
         # 开始录音（锁外，recorder.start 可能涉及 PortAudio）。
         try:
@@ -370,9 +379,34 @@ class ApplicationController:
             logger.exception("[ApplicationController] recorder.start 异常")
             with self._lock:
                 self._current_task = None
-            self._report_error("无法开始录音（音频设备不可用）")
+            # 设备占用/打开失败的语义提示（不改 recorder 异常类型，仅文案）。
+            self._report_error("麦克风不可用：可能被其他应用独占或已拔出")
             return
         self._goto(AppState.RECORDING)
+
+    def _on_stream_error(self, msg: str) -> None:
+        """recorder 录音中途严重 status 回调（PortAudio 线程）。
+
+        - 仅 RECORDING 状态响应：discard 录音 + on_error 提示 + 回 IDLE。
+        - 走 self._lock，与 hotkey / worker 线程串行。
+        - 回调只做状态迁移与通知，recorder.discard 的关流阻塞可能极短，
+          AGENTS.md 5.1 的"回调不做阻塞 I/O"主要约束的是 _callback 本身；
+          此处是 recorder 主动通知上层的 on_stream_error 通道，由上层
+          （application 层）已转交后台线程执行，不直接在 PortAudio 线程阻塞。
+        """
+        with self._lock:
+            if self._sm.state != AppState.RECORDING:
+                return
+            current_task = self._current_task
+            self._current_task = None
+        # discard 在锁外执行（关流可能阻塞）。
+        if current_task is not None:
+            try:
+                self._recorder.discard()
+            except Exception:  # noqa: BLE001
+                logger.exception("[ApplicationController] stream error discard 异常")
+        self._report_error("录音中断：麦克风连接异常")
+        self._force_state(AppState.IDLE)
 
     def _handle_cancel(self) -> None:
         with self._lock:

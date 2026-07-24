@@ -50,9 +50,34 @@ class FakeInputStream:
 
 @pytest.fixture
 def fake_sd(monkeypatch):
-    """monkeypatch recorder.sd.InputStream 为 FakeInputStream。"""
+    """monkeypatch recorder.sd.InputStream 为 FakeInputStream，并默认把
+    query_devices 伪造成返回 16kHz 原生采样率的设备信息（多数测试沿用 16k）。"""
     monkeypatch.setattr(recorder_mod.sd, "InputStream", FakeInputStream)
+    _default = {"name": "fake-mic", "default_samplerate": 16000.0, "max_input_channels": 1}
+
+    def _query_devices(device=None, *args, **kwargs):
+        return _default
+
+    monkeypatch.setattr(recorder_mod.sd, "query_devices", _query_devices)
     return FakeInputStream
+
+
+@pytest.fixture
+def fake_query(monkeypatch):
+    """自包含 fixture：同时 patch InputStream 与 query_devices，返回可改写的
+    状态容器。测试中设置 fake_query['sr'] = 48000 即可改变设备原生采样率。
+
+    用法：fake_query['sr'] = 48000（默认 16k）
+    不与 fake_sd 同时使用（避免 query_devices 互相覆盖）。
+    """
+    monkeypatch.setattr(recorder_mod.sd, "InputStream", FakeInputStream)
+    state = {"sr": 16000.0}
+
+    def _query_devices(device=None, *args, **kwargs):
+        return {"name": "fake-mic", "default_samplerate": state["sr"], "max_input_channels": 1}
+
+    monkeypatch.setattr(recorder_mod.sd, "query_devices", _query_devices)
+    return state
 
 
 # ==================== AudioRecorder ====================
@@ -120,13 +145,89 @@ def test_discard_clears_buffer(fake_sd) -> None:
 
 
 def test_input_stream_records_kwargs(fake_sd) -> None:
-    """构造 InputStream 时参数正确传递。"""
-    rec = recorder_mod.AudioRecorder(sample_rate=22050)
+    """构造 InputStream 时参数正确传递。
+
+    新行为：流采样率取自设备原生采样率（query_devices，fake_sd 默认 16k），
+    不再直接用 sample_rate 构造参数。device_index 透传给 InputStream。
+    """
+    rec = recorder_mod.AudioRecorder(sample_rate=16000, device_index=7)
     rec.start()
     stream: FakeInputStream = rec._stream  # type: ignore[assignment]
-    assert stream.kwargs["samplerate"] == 22050
+    # samplerate 走设备原生（默认 fake 设备 16k）
+    assert stream.kwargs["samplerate"] == 16000
     assert stream.kwargs["channels"] == 1
     assert stream.kwargs["dtype"] == "float32"
+    # device_index 透传
+    assert stream.kwargs["device"] == 7
+    rec.stop()
+
+
+def test_device_index_defaults_to_none(fake_sd) -> None:
+    """不传 device_index 时 InputStream 收到 device=None（默认输入设备）。"""
+    rec = recorder_mod.AudioRecorder()
+    assert rec.device_index is None
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    assert stream.kwargs["device"] is None
+    rec.stop()
+
+
+def test_device_index_passed_through(monkeypatch) -> None:
+    """device_index 透传到 InputStream 与 query_devices。"""
+    monkeypatch.setattr(recorder_mod.sd, "InputStream", FakeInputStream)
+    calls: list = []
+
+    def _q(device=None, *a, **kw):
+        calls.append(device)
+        return {"name": "x", "default_samplerate": 16000.0, "max_input_channels": 1}
+
+    monkeypatch.setattr(recorder_mod.sd, "query_devices", _q)
+    rec = recorder_mod.AudioRecorder(device_index=3)
+    rec.start()
+    assert calls and calls[-1] == 3
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    assert stream.kwargs["device"] == 3
+    rec.stop()
+
+
+def test_non_native_sr_resampled_to_16k(fake_query) -> None:
+    """设备原生 48k -> 流以 48k 打开，stop 返回 16k 长度比例正确（1/3）。"""
+    fake_query["sr"] = 48000.0
+    rec = recorder_mod.AudioRecorder(device_index=0)
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    # 流确实以 48k 打开
+    assert stream.kwargs["samplerate"] == 48000
+    # 喂入 4800 采样（48k 下的 0.1 秒）
+    frame = np.zeros((4800, 1), dtype=np.float32)
+    stream.feed(frame, frames=4800)
+    out = rec.stop()
+    # 48k -> 16k：长度应为 1600 ±1（重采样长度按 ceil 比例）
+    assert out.dtype == np.float32
+    assert out.ndim == 1
+    assert abs(out.shape[0] - 1600) <= 2
+
+
+def test_native_16k_passthrough_no_resample(fake_sd) -> None:
+    """设备原生 16k -> 不重采样，stop 返回原始长度。"""
+    rec = recorder_mod.AudioRecorder()
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    stream.feed(np.full((1000, 1), 0.5, dtype=np.float32), frames=1000)
+    out = rec.stop()
+    assert out.shape == (1000,)
+    np.testing.assert_allclose(out, 0.5)
+
+
+def test_query_devices_failure_falls_back_to_16k(monkeypatch, fake_sd) -> None:
+    """query_devices 抛异常时回退 16k，流以 16k 打开。"""
+    def boom(*a, **kw):
+        raise RuntimeError("sd unavailable")
+    monkeypatch.setattr(recorder_mod.sd, "query_devices", boom)
+    rec = recorder_mod.AudioRecorder(device_index=2)
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    assert stream.kwargs["samplerate"] == 16000
     rec.stop()
 
 
@@ -139,6 +240,123 @@ def test_auto_stop_callback_invoked(fake_sd) -> None:
     # 喂满 1 秒（16000 采样）
     stream.feed(np.zeros((16000, 1), dtype=np.float32), frames=16000)
     assert called.wait(timeout=2.0)
+    rec.stop()
+
+
+def test_auto_stop_uses_native_sr(fake_query) -> None:
+    """自动停止按设备原生采样率累计：48k 下 max_seconds=1 需 48000 采样触发。"""
+    fake_query["sr"] = 48000.0
+    called = threading.Event()
+    rec = recorder_mod.AudioRecorder(sample_rate=16000, max_seconds=1, on_auto_stop=called.set)
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    # 喂 47999 采样（48k 下不足 1 秒）-> 不应触发
+    stream.feed(np.zeros((47999, 1), dtype=np.float32), frames=47999)
+    assert not called.wait(timeout=0.2)
+    # 再喂 1 采样 -> 达到 48000，触发
+    stream.feed(np.zeros((1, 1), dtype=np.float32), frames=1)
+    assert called.wait(timeout=2.0)
+    rec.stop()
+
+
+# ==================== _is_fatal_status 纯函数 ====================
+
+
+def test_is_fatal_status_empty_not_fatal() -> None:
+    from dictashift.audio.recorder import _is_fatal_status
+    import sounddevice as sd
+    # 空 CallbackFlags / 0 / None 都不是致命
+    assert _is_fatal_status(sd.CallbackFlags(0)) is False
+    assert _is_fatal_status(None) is False
+    assert _is_fatal_status(0) is False
+
+
+def test_is_fatal_status_input_overflow_not_fatal() -> None:
+    from dictashift.audio.recorder import _is_fatal_status
+    import sounddevice as sd
+    # input_overflow 位 = 2，input_underflow = 1，priming_output = 16：均良性
+    assert _is_fatal_status(sd.CallbackFlags(2)) is False
+    assert _is_fatal_status(sd.CallbackFlags(1)) is False
+    assert _is_fatal_status(sd.CallbackFlags(16)) is False
+    # 组合良性位仍非致命
+    assert _is_fatal_status(sd.CallbackFlags(1 | 2 | 16)) is False
+
+
+def test_is_fatal_status_output_flags_fatal() -> None:
+    from dictashift.audio.recorder import _is_fatal_status
+    import sounddevice as sd
+    # output_underflow = 4, output_overflow = 8：纯输入流不应出现 -> 致命
+    assert _is_fatal_status(sd.CallbackFlags(4)) is True
+    assert _is_fatal_status(sd.CallbackFlags(8)) is True
+    # input_overflow + output_overflow 组合仍致命
+    assert _is_fatal_status(sd.CallbackFlags(2 | 8)) is True
+
+
+def test_is_fatal_status_unknown_high_bit_fatal() -> None:
+    from dictashift.audio.recorder import _is_fatal_status
+    import sounddevice as sd
+    # 未知高位 flag -> 保守判定为致命
+    assert _is_fatal_status(sd.CallbackFlags(1 << 20)) is True
+
+
+# ==================== on_stream_error 一次性通知 ====================
+
+
+def _make_fatal_status():
+    import sounddevice as sd
+    return sd.CallbackFlags(8)  # output_overflow -> _is_fatal_status 判定为 True
+
+
+def test_stream_error_notified_once_on_fatal_status(fake_sd) -> None:
+    """致命 status 出现多次时 on_stream_error 只通知一次。"""
+    msgs: list[str] = []
+
+    rec = recorder_mod.AudioRecorder(on_stream_error=msgs.append)
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    # status 必须放在第 4 位（callback 签名 indata, frames, time, status）
+    fatal = _make_fatal_status()
+    stream.callback(np.zeros((4, 1), dtype=np.float32), 4, 0, fatal)
+    stream.callback(np.zeros((4, 1), dtype=np.float32), 4, 0, fatal)
+    stream.callback(np.zeros((4, 1), dtype=np.float32), 4, 0, fatal)
+    assert len(msgs) == 1
+    # 消息内容是 str(status)
+    assert "output overflow" in msgs[0] or "output" in msgs[0]
+    rec.stop()
+
+
+def test_stream_error_not_called_on_input_overflow(fake_sd) -> None:
+    """input_overflow 仅 debug 日志，不触发 on_stream_error。"""
+    import sounddevice as sd
+    msgs: list[str] = []
+    rec = recorder_mod.AudioRecorder(on_stream_error=msgs.append)
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    stream.callback(np.zeros((4, 1), dtype=np.float32), 4, 0, sd.CallbackFlags(2))
+    stream.callback(np.zeros((4, 1), dtype=np.float32), 4, 0, sd.CallbackFlags(2))
+    assert msgs == []
+    rec.stop()
+
+
+def test_stream_error_notified_again_after_new_start(fake_sd) -> None:
+    """stop + 再次 start 后，新一轮录音致命 status 可再次通知一次。"""
+    msgs: list[str] = []
+    fatal = _make_fatal_status()
+
+    rec = recorder_mod.AudioRecorder(on_stream_error=msgs.append)
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    stream.callback(np.zeros((4, 1), dtype=np.float32), 4, 0, fatal)
+    stream.callback(np.zeros((4, 1), dtype=np.float32), 4, 0, fatal)
+    assert len(msgs) == 1
+    rec.stop()
+
+    # 新一轮
+    rec.start()
+    stream2: FakeInputStream = rec._stream  # type: ignore[assignment]
+    stream2.callback(np.zeros((4, 1), dtype=np.float32), 4, 0, fatal)
+    stream2.callback(np.zeros((4, 1), dtype=np.float32), 4, 0, fatal)
+    assert len(msgs) == 2
     rec.stop()
 
 

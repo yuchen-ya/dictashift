@@ -140,6 +140,88 @@ def test_type_text_at_cursor_success_returns_true(monkeypatch) -> None:
     assert called["text"] == "直输测试"
 
 
+# ==================== strip_emoji 用例 ====================
+
+
+def test_strip_emoji_keeps_chinese_and_punctuation() -> None:
+    """中文、标点、数字保留。"""
+    assert typing.strip_emoji("你好，世界！123") == "你好，世界！123"
+
+
+def test_strip_emoji_keeps_english_and_ascii() -> None:
+    """英文与常见 ASCII 符号保留。"""
+    assert typing.strip_emoji("Hello, world! abc 123") == "Hello, world! abc 123"
+
+
+def test_strip_emoji_keeps_common_symbols_copyright() -> None:
+    """©(U+00A9) ®(U+00AE) ™(U+2122) 等常用符号保留。"""
+    assert typing.strip_emoji("©®™") == "©®™"
+
+
+def test_strip_emoji_strips_non_bmp_emoji() -> None:
+    """非 BMP emoji（U+1F600😀, U+1F3A4🎤, 旗帜 U+1F1E8 U+1F1F3）过滤。"""
+    assert typing.strip_emoji("😀🎤") == ""
+    # 旗帜 emoji 由两个 regional indicator（非 BMP？实际 U+1F1E8 在补充平面）
+    assert typing.strip_emoji("CN 🇨🇳") == "CN "
+
+
+def test_strip_emoji_strips_bmp_symbol_blocks() -> None:
+    """BMP 表情符号区（U+2600-U+27BF、U+2B00-U+2BFF）过滤。"""
+    # ☀ (U+2600)、✂ (U+2702)、✅ (U+2705)、⬛ (U+2B1B)
+    assert typing.strip_emoji("a☀b✂c✅d⬛e") == "abcde"
+
+
+def test_strip_emoji_strips_variation_selector_and_zwj() -> None:
+    """VS16 (U+FE0F)、ZWJ (U+200D)、keycap 组合 (U+20E3) 过滤；
+    © + VS16 仍正常显示为 ©。"""
+    # ©(U+00A9) + VS16(U+FE0F) -> ©（VS16 被过滤，© 保留）
+    assert typing.strip_emoji("©\ufe0f") == "©"
+    # ZWJ 序列：男 + ZWJ + 男（非 BMP）整体都被过滤
+    assert typing.strip_emoji("\u200d") == ""
+    # keycap 组合：'1'(U+0031) + VS16 + U+20E3 -> '1'（后两者过滤）
+    assert typing.strip_emoji("1\ufe0f\u20e3") == "1"
+
+
+def test_strip_emoji_mixed_text() -> None:
+    """混合文本：保留普通字符，过滤 emoji。"""
+    text = "你好 hello 🎤 世界！world ✅ test"
+    assert typing.strip_emoji(text) == "你好 hello  世界！world  test"
+
+
+def test_strip_emoji_empty_string() -> None:
+    """空串原样返回。"""
+    assert typing.strip_emoji("") == ""
+
+
+# ==================== type_text_at_cursor：emoji 过滤 ====================
+
+
+def test_type_text_at_cursor_strips_emoji_before_inject(monkeypatch) -> None:
+    """有 caret 时，emoji 在注入前被过滤；注入的是过滤后的文本。"""
+    monkeypatch.setattr(typing, "has_focused_caret", lambda: True)
+    captured: list[str] = []
+
+    def _capture(text: str) -> None:
+        captured.append(text)
+
+    monkeypatch.setattr(typing, "type_text", _capture)
+    assert typing.type_text_at_cursor("你好🎤world✅") is True
+    assert captured == ["你好world"]
+
+
+def test_type_text_at_cursor_emoji_only_returns_true_no_inject(monkeypatch) -> None:
+    """过滤后为空串 -> 返回 True 且不调用 type_text。"""
+    monkeypatch.setattr(typing, "has_focused_caret", lambda: True)
+    called = {"n": 0}
+
+    def _fail(text: str) -> None:
+        called["n"] += 1
+
+    monkeypatch.setattr(typing, "type_text", _fail)
+    assert typing.type_text_at_cursor("🎤✅😀") is True
+    assert called["n"] == 0
+
+
 # ==================== text_to_units：混合文本补充 ====================
 
 

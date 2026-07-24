@@ -66,6 +66,34 @@ _user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int
 # ==================== 纯函数 ====================
 
 
+def strip_emoji(text: str) -> str:
+    """过滤 emoji：全部非 BMP 字符（U+10000 及以上）、BMP 表情符号区
+    （U+2600-U+27BF、U+2B00-U+2BFF、U+FE00-U+FE0F 变体选择符、U+200D 零宽连接符、
+    U+20E3 组合 enclosed keycap）。普通中英文/标点/数字/常用符号（如 ©®™）保留。
+    ©(U+00A9) 和 ®(U+00AE) 后的 FE0F 变体选择符被过滤不影响显示。"""
+
+    def _is_emoji(cp: int) -> bool:
+        # 全部非 BMP（U+10000 及以上），包括所有 emoji（表情、补充符号、旗帜等）。
+        if cp >= 0x10000:
+            return True
+        # BMP 表情/符号区。
+        if 0x2600 <= cp <= 0x27BF:      # 杂项符号 + 装饰符号（☀ ⛄ ✂ ✏ ✅ 等）
+            return True
+        if 0x2B00 <= cp <= 0x2BFF:      # 其他符号（⬛ ⬤ 等）
+            return True
+        if 0xFE00 <= cp <= 0xFE0F:      # 变体选择符 VS1-VS16
+            return True
+        if cp == 0x200D:                # 零宽连接符 ZWJ（用于 emoji 组合）
+            return True
+        if cp == 0x20E3:                # 组合 enclosed keycap（数字键帽 emoji 的组合符）
+            return True
+        return False
+
+    if not text:
+        return text
+    return "".join(ch for ch in text if not _is_emoji(ord(ch)))
+
+
 def _char_to_utf16_units(ch: str) -> list[int]:
     """单个字符 -> UTF-16 code unit 列表 (BMP 字符 1 个，非 BMP surrogate pair 2 个)。"""
     data = ch.encode("utf-16-le")
@@ -135,14 +163,21 @@ def type_text_at_cursor(text: str) -> bool:
     返回值语义与原 paste_text 对齐：True=已输出，False=失败需上层处理。
     - 空文本直接返回 True。
     - has_focused_caret() 为 False -> 返回 False (不尝试注入，由上层弹窗)。
+    - 过滤 emoji 后为空串 -> 视为已处理，记 info 日志并返回 True（不注入）。
     - type_text 抛 OutputError -> 返回 False (记 warning 日志)。
     """
     if not text:
         return True
     if not has_focused_caret():
         return False
+    # 过滤 emoji（产品决策：Qt 目标 emoji 错位，默认过滤）。
+    # 注意：controller.on_text_ready 仍携带原文，弹窗可显示完整内容。
+    filtered = strip_emoji(text)
+    if not filtered:
+        logger.info("[type_text_at_cursor] emoji 过滤后为空串，不注入（原文 %d 字符）", len(text))
+        return True
     try:
-        type_text(text)
+        type_text(filtered)
     except OutputError:
         logger.warning("[type_text_at_cursor] 直输失败，请查看弹窗", exc_info=True)
         return False

@@ -529,6 +529,96 @@ def test_dictate_en_without_active_profile_does_not_record() -> None:
     assert ctrl.state == AppState.IDLE
 
 
+def test_dictate_en_without_active_profile_reports_error() -> None:
+    """dictate_en 无活动 profile 时通过 on_error 给用户可见提示，且不录音。"""
+    ctrl, cb, asr, recorder, _ = _make_controller()
+    cb.error_event.clear()
+
+    ctrl.handle_hotkey_press("dictate_en")
+    assert _wait(cb.error_event)
+    assert recorder.start_calls == 0
+    assert ctrl.state == AppState.IDLE
+    assert len(cb.errors) == 1
+    assert "翻译" in cb.errors[0] or "设置" in cb.errors[0]
+
+
+def test_dictate_en_with_profile_starts_recording_and_no_error() -> None:
+    """对照测试：有活动 profile 时不报错，正常录音。"""
+    ctrl, cb, asr, recorder, _ = _make_controller()
+    ctrl.set_translation_profiles([_PROFILE_OLD], active_name="old")
+    cb.error_event.clear()
+
+    ctrl.handle_hotkey_press("dictate_en")
+    assert recorder.start_calls == 1
+    assert ctrl.state == AppState.RECORDING
+    assert cb.errors == []
+    # 清理
+    rec_audio = np.ones(1600, dtype=np.float32)
+    recorder._stop_audio = rec_audio  # type: ignore[attr-defined]
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_en")
+    assert _wait(cb.text_event)
+
+
+# ==================== 录音中 stream error ====================
+
+
+def test_stream_error_while_recording_discards_and_reports() -> None:
+    """RECORDING 中触发 controller._on_stream_error -> discard + on_error + IDLE。"""
+    ctrl, cb, asr, recorder, _ = _make_controller()
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.RECORDING
+
+    cb.error_event.clear()
+    ctrl._on_stream_error("output overflow")
+
+    # 等待 on_error
+    assert _wait(cb.error_event)
+    # discard 被调用一次
+    assert recorder.discard_calls == 1
+    # 状态回 IDLE
+    assert ctrl.state == AppState.IDLE
+    # 错误消息含"录音中断"语义
+    assert len(cb.errors) == 1
+    assert "录音中断" in cb.errors[0] or "麦克风" in cb.errors[0]
+
+
+def test_stream_error_ignored_when_not_recording() -> None:
+    """非 RECORDING 状态下 _on_stream_error 不触发状态迁移/discard/error。"""
+    ctrl, cb, asr, recorder, _ = _make_controller()
+    # 当前 IDLE
+    assert ctrl.state == AppState.IDLE
+    cb.error_event.clear()
+
+    ctrl._on_stream_error("output overflow")
+    # 短暂等待确认无事件
+    assert not cb.error_event.wait(timeout=0.2)
+    assert recorder.discard_calls == 0
+    assert ctrl.state == AppState.IDLE
+    assert cb.errors == []
+
+
+def test_stream_error_after_release_does_not_clobber_pipeline() -> None:
+    """release 已结束录音（进入 TRANSCRIBING）后 stream error 不应误打断流水线。"""
+    paste_calls: list[str] = []
+    ctrl, cb, asr, recorder, _ = _make_controller(
+        paste_func=lambda t: paste_calls.append(t) or True
+    )
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+    # 等 worker 进入 TRANSCRIBING
+    _wait_for_state(cb, AppState.TRANSCRIBING)
+
+    # 此时 stream error 回调进来（状态非 RECORDING）-> 应被忽略
+    ctrl._on_stream_error("output overflow")
+
+    _wait_for_state(cb, AppState.IDLE)
+    time.sleep(0.2)
+    # 流水线照常粘贴
+    assert len(paste_calls) == 1
+    assert ctrl.state == AppState.IDLE
+
+
 # ==================== controller 默认 paste_func 语义 ====================
 
 
