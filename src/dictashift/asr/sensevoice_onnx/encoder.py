@@ -9,12 +9,10 @@ logger = logging.getLogger(__name__)
 class SenseVoiceEncoder:
     def __init__(self, encoder_path: str, providers: list):
         # 1. 资源路径
-        self.model_path = encoder_path # 记录路径用于 TRT 缓存
+        self.model_path = encoder_path
         encoder_path = Path(encoder_path)
 
         # 2. 初始化会话 (职责下放：稳健的 Provider 选择逻辑)
-
-        # 3. 初始化会话 (职责下放：稳健的 Provider 选择逻辑)
         session_opts = ort.SessionOptions()
         session_opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
         session_opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
@@ -71,7 +69,7 @@ class SenseVoiceEncoder:
 
         T_valid = lfr_feat.shape[0]
 
-        # 动态轴推理 (非 DML 模式或长度已超过固定值)
+        # 动态轴推理（按实际输入长度构造 mask）
         mask = np.ones((1, T_valid), dtype=self.input_dtype)
         enc_out = self.session.run(None, {
             "speech_feat": lfr_feat[np.newaxis, ...].astype(self.input_dtype),

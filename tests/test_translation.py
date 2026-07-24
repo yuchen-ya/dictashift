@@ -20,10 +20,16 @@ import pytest
 
 from dictashift.translation import (
     DEFAULT_LLAMA_PORT,
+    BUILTIN_BING,
+    BUILTIN_GOOGLE,
     LlamaServerBackend,
     OpenAICompatibleBackend,
     TranslationError,
     TranslationProfile,
+    builtin_free_profiles,
+    builtin_name_for_backend_type,
+    builtin_profile_by_name,
+    builtin_profile_names,
 )
 from dictashift.translation.openai_compatible import _build_request_body, _parse_sse_line
 
@@ -239,3 +245,47 @@ def test_default_local_profile_base_url() -> None:
 def test_default_local_profile_custom_port() -> None:
     p = LlamaServerBackend.default_local_profile(port=12345)
     assert p.base_url == "http://127.0.0.1:12345/v1"
+
+
+# ==================== 内置免登录翻译项 ====================
+
+
+def test_builtin_free_profiles_backend_types() -> None:
+    """builtin_free_profiles 返回 (Google, Bing)，backend_type 正确。"""
+    google, bing = builtin_free_profiles()
+    assert google is BUILTIN_GOOGLE
+    assert bing is BUILTIN_BING
+    assert BUILTIN_GOOGLE.backend_type == "google"
+    assert BUILTIN_BING.backend_type == "bing"
+
+
+def test_builtin_profile_names_unique() -> None:
+    """内置项 name 唯一。"""
+    names = builtin_profile_names()
+    assert len(names) == 2
+    assert len(names) == len(set(names))
+    assert BUILTIN_GOOGLE.name in names
+    assert BUILTIN_BING.name in names
+
+
+def test_builtin_profiles_empty_url_model() -> None:
+    """内置项 base_url/model 为空（免登录服务无需配置）。"""
+    for p in builtin_free_profiles():
+        assert p.base_url == ""
+        assert p.model == ""
+        assert p.api_key is None
+
+
+def test_builtin_name_for_backend_type_mapping() -> None:
+    """backend_type -> 内置项 name 映射正确；openai_compatible 返回 None。"""
+    assert builtin_name_for_backend_type("google") == BUILTIN_GOOGLE.name
+    assert builtin_name_for_backend_type("bing") == BUILTIN_BING.name
+    assert builtin_name_for_backend_type("openai_compatible") is None
+
+
+def test_builtin_profile_by_name() -> None:
+    """按 name 查找内置项；未命中返回 None。"""
+    assert builtin_profile_by_name(BUILTIN_GOOGLE.name) is BUILTIN_GOOGLE
+    assert builtin_profile_by_name(BUILTIN_BING.name) is BUILTIN_BING
+    assert builtin_profile_by_name("不存在") is None
+

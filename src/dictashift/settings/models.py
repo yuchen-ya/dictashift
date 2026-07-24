@@ -14,7 +14,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..translation import TranslationProfile
+from ..translation import (
+    TranslationProfile,
+    builtin_name_for_backend_type,
+    builtin_profile_names,
+)
 
 
 # ==================== 翻译档案序列化 ====================
@@ -104,19 +108,18 @@ class HotkeySettings:
 class AsrSettings:
     """ASR 配置。
 
-    默认值：device=auto, device_id=0, max_record_seconds=60,
-    mic_device_index=None（表示使用系统默认输入设备）。
+    device/device_id 字段已随 GPU 路线移除（推理设备固定为 AUTO/CPU，等价）。
+    from_dict 本就忽略未知键，旧配置文件中的 device/device_id 键自然失效，
+    无需额外迁移代码。
+
+    默认值：max_record_seconds=60, mic_device_index=None（表示使用系统默认输入设备）。
     """
 
-    device: str = "auto"
-    device_id: int = 0
     max_record_seconds: int = 60
     mic_device_index: int | None = None
 
     def to_dict(self) -> dict:
         return {
-            "device": self.device,
-            "device_id": self.device_id,
             "max_record_seconds": self.max_record_seconds,
             "mic_device_index": self.mic_device_index,
         }
@@ -125,14 +128,7 @@ class AsrSettings:
     def from_dict(cls, d: dict | None = None) -> "AsrSettings":
         if not d:
             return cls()
-        device = d.get("device", "auto")
-        # 配置迁移：第一版移除了 GPU 路线（CUDA/DirectML），旧配置中的
-        # 已移除设备值静默归一为 "auto"，不报错。
-        if device in {"cuda", "directml"}:
-            device = "auto"
         return cls(
-            device=device,
-            device_id=d.get("device_id", 0),
             max_record_seconds=d.get("max_record_seconds", 60),
             mic_device_index=d.get("mic_device_index", None),
         )
@@ -159,13 +155,37 @@ class TranslationSettings:
         if not d:
             return cls()
         raw_profiles = d.get("profiles", []) or []
+        # 过滤掉非 openai_compatible 的 profile（旧版本保存的免费 profile 由
+        # 内置项 BUILTIN_GOOGLE/BUILTIN_BING 取代，不再作为用户配置持久化）。
+        # 同时记录被过滤项的 backend_type，用于 active_profile 重映射。
         profiles: list[TranslationProfile] = []
+        dropped_by_name: dict[str, TranslationProfile] = {}
         if isinstance(raw_profiles, list):
             for item in raw_profiles:
-                if isinstance(item, dict):
-                    profiles.append(profile_from_dict(item))
+                if not isinstance(item, dict):
+                    continue
+                p = profile_from_dict(item)
+                if p.backend_type == "openai_compatible":
+                    profiles.append(p)
+                else:
+                    dropped_by_name[p.name] = p
+        active_profile = d.get("active_profile", "")
+        # active_profile 指向被过滤掉的免费 profile：按 backend_type 映射到内置项 name。
+        if active_profile in dropped_by_name:
+            mapped = builtin_name_for_backend_type(
+                dropped_by_name[active_profile].backend_type
+            )
+            active_profile = mapped if mapped is not None else ""
+        # active_profile 指向不存在的 name（既非保留项也非内置项）：置为 ""。
+        # 注意：内置项 name 合法（不持久化在 profiles 中），不应被清除。
+        elif (
+            active_profile
+            and active_profile not in builtin_profile_names()
+            and not any(p.name == active_profile for p in profiles)
+        ):
+            active_profile = ""
         return cls(
-            active_profile=d.get("active_profile", ""),
+            active_profile=active_profile,
             profiles=profiles,
         )
 

@@ -28,6 +28,6 @@ packages = ["src/dictashift"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "hardware: 依赖真实模型/GPU/麦克风的测试，默认跳过",
+    "hardware: 依赖真实模型/麦克风的测试，默认跳过",
 ]
 addopts = "-m 'not hardware'"

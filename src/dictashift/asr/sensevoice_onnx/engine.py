@@ -14,7 +14,7 @@ class SenseVoiceInference:
     SenseVoice ONNX 推理引擎 (纯净版)
     - 零 PyTorch 依赖
     - 动态 Prompt 构造
-    - ONNX CPU/DML 支持
+    - ONNX CPU 支持
     """
     def __init__(self, config: ASREngineConfig):
         """
@@ -61,8 +61,8 @@ class SenseVoiceInference:
     def active_providers(self) -> List[str]:
         """返回 encoder/decoder Session 实际生效的 provider 名（去重，保持顺序）。
 
-        onnxruntime 在 CUDA 依赖缺失时可能只警告并静默回退 CPU 而不抛异常，
-        因此不能仅凭"创建没报错"判断设备，必须用 get_providers() 核实。
+        用于核实 ONNX Session 实际加载的 execution provider，不能仅凭
+        "创建没报错"判断，必须用 get_providers() 核实。
         """
         seen: List[str] = []
         for component in (self.encoder, self.decoder):

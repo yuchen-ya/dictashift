@@ -28,7 +28,7 @@ from .hotkeys.matcher import HotkeyBinding, parse_hotkey
 from .hotkeys.service import HotkeyService
 from .output.typing import type_text_at_cursor
 from .settings import AppSettings, SettingsRepository
-from .translation import DispatcherBackend, TranslationProfile
+from .translation import DispatcherBackend, TranslationProfile, builtin_free_profiles
 from .ui.overlay import StateOverlay
 from .ui.result_popup import ResultPopup
 from .ui.settings_window import SettingsWindow
@@ -177,14 +177,12 @@ class DictaShiftApplication:
         except Exception:  # noqa: BLE001
             logger.exception("[DictaShiftApplication] 启动 hotkey 监听失败")
             self._tray.show_message("DictaShift", "全局快捷键监听启动失败")
-        # 初始化翻译 profiles
+        # 初始化翻译 profiles：内置免登录项 + 用户 LLM profiles
         self._controller.set_translation_profiles(
-            self.settings.translation.profiles, self.settings.translation.active_profile
+            self._translation_profiles_for_controller(), self.settings.translation.active_profile
         )
-        # 后台初始化 ASR（不阻塞 UI）
-        self._start_asr_init_thread(
-            AsrDevice(self.settings.asr.device), int(self.settings.asr.device_id)
-        )
+        # 后台初始化 ASR（不阻塞 UI）。设备固定 AUTO/0（GPU 路线已移除）。
+        self._start_asr_init_thread(AsrDevice.AUTO, 0)
 
     def shutdown(self) -> None:
         """退出收尾：停 hotkey、停录音、释放 ASR、保存设置。"""
@@ -314,12 +312,6 @@ class DictaShiftApplication:
 
     def _on_settings_applied(self, new_settings: AppSettings) -> None:
         """用户在设置窗口点击「应用」/「确定」。"""
-        # 检测 ASR 设备变化
-        old_device = self.settings.asr.device
-        old_device_id = self.settings.asr.device_id
-        new_device = new_settings.asr.device
-        new_device_id = new_settings.asr.device_id
-
         self.settings = new_settings
 
         # 保存
@@ -331,35 +323,24 @@ class DictaShiftApplication:
         # 更新热键绑定（无需重启 listener）
         self._hotkeys.update_bindings(self._bindings_from_settings(self.settings))
 
-        # 更新翻译 profiles
+        # 更新翻译 profiles：内置免登录项 + 用户 LLM profiles
         self._controller.set_translation_profiles(
-            self.settings.translation.profiles, self.settings.translation.active_profile
+            self._translation_profiles_for_controller(),
+            self.settings.translation.active_profile,
         )
 
         # overlay 显隐
         self._overlay.set_visible_enabled(self.settings.ui.show_overlay)
+        # ASR 设备不再可变（GPU 路线已移除）：设置应用时不触发设备切换。
 
-        # ASR 设备变化：后台 switch，完成后经 on_done 刷新实际设备标签
-        if old_device != new_device or old_device_id != new_device_id:
-            self._settings_window.set_recheck_loading(True)
-            self._controller.switch_asr_device(
-                AsrDevice(new_device),
-                device_id=int(new_device_id),
-                on_done=self._on_asr_switch_done,
-            )
+    def _translation_profiles_for_controller(self) -> list[TranslationProfile]:
+        """构造传给 controller 的 profiles 列表：内置免登录项在前，用户 LLM 在后。"""
+        return list(builtin_free_profiles()) + list(self.settings.translation.profiles)
 
-    def _on_asr_switch_done(self, success: bool) -> None:
-        """controller.switch_asr_device 完成后回调（切换线程内）。
-
-        emit asr_ready（QueuedConnection 回主线程）刷新"实际运行设备"标签；
-        失败时 on_error 已另行上报，这里仍刷新标签以显示保留的旧设备。
-        """
-        self._bridge.asr_ready.emit()
-
-    def _on_recheck_hardware(self, device: AsrDevice, device_id: int) -> None:
-        """设置窗口「重新检测硬件」：后台重新 initialize。"""
+    def _on_recheck_hardware(self) -> None:
+        """设置窗口「重新检测硬件」：后台重新 initialize（设备固定 AUTO/0）。"""
         self._settings_window.set_recheck_loading(True)
-        self._start_asr_init_thread(device, device_id)
+        self._start_asr_init_thread(AsrDevice.AUTO, 0)
 
     def _on_test_connection(self, profile: TranslationProfile) -> None:
         """设置窗口「测试连接」：后台线程调 backend.translate。

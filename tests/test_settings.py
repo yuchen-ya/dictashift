@@ -46,8 +46,6 @@ def test_app_settings_defaults() -> None:
     assert s.hotkeys.dictate_en == "f9"
     assert s.hotkeys.toggle_enabled == "ctrl+alt+f12"
     assert s.hotkeys.cancel == "esc"
-    assert s.asr.device == "auto"
-    assert s.asr.device_id == 0
     assert s.asr.max_record_seconds == 60
     assert s.asr.mic_device_index is None
     assert s.translation.active_profile == ""
@@ -63,7 +61,7 @@ def test_app_settings_round_trip() -> None:
     s = AppSettings(
         enabled=False,
         hotkeys=HotkeySettings(dictate_zh="f1", dictate_en="f2", toggle_enabled="ctrl+a", cancel="esc"),
-        asr=AsrSettings(device="cpu", device_id=1, max_record_seconds=30, mic_device_index=2),
+        asr=AsrSettings(max_record_seconds=30, mic_device_index=2),
         translation=TranslationSettings(
             active_profile="p1",
             profiles=[
@@ -92,7 +90,7 @@ def test_from_dict_missing_keys_uses_defaults() -> None:
     assert s.enabled is False
     # 其余子配置走默认
     assert s.hotkeys.dictate_zh == "f8"
-    assert s.asr.device == "auto"
+    assert s.asr.max_record_seconds == 60
     assert s.translation.active_profile == ""
     assert s.ui.show_overlay is True
 
@@ -126,7 +124,7 @@ def test_repo_save_load_round_trip(tmp_path: Path) -> None:
     s = AppSettings(
         enabled=False,
         hotkeys=HotkeySettings(dictate_zh="f1"),
-        asr=AsrSettings(device="cpu", device_id=3),
+        asr=AsrSettings(max_record_seconds=20),
     )
     repo.save(s)
     assert repo.path.exists()
@@ -163,3 +161,118 @@ def test_repo_save_atomic_no_tmp_residual(tmp_path: Path) -> None:
     assert p.parent.exists()
     # 无 .tmp 残留
     assert not p.with_suffix(".json.tmp").exists()
+
+
+# ==================== AsrSettings 旧配置迁移 ====================
+
+
+def test_asr_settings_no_device_fields() -> None:
+    """AsrSettings 不再有 device/device_id 字段（GPU 路线已移除）。"""
+    a = AsrSettings()
+    assert not hasattr(a, "device")
+    assert not hasattr(a, "device_id")
+    # to_dict 不应包含这些键
+    assert "device" not in a.to_dict()
+    assert "device_id" not in a.to_dict()
+
+
+def test_asr_settings_ignores_legacy_device_keys() -> None:
+    """旧配置文件中的 device/device_id 键被忽略（from_dict 不读取）。"""
+    a = AsrSettings.from_dict({"device": "cuda", "device_id": 3, "max_record_seconds": 20})
+    assert a.max_record_seconds == 20
+    assert not hasattr(a, "device")
+    # round-trip 不再写出 device/device_id
+    assert "device" not in a.to_dict()
+
+
+def test_asr_settings_round_trip_no_device() -> None:
+    """AsrSettings 序列化往返不含 device。"""
+    a = AsrSettings(max_record_seconds=45, mic_device_index=1)
+    a2 = AsrSettings.from_dict(a.to_dict())
+    assert a2 == a
+    assert "device" not in a2.to_dict()
+
+
+# ==================== TranslationSettings 迁移（内置免登录服务） ====================
+
+
+def test_translation_settings_filters_free_profiles() -> None:
+    """旧版本保存的免费 profile（backend_type != openai_compatible）被过滤掉。"""
+    d = {
+        "active_profile": "",
+        "profiles": [
+            {"name": "Google 免费", "backend_type": "google"},
+            {"name": "Bing 免费", "backend_type": "bing"},
+            {"name": "myLLM", "backend_type": "openai_compatible",
+             "base_url": "http://x/v1", "model": "m"},
+        ],
+    }
+    t = TranslationSettings.from_dict(d)
+    assert [p.name for p in t.profiles] == ["myLLM"]
+    assert all(p.backend_type == "openai_compatible" for p in t.profiles)
+
+
+def test_translation_settings_active_remapped_to_builtin() -> None:
+    """active 指向被过滤的免费 profile 时，按 backend_type 映射到内置项 name。"""
+    from dictashift.translation import BUILTIN_GOOGLE, BUILTIN_BING
+
+    # active 指向 google 免费 profile
+    d = {
+        "active_profile": "Google 免费",
+        "profiles": [{"name": "Google 免费", "backend_type": "google"}],
+    }
+    t = TranslationSettings.from_dict(d)
+    assert t.active_profile == BUILTIN_GOOGLE.name
+
+    # active 指向 bing 免费 profile
+    d2 = {
+        "active_profile": "Bing 免费",
+        "profiles": [{"name": "Bing 免费", "backend_type": "bing"}],
+    }
+    t2 = TranslationSettings.from_dict(d2)
+    assert t2.active_profile == BUILTIN_BING.name
+
+
+def test_translation_settings_active_nonexistent_becomes_empty() -> None:
+    """active 指向不存在的 name（既非保留项也非内置项）-> ''。"""
+    d = {
+        "active_profile": "ghost",
+        "profiles": [{"name": "a", "backend_type": "openai_compatible"}],
+    }
+    t = TranslationSettings.from_dict(d)
+    assert t.active_profile == ""
+
+
+def test_translation_settings_active_preserved_when_exists() -> None:
+    """active 指向保留的用户 profile 时保持不变。"""
+    d = {
+        "active_profile": "myLLM",
+        "profiles": [{"name": "myLLM", "backend_type": "openai_compatible",
+                      "base_url": "http://x/v1", "model": "m"}],
+    }
+    t = TranslationSettings.from_dict(d)
+    assert t.active_profile == "myLLM"
+
+
+def test_translation_settings_round_trip_after_migration() -> None:
+    """迁移后再往返：仅含 openai_compatible profile，active 可为内置 name。"""
+    from dictashift.translation import BUILTIN_GOOGLE
+
+    # 模拟旧配置 -> 迁移
+    d = {
+        "active_profile": "Google 免费",
+        "profiles": [
+            {"name": "Google 免费", "backend_type": "google"},
+            {"name": "myLLM", "backend_type": "openai_compatible",
+             "base_url": "http://x/v1", "model": "m", "api_key": "k"},
+        ],
+    }
+    t = TranslationSettings.from_dict(d)
+    assert t.active_profile == BUILTIN_GOOGLE.name
+    # 再 to_dict -> from_dict 应稳定（active 仍为内置 name，profiles 不变）
+    d2 = t.to_dict()
+    t2 = TranslationSettings.from_dict(d2)
+    assert t2 == t
+    assert t2.active_profile == BUILTIN_GOOGLE.name
+    assert [p.name for p in t2.profiles] == ["myLLM"]
+

@@ -1,11 +1,14 @@
 """设置窗口（四页 QTabWidget）。
 
-页面结构（按 计划.md / 任务规格）：
-1. 常规：启用语音输入、开机启动(仅保存设置)、显示状态悬浮窗、全局禁用快捷键。
+页面结构：
+1. 常规：启用语音输入、开机启动(仅保存设置)、显示状态悬浮窗、全局禁用快捷键、
+   恢复默认设置按钮（重置常规/快捷键/语音识别/界面，不影响翻译配置）。
 2. 快捷键：中文输入(f8)、中文→英文(f9)、取消当前任务(esc)。
-3. 语音识别：模型(只读)、推理设备、GPU 设备、实际运行设备(只读)、
-   麦克风、最长录音秒数、重新检测硬件、测试识别(禁用占位)。
-4. 翻译：当前配置 ComboBox、编辑区(base_url/model/api_key/temperature)、
+3. 语音识别：模型(只读)、实际运行设备(只读)、麦克风、最长录音秒数、
+   重新检测硬件、测试识别(禁用占位)。
+   注：推理设备/GPU 设备控件已随 GPU 路线移除（设备固定为 AUTO/CPU，等价）。
+4. 翻译：当前配置 ComboBox（内置免登录 Google/Bing + 用户 LLM profiles）、
+   编辑区(base_url/model/api_key/temperature，仅作用于用户 LLM 配置)、
    保存为新配置、测试连接(后台)。
 
 线程模型：
@@ -25,6 +28,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QTabWidget,
@@ -35,30 +39,18 @@ from PySide6.QtWidgets import (
 from ..asr.providers import AsrDevice
 from ..audio.devices import list_input_devices
 from ..settings import AppSettings
-from ..translation import TranslationProfile
+from ..settings.models import (
+    AsrSettings,
+    HotkeySettings,
+    UiSettings,
+)
+from ..translation import TranslationProfile, builtin_free_profiles, builtin_profile_names
 from .hotkey_editor import HotkeyEdit
 
 
-# 设备 ComboBox 显示文案与 AsrDevice 值的双向映射。
-# 注：当前只支持 CPU（AUTO 与 CPU 行为等价），保留两项结构为后续 DirectML 留位。
-_DEVICE_LABELS: list[tuple[str, AsrDevice]] = [
-    ("自动选择", AsrDevice.AUTO),
-    ("CPU", AsrDevice.CPU),
-]
-
-# 翻译服务类型 ComboBox 显示文案与 TranslationProfile.backend_type 的双向映射。
-# 顺序即 ComboBox addItem 顺序；第一项为默认。
-_BACKEND_TYPE_LABELS: list[tuple[str, str]] = [
-    ("OpenAI 兼容 API（云端/本地 llama-server）", "openai_compatible"),
-    ("Google 翻译（免费）", "google"),
-    ("Bing 翻译（免费）", "bing"),
-]
-
-# 免费服务默认配置名建议（保存为新配置时使用）。
-_DEFAULT_NAME_BY_BACKEND: dict[str, str] = {
-    "google": "Google 免费",
-    "bing": "Bing 免费",
-}
+# 内置免登录翻译项顺序（与「当前翻译配置」ComboBox 内置段顺序一致）。
+_BUILTIN_PROFILES = list(builtin_free_profiles())
+_BUILTIN_NAMES = builtin_profile_names()
 
 
 class SettingsWindow(QWidget):
@@ -66,12 +58,12 @@ class SettingsWindow(QWidget):
 
     信号（application 层连接）：
     - applied(settings)：用户点击「应用」或「确定」时发出，携带最新设置副本。
-    - recheck_hardware_requested(device, device_id)：用户点击「重新检测硬件」。
+    - recheck_hardware_requested()：用户点击「重新检测硬件」（无参，固定重新初始化）。
     - test_connection_requested(profile)：用户点击「测试连接」（后台执行）。
     """
 
     applied = Signal(AppSettings)
-    recheck_hardware_requested = Signal(object, int)  # AsrDevice, device_id
+    recheck_hardware_requested = Signal()
     test_connection_requested = Signal(object)  # TranslationProfile
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -125,6 +117,16 @@ class SettingsWindow(QWidget):
         self._toggle_hotkey = HotkeyEdit(page)
         form.addRow(self._toggle_hotkey)
 
+        # 恢复默认设置：重置常规/快捷键/语音识别/界面为默认值（不影响翻译配置）。
+        self._reset_btn = QPushButton("恢复默认设置", page)
+        self._reset_btn.clicked.connect(self._on_reset_clicked)
+        self._reset_status_label = QLabel("", page)
+        reset_row = QHBoxLayout()
+        reset_row.addWidget(self._reset_btn)
+        reset_row.addWidget(self._reset_status_label)
+        reset_row.addStretch(1)
+        form.addRow(reset_row)
+
         return page
 
     # ==================== 快捷键页 ====================
@@ -151,16 +153,6 @@ class SettingsWindow(QWidget):
         form = QFormLayout(page)
 
         form.addRow("模型：", QLabel("SenseVoiceSmall ONNX", page))
-
-        self._device_combo = QComboBox(page)
-        for label, _dev in _DEVICE_LABELS:
-            self._device_combo.addItem(label)
-        form.addRow("推理设备：", self._device_combo)
-
-        self._gpu_spin = QSpinBox(page)
-        self._gpu_spin.setRange(0, 7)
-        self._gpu_spin.setValue(0)
-        form.addRow("GPU 设备：", self._gpu_spin)
 
         self._actual_device_label = QLabel("（未初始化）", page)
         form.addRow("实际运行设备：", self._actual_device_label)
@@ -203,19 +195,16 @@ class SettingsWindow(QWidget):
         top_form.addRow("当前翻译配置：", self._profile_combo)
         outer.addLayout(top_form)
 
+        # 内置项选中时显示的提示标签（免登录服务，无需配置）。
+        self._builtin_hint_label = QLabel("免登录翻译服务，无需配置", page)
+        outer.addWidget(self._builtin_hint_label)
+
         edit_group_label = QLabel("编辑当前配置：", page)
         outer.addWidget(edit_group_label)
 
         form = QFormLayout()
         self._name_edit = QLineEdit(page)
         form.addRow("配置名称：", self._name_edit)
-
-        # 服务类型：决定 base_url/model/api_key/temperature 的可用性。
-        self._backend_type_combo = QComboBox(page)
-        for _label, _value in _BACKEND_TYPE_LABELS:
-            self._backend_type_combo.addItem(_label, _value)
-        self._backend_type_combo.currentIndexChanged.connect(self._on_backend_type_changed)
-        form.addRow("服务类型：", self._backend_type_combo)
 
         self._base_url_edit = QLineEdit(page)
         self._base_url_edit.setPlaceholderText("https://api.openai.com/v1 或 http://127.0.0.1:19120/v1")
@@ -249,7 +238,8 @@ class SettingsWindow(QWidget):
         self._test_result_label = QLabel("", page)
         outer.addWidget(self._test_result_label)
 
-        # 内存中维护的 profiles 列表（编辑/保存时操作；apply 时同步到 settings）。
+        # 内存中维护的用户 LLM profiles 列表（编辑/保存时操作；apply 时同步到 settings）。
+        # 内置免登录项不在此列表中，由 _rebuild_profile_combo 拼接到下拉顶部。
         self._profiles: list[TranslationProfile] = []
 
         return page
@@ -265,13 +255,12 @@ class SettingsWindow(QWidget):
         self._autostart_check.setChecked(settings.ui.launch_at_login)
         self._overlay_check.setChecked(settings.ui.show_overlay)
         self._toggle_hotkey.set_config_text(settings.hotkeys.toggle_enabled)
+        self._reset_status_label.setText("")
         # 快捷键
         self._dictate_zh_edit.set_config_text(settings.hotkeys.dictate_zh)
         self._dictate_en_edit.set_config_text(settings.hotkeys.dictate_en)
         self._cancel_edit.set_config_text(settings.hotkeys.cancel)
         # ASR
-        self._select_device(settings.asr.device)
-        self._gpu_spin.setValue(int(settings.asr.device_id))
         self._max_record_spin.setValue(int(settings.asr.max_record_seconds))
         self._select_mic(settings.asr.mic_device_index)
         # 翻译
@@ -306,21 +295,62 @@ class SettingsWindow(QWidget):
         # ASR
         asr = dataclasses.replace(
             settings.asr,
-            device=self._current_device().value,
-            device_id=int(self._gpu_spin.value()),
             max_record_seconds=int(self._max_record_spin.value()),
             mic_device_index=self._current_mic_index(),
         )
         settings.asr = asr
-        # 翻译：把编辑区当前内容写回当前选中的 profile，再同步列表/active。
+        # 翻译：把编辑区当前内容写回当前选中的用户 profile，再同步列表/active。
         self._flush_edit_to_active_profile()
+        # active 取自 ComboBox 选中项的 name；内置项 name 也合法（由 application 层解析）。
+        active = self._profile_combo.currentText()
+        # 若 ComboBox 为空（极端：无内置无用户），active 置空。
+        if not active:
+            active = ""
         tr = dataclasses.replace(
             settings.translation,
             profiles=list(self._profiles),
-            active_profile=self._profile_combo.currentText(),
+            active_profile=active,
         )
         settings.translation = tr
         return settings
+
+    # ==================== 一键重置 ====================
+
+    def reset_to_defaults(self) -> None:
+        """把非翻译页控件重置为 dataclass 默认值（仅改 UI，不持久化）。
+
+        重置范围：常规(enabled=True + UiSettings 默认)、快捷键(HotkeySettings 默认)、
+        语音识别(AsrSettings 默认)。翻译页内容（profiles / active / 编辑区）完全不动。
+        用户仍需点「应用/确定」才落盘，与现有编辑行为一致。
+        """
+        default_ui = UiSettings()
+        default_hk = HotkeySettings()
+        default_asr = AsrSettings()
+        # 常规
+        self._enable_check.setChecked(True)
+        self._autostart_check.setChecked(default_ui.launch_at_login)
+        self._overlay_check.setChecked(default_ui.show_overlay)
+        self._toggle_hotkey.set_config_text(default_hk.toggle_enabled)
+        # 快捷键
+        self._dictate_zh_edit.set_config_text(default_hk.dictate_zh)
+        self._dictate_en_edit.set_config_text(default_hk.dictate_en)
+        self._cancel_edit.set_config_text(default_hk.cancel)
+        # ASR
+        self._max_record_spin.setValue(int(default_asr.max_record_seconds))
+        self._select_mic(default_asr.mic_device_index)
+        # 状态提示
+        self._reset_status_label.setText("已恢复默认值，点击应用生效")
+
+    def _on_reset_clicked(self) -> None:
+        btn = QMessageBox.question(
+            self,
+            "恢复默认设置",
+            "将恢复常规、快捷键、语音识别、界面设置为默认值，翻译配置不受影响。是否继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if btn == QMessageBox.StandardButton.Yes:
+            self.reset_to_defaults()
 
     # ==================== ASR 实际设备显示 ====================
 
@@ -358,36 +388,34 @@ class SettingsWindow(QWidget):
         self.applied.emit(new_settings)
 
     def _on_recheck_clicked(self) -> None:
-        device = self._current_device()
-        device_id = int(self._gpu_spin.value())
         self._recheck_btn.setEnabled(False)
         self._recheck_btn.setText("加载中…")
-        self.recheck_hardware_requested.emit(device, device_id)
+        # 重新检测 = 重新初始化（设备固定 AUTO/0）。
+        self.recheck_hardware_requested.emit()
 
     def _on_test_conn_clicked(self) -> None:
-        profile = self._profile_from_edit()
-        if profile.backend_type == "openai_compatible":
-            if not profile.base_url or not profile.model:
-                self._test_result_label.setText("请填写 Base URL 和模型")
-                return
+        profile = self._current_test_profile()
+        if profile is None:
+            # 用户配置且字段缺失：_current_test_profile 已写错误提示
+            return
         self._test_conn_btn.setEnabled(False)
         self._test_conn_btn.setText("测试中…")
         self._test_result_label.setText("测试中…")
         self.test_connection_requested.emit(profile)
 
     def _on_save_new_clicked(self) -> None:
-        """把当前编辑区内容保存为一个新配置（追加到 profiles）。
+        """把当前编辑区内容保存为一个新用户 LLM 配置（追加到 profiles）。
 
-        免费服务且配置名为空时，使用建议默认名（"Google 免费"/"Bing 免费"）。
+        仅在用户配置选中时可用（内置项选中时此按钮被禁用）。保存的 profile 固定
+        backend_type="openai_compatible"。
         """
-        backend_type = self._current_backend_type()
         name = self._name_edit.text().strip()
-        if not name and backend_type in _DEFAULT_NAME_BY_BACKEND:
-            name = _DEFAULT_NAME_BY_BACKEND[backend_type]
-            self._name_edit.setText(name)
-        profile = self._profile_from_edit(name=name)
-        if not profile.name.strip():
+        if not name:
             self._test_result_label.setText("请填写配置名称")
+            return
+        profile = self._profile_from_edit(name=name)
+        if not profile.base_url or not profile.model:
+            self._test_result_label.setText("请填写 Base URL 和模型")
             return
         # 若同名已存在则替换，否则追加。
         replaced = False
@@ -403,8 +431,21 @@ class SettingsWindow(QWidget):
     # ==================== 翻译 profiles 编辑辅助 ====================
 
     def _on_profile_selected(self, _index: int) -> None:
-        """ComboBox 选择变化时把对应 profile 载入编辑区。"""
+        """ComboBox 选择变化时载入对应 profile 到编辑区，并切换编辑区启用态。
+
+        - 内置项：编辑区整体禁用、显示提示标签、「保存为新配置」禁用。
+        - 用户项：编辑区启用、隐藏提示标签、「保存为新配置」启用。
+        """
         name = self._profile_combo.currentText()
+        if name in _BUILTIN_NAMES:
+            self._builtin_hint_label.show()
+            self._set_edit_enabled(False)
+            self._save_new_btn.setEnabled(False)
+            self._load_profile_to_edit(self._builtin_profile(name))
+            return
+        self._builtin_hint_label.hide()
+        self._set_edit_enabled(True)
+        self._save_new_btn.setEnabled(True)
         for p in self._profiles:
             if p.name == name:
                 self._load_profile_to_edit(p)
@@ -413,23 +454,30 @@ class SettingsWindow(QWidget):
         self._clear_edit()
 
     def _rebuild_profile_combo(self, active_name: str) -> None:
-        """根据 self._profiles 重建 ComboBox 并选中 active_name。"""
+        """重建 ComboBox：内置项在前，用户 profiles 在后；选中 active_name。"""
         was = self._profile_combo.blockSignals(True)
         self._profile_combo.clear()
+        for p in _BUILTIN_PROFILES:
+            self._profile_combo.addItem(p.name)
         for p in self._profiles:
             self._profile_combo.addItem(p.name)
-        if active_name and any(p.name == active_name for p in self._profiles):
-            self._profile_combo.setCurrentText(active_name)
-        elif self._profiles:
+        # 选中 active_name（内置项或用户项均可）；否则空选（index 0 即首个内置项）。
+        idx = self._profile_combo.findText(active_name) if active_name else -1
+        if active_name and idx >= 0:
+            self._profile_combo.setCurrentIndex(idx)
+        elif self._profile_combo.count() > 0:
             self._profile_combo.setCurrentIndex(0)
         self._profile_combo.blockSignals(was)
-        # 触发一次编辑区载入
+        # 触发一次编辑区载入/启用态切换
         self._on_profile_selected(self._profile_combo.currentIndex())
 
     def _flush_edit_to_active_profile(self) -> None:
-        """把当前编辑区内容写回当前选中名的 profile（若存在）。"""
+        """把当前编辑区内容写回当前选中的用户 profile（若存在且非内置项）。
+
+        内置项选中时不写回（编辑区内容是上次载入的内置占位，不应污染用户列表）。
+        """
         name = self._profile_combo.currentText()
-        if not name:
+        if not name or name in _BUILTIN_NAMES:
             return
         profile = self._profile_from_edit(name=name)
         for i, p in enumerate(self._profiles):
@@ -441,41 +489,34 @@ class SettingsWindow(QWidget):
 
     def _load_profile_to_edit(self, profile: TranslationProfile) -> None:
         self._name_edit.setText(profile.name)
-        # backend_type 兜底：旧配置无该字段时按 openai_compatible 回填。
-        self._select_backend_type(profile.backend_type or "openai_compatible")
         self._base_url_edit.setText(profile.base_url)
         self._model_edit.setText(profile.model)
         self._api_key_edit.setText(profile.api_key or "")
         self._temperature_spin.setValue(float(profile.temperature))
-        self._apply_backend_field_state()
 
     def _clear_edit(self) -> None:
         self._name_edit.clear()
-        self._select_backend_type("openai_compatible")
         self._base_url_edit.clear()
         self._model_edit.clear()
         self._api_key_edit.clear()
         self._temperature_spin.setValue(0.3)
-        self._apply_backend_field_state()
+
+    def _set_edit_enabled(self, enabled: bool) -> None:
+        """整体启用/禁用编辑区字段控件（不含按钮）。"""
+        for w in (
+            self._name_edit,
+            self._base_url_edit,
+            self._model_edit,
+            self._api_key_edit,
+            self._temperature_spin,
+        ):
+            w.setEnabled(enabled)
 
     def _profile_from_edit(self, name: str | None = None) -> TranslationProfile:
-        """从编辑区控件构造 TranslationProfile。
+        """从编辑区控件构造用户 LLM profile。
 
-        免费服务（google/bing）时 base_url/model/api_key 存空串/None，
-        temperature 保持默认 0.3（免费服务不支持该参数）。
+        保存/写回的 profile 固定 backend_type="openai_compatible"（编辑区仅服务用户 LLM 配置）。
         """
-        backend_type = self._current_backend_type()
-        is_free = backend_type in ("google", "bing")
-        if is_free:
-            return TranslationProfile(
-                name=(name if name is not None else self._name_edit.text().strip()),
-                base_url="",
-                model="",
-                api_key=None,
-                temperature=0.3,
-                timeout=60.0,
-                backend_type=backend_type,
-            )
         return TranslationProfile(
             name=(name if name is not None else self._name_edit.text().strip()),
             base_url=self._base_url_edit.text().strip(),
@@ -483,75 +524,34 @@ class SettingsWindow(QWidget):
             api_key=self._api_key_edit.text() or None,
             temperature=float(self._temperature_spin.value()),
             timeout=60.0,
-            backend_type=backend_type,
+            backend_type="openai_compatible",
         )
 
-    # ==================== 翻译服务类型辅助 ====================
+    @staticmethod
+    def _builtin_profile(name: str) -> TranslationProfile:
+        """按 name 取内置项对象（调用方已确保 name 在内置集合中）。"""
+        for p in _BUILTIN_PROFILES:
+            if p.name == name:
+                return p
+        # 不应到达：调用前已用 _BUILTIN_NAMES 校验。
+        return _BUILTIN_PROFILES[0]
 
-    def _on_backend_type_changed(self, _index: int) -> None:
-        """服务类型切换：更新编辑框禁用态与占位提示。
+    def _current_test_profile(self) -> TranslationProfile | None:
+        """构造「测试连接」使用的 profile，与编辑区选中态匹配。
 
-        免费服务（google/bing）禁用 base_url/model/api_key/temperature，
-        并把占位文案改为「无需配置」；切回 openai_compatible 时恢复编辑行为。
-        切到免费服务时不主动清空已有输入（用户可能在切换前误填），只在保存时
-        由 _profile_from_edit 忽略。
+        - 内置项选中：直接返回对应内置 profile 对象。
+        - 用户项选中：从编辑区构造；字段缺失时写错误提示并返回 None。
         """
-        self._apply_backend_field_state()
-
-    def _apply_backend_field_state(self) -> None:
-        """按当前服务类型设置编辑框的启用态与占位提示。"""
-        is_free = self._current_backend_type() in ("google", "bing")
-        for w in (
-            self._base_url_edit,
-            self._model_edit,
-            self._api_key_edit,
-            self._temperature_spin,
-        ):
-            w.setEnabled(not is_free)
-        if is_free:
-            self._base_url_edit.setPlaceholderText("无需配置")
-            self._model_edit.setPlaceholderText("无需配置")
-            self._api_key_edit.setPlaceholderText("无需配置")
-        else:
-            self._base_url_edit.setPlaceholderText(
-                "https://api.openai.com/v1 或 http://127.0.0.1:19120/v1"
-            )
-            self._model_edit.setPlaceholderText("")
-            self._api_key_edit.setPlaceholderText("")
-
-    def _current_backend_type(self) -> str:
-        data = self._backend_type_combo.currentData()
-        if isinstance(data, str) and data:
-            return data
-        return "openai_compatible"
-
-    def _select_backend_type(self, backend_type: str) -> None:
-        """按 backend_type 值选中 ComboBox；未知值回退 openai_compatible。"""
-        target = backend_type if backend_type in ("openai_compatible", "google", "bing") else "openai_compatible"
-        for i, (_label, value) in enumerate(_BACKEND_TYPE_LABELS):
-            if value == target:
-                self._backend_type_combo.setCurrentIndex(i)
-                return
-        self._backend_type_combo.setCurrentIndex(0)
+        name = self._profile_combo.currentText()
+        if name in _BUILTIN_NAMES:
+            return self._builtin_profile(name)
+        profile = self._profile_from_edit()
+        if not profile.base_url or not profile.model:
+            self._test_result_label.setText("请填写 Base URL 和模型")
+            return None
+        return profile
 
     # ==================== ASR 控件辅助 ====================
-
-    def _current_device(self) -> AsrDevice:
-        idx = self._device_combo.currentIndex()
-        if 0 <= idx < len(_DEVICE_LABELS):
-            return _DEVICE_LABELS[idx][1]
-        return AsrDevice.AUTO
-
-    def _select_device(self, device_str: str) -> None:
-        try:
-            dev = AsrDevice(device_str)
-        except ValueError:
-            dev = AsrDevice.AUTO
-        for i, (_label, d) in enumerate(_DEVICE_LABELS):
-            if d == dev:
-                self._device_combo.setCurrentIndex(i)
-                return
-        self._device_combo.setCurrentIndex(0)
 
     def _current_mic_index(self) -> int | None:
         data = self._mic_combo.currentData()
@@ -566,4 +566,3 @@ class SettingsWindow(QWidget):
             self._mic_combo.setCurrentIndex(idx)
         else:
             self._mic_combo.setCurrentIndex(0)
-
