@@ -14,3 +14,6 @@ assets/models/
 .ai_docs/
 logs/
 *.log
+
+# 工作区协作规则（本地文件，不进版本控制）
+AGENTS.md
