@@ -6,6 +6,10 @@ __pycache__/
 build/
 dist/
 
+# PyInstaller 生成的 spec（默认忽略），但仓库自带的项目 spec 要提交，单独排除
+*.spec
+!scripts/DictaShift.spec
+
 # 模型资产（体积大，不进版本控制，由本地拷贝或下载脚本获取）
 assets/models/
 

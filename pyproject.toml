@@ -1,8 +1,13 @@
 [project]
 name = "dictashift"
-version = "0.1.0"
-description = "DictaShift - Windows 常驻桌面语音输入工具"
+version = "0.2.0"
+description = "DictaShift - Windows 常驻桌面语音输入工具（按住 F8 中文听写、按住 F9 中文转英文输入）"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11,<3.12"
+authors = [
+    { name = "yuchen-ya" },
+]
 dependencies = [
     "pyside6>=6.7",
     "sounddevice>=0.5",
@@ -13,9 +18,16 @@ dependencies = [
     "onnxruntime>=1.18",
 ]
 
+[project.urls]
+Homepage = "https://github.com/yuchen-ya/dictashift"
+
+[project.scripts]
+dictashift = "dictashift.main:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pyinstaller>=6.0",
 ]
 
 [build-system]
