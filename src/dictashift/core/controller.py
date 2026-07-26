@@ -90,6 +90,9 @@ class ApplicationController:
     - 录音中禁用 -> discard 丢弃。
     - 推理中禁用 -> 设置 _disabled_mid_task 标记，任务自然结束但不得粘贴。
     - 翻译配置在任务创建时冻结为快照。
+    - wait_first_frame=True 时：start 成功后保持 PREPARING，等首个音频帧到达
+      （_on_first_frame）或安全超时后才迁移 RECORDING；期间 release/cancel/
+      toggle/stream_error 均可在 PREPARING 上正确处理（与 RECORDING 同路径或回 IDLE）。
     """
 
     def __init__(
@@ -99,6 +102,7 @@ class ApplicationController:
         translation_backend: TranslationBackend,
         paste_func: Callable[[str], bool] = type_text_at_cursor,
         callbacks: ControllerCallbacks | None = None,
+        wait_first_frame: bool = False,
     ) -> None:
         self._asr = asr_service
         self._recorder = recorder
@@ -111,6 +115,13 @@ class ApplicationController:
         self._lock = threading.Lock()
         self._enabled = True
         self._shutdown = False
+        # 是否等待首个音频帧再 PREPARING -> RECORDING（蓝牙设备 stream.start 立即返回，
+        # 但首个回调要数百毫秒后才到）。默认 False = 旧行为（start 成功即 RECORDING）。
+        self._wait_first_frame = bool(wait_first_frame)
+        # 首帧安全兜底 timer：若设备一直不投递帧，超时后强制 RECORDING（宁可录也不卡死）。
+        # 由 _on_first_frame（首帧到达或超时）取消。实例属性 _first_frame_timeout 便于测试。
+        self._first_frame_timer: threading.Timer | None = None
+        self._first_frame_timeout: float = 3.0
         # 当前进行中的任务（按下快捷键时创建）。仅 IDLE->RECORDING 时非空。
         self._current_task: VoiceTask | None = None
         # 中断标记：worker 在关键检查点读取，决定是否继续粘贴。
@@ -173,11 +184,17 @@ class ApplicationController:
         self._fire_enabled_changed(bool(enabled))
 
     def shutdown(self) -> None:
-        """关闭：录音中则 discard，标记 shutdown。"""
+        """关闭：录音中（含 PREPARING 等待首帧）则 discard，标记 shutdown。"""
         with self._lock:
             self._shutdown = True
+        # 取消可能挂起的首帧兜底 timer。
+        self._cancel_first_frame_timer()
         # 录音中丢弃；推理中不打断（让 worker 自然结束，但禁用粘贴由 shutdown 标记保证）。
-        if self._recorder is not None and self._is_recording_safe():
+        # PREPARING（wait_first_frame 等待首帧）同样可能已打开流 -> 视为录音中。
+        is_recording = self._is_recording_safe()
+        with self._lock:
+            in_preparing = self._sm.state == AppState.PREPARING
+        if self._recorder is not None and (is_recording or in_preparing):
             try:
                 self._recorder.discard()
             except Exception:  # noqa: BLE001
@@ -225,8 +242,8 @@ class ApplicationController:
     def handle_hotkey_release(self, action: str) -> None:
         """快捷键松开处理（pynput 监听线程调用）。
 
-        仅 dictate_zh / dictate_en 且当前 RECORDING 且 action 匹配当前任务时
-        结束录音并启动 worker。
+        仅 dictate_zh / dictate_en 且当前 RECORDING 或 PREPARING（wait_first_frame
+        模式下首帧未到的秒按秒松）且 action 匹配当前任务时结束录音并启动 worker。
         """
         try:
             if action not in ("dictate_zh", "dictate_en"):
@@ -236,11 +253,17 @@ class ApplicationController:
             with self._lock:
                 if self._current_task is None or self._current_task.action != action:
                     return
-                if self._sm.state != AppState.RECORDING:
+                cur_state = self._sm.state
+                if cur_state not in (AppState.RECORDING, AppState.PREPARING):
                     return
                 # 取出任务，清空当前指针；stop 在锁外执行（recorder.stop 可能阻塞）。
                 task = self._current_task
                 self._current_task = None
+                was_preparing = cur_state == AppState.PREPARING
+            # PREPARING 下 release：首帧没来但用户已松手。取消首帧兜底 timer
+            # （若 wait_first_frame 模式下还在等待）。
+            if was_preparing:
+                self._cancel_first_frame_timer()
             # 结束录音：在锁外调用，避免与 recorder 内部锁死锁。
             try:
                 audio = self._recorder.stop()
@@ -251,10 +274,17 @@ class ApplicationController:
                 return
 
             # 空录音直接回 IDLE，不进入流水线。
+            # PREPARING -> IDLE 合法；RECORDING -> IDLE 合法。
             if audio is None or len(audio) == 0:
                 logger.info("[ApplicationController] 空录音，回 IDLE")
                 self._goto(AppState.IDLE)
                 return
+
+            # 非空音频但状态仍为 PREPARING（首帧没来但 stop 取到了帧，罕见：
+            # stop 自身的关流过程可能恰好让一帧落地）：先补迁移到 RECORDING，
+            # 因为 PREPARING 不能直接 -> TRANSCRIBING。
+            if self._sm.state == AppState.PREPARING:
+                self._goto(AppState.RECORDING)
 
             # 迁移到 TRANSCRIBING 并启动 worker。
             self._goto(AppState.TRANSCRIBING)
@@ -299,22 +329,25 @@ class ApplicationController:
                 self._enabled = False
                 current_state = self._sm.state
                 if current_state in (
+                    AppState.PREPARING,
                     AppState.RECORDING,
                     AppState.TRANSCRIBING,
                     AppState.TRANSLATING,
                     AppState.INSERTING,
                 ):
-                    # RECORDING 也置标记作为竞态安全网：若 release 恰好在本决策
+                    # RECORDING/PREPARING 也置标记作为竞态安全网：若 release 恰好在本决策
                     # 之后抢先启动了 worker，worker 仍会被抑制，不会粘贴。
                     self._disabled_mid_task = True
-            if current_state == AppState.RECORDING:
+            if current_state in (AppState.RECORDING, AppState.PREPARING):
+                # PREPARING 与 RECORDING 同处理：discard 丢弃 + 清任务 + 取消首帧
+                # 兜底 timer。PREPARING -> DISABLED 合法；RECORDING -> DISABLED 合法。
+                self._cancel_first_frame_timer()
                 try:
                     self._recorder.discard()
                 except Exception:  # noqa: BLE001
                     logger.exception("[ApplicationController] 禁用时 discard 异常")
                 with self._lock:
                     self._current_task = None
-                # RECORDING -> DISABLED 合法。
                 self._goto(AppState.DISABLED)
             elif current_state in (AppState.TRANSCRIBING, AppState.TRANSLATING, AppState.INSERTING):
                 # 推理/插入中：让任务自然结束（_disabled_mid_task 已置位，
@@ -388,12 +421,57 @@ class ApplicationController:
             # PREPARING -> IDLE 合法迁移。
             self._goto(AppState.IDLE)
             return
+        if self._wait_first_frame:
+            # 保持 PREPARING：等首个音频帧到达（recorder on_first_frame -> _on_first_frame）
+            # 再迁移 RECORDING。启动安全兜底 timer：设备一直不投递帧时强制 RECORDING，
+            # 宁可录也不卡死。timer 与 _on_first_frame 互相取消，先到者赢，幂等。
+            self._cancel_first_frame_timer()
+            timer = threading.Timer(self._first_frame_timeout, self._on_first_frame)
+            timer.name = "dictashift-first-frame-timeout"
+            timer.daemon = True
+            with self._lock:
+                self._first_frame_timer = timer
+            timer.start()
+        else:
+            self._goto(AppState.RECORDING)
+
+    def _on_first_frame(self) -> None:
+        """首个音频帧到达（recorder on_first_frame，由 application 层从后台线程调用）
+        或安全兜底 timer 触发时调用。取消防兜 timer；若仍在 PREPARING 且任务未取消
+        则迁移到 RECORDING，否则幂等忽略（release/cancel/toggle 已先行处理）。
+
+        幂等性：可能被首帧回调与超时 timer 先后各触发一次（竞态），或被迟到的回调在
+        release/stream_error 之后触发；任何「当前不是 PREPARING」的情况都直接返回。
+        """
+        self._cancel_first_frame_timer()
+        with self._lock:
+            if self._sm.state != AppState.PREPARING:
+                return
+            task = self._current_task
+        if task is None:
+            # 任务已被 release/cancel/toggle 取走 -> 幂等忽略。
+            return
+        # PREPARING -> RECORDING 合法迁移。
         self._goto(AppState.RECORDING)
 
-    def _on_stream_error(self, msg: str) -> None:
-        """recorder 录音中途严重 status 回调（PortAudio 线程）。
+    def _cancel_first_frame_timer(self) -> None:
+        """取消防兜 timer（判空 + cancel + 置 None）。各结束路径统一调用。"""
+        with self._lock:
+            timer = self._first_frame_timer
+            self._first_frame_timer = None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:  # noqa: BLE001
+                logger.exception("[ApplicationController] 取消首帧 timer 异常")
 
-        - 仅 RECORDING 状态响应：discard 录音 + on_error 提示 + 回 IDLE。
+    def _on_stream_error(self, msg: str) -> None:
+        """recorder 录音中途严重 status 回调（PortAudio 线程，由 application 层转后台线程）。
+
+        - RECORDING 或 PREPARING（wait_first_frame 模式下首帧回调本身可能携带
+          致命 status）状态响应：discard 录音 + on_error 提示 + 回 IDLE。
+        - 与随后的 _on_first_frame 幂等共存：on_stream_error 已 discard + 回 IDLE，
+          随后到达的 _on_first_frame 发现不是 PREPARING 即幂等忽略。
         - 走 self._lock，与 hotkey / worker 线程串行。
         - 回调只做状态迁移与通知，recorder.discard 的关流阻塞可能极短，
           AGENTS.md 5.1 的"回调不做阻塞 I/O"主要约束的是 _callback 本身；
@@ -401,10 +479,12 @@ class ApplicationController:
           （application 层）已转交后台线程执行，不直接在 PortAudio 线程阻塞。
         """
         with self._lock:
-            if self._sm.state != AppState.RECORDING:
+            if self._sm.state not in (AppState.RECORDING, AppState.PREPARING):
                 return
             current_task = self._current_task
             self._current_task = None
+        # 取消可能挂起的首帧兜底 timer。
+        self._cancel_first_frame_timer()
         # discard 在锁外执行（关流可能阻塞）。
         if current_task is not None:
             try:
@@ -417,14 +497,17 @@ class ApplicationController:
     def _handle_cancel(self) -> None:
         with self._lock:
             current = self._sm.state
-        if current == AppState.RECORDING:
+        if current in (AppState.RECORDING, AppState.PREPARING):
+            # PREPARING 分支：首帧未到时取消（用户秒按秒 Esc）；与 RECORDING 同路径
+            # discard + 清任务，并取消可能挂起的首帧兜底 timer。
+            self._cancel_first_frame_timer()
             try:
                 self._recorder.discard()
             except Exception:  # noqa: BLE001
                 logger.exception("[ApplicationController] cancel discard 异常")
             with self._lock:
                 self._current_task = None
-            # RECORDING -> IDLE 合法。
+            # PREPARING -> IDLE 合法；RECORDING -> IDLE 合法。
             self._goto(AppState.IDLE)
         elif current in (AppState.TRANSCRIBING, AppState.TRANSLATING):
             # 推理中取消：设置取消标记，任务自然结束但不粘贴。

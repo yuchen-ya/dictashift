@@ -10,7 +10,7 @@
 
 合法迁移表（严格实现）：
 - IDLE        -> PREPARING, DISABLED
-- PREPARING   -> RECORDING, IDLE（打开麦克风失败回 IDLE）
+- PREPARING   -> RECORDING, IDLE, DISABLED（打开麦克风失败回 IDLE；准备中禁用）
 - RECORDING   -> TRANSCRIBING, IDLE, DISABLED
 - TRANSCRIBING-> TRANSLATING, INSERTING, IDLE, DISABLED, ERROR
 - TRANSLATING -> INSERTING, IDLE, DISABLED, ERROR
@@ -55,7 +55,7 @@ class InvalidTransition(RuntimeError):
 # 注意：ERROR 只能从 TRANSCRIBING / TRANSLATING / INSERTING 进入。
 _TRANSITIONS: dict[AppState, frozenset[AppState]] = {
     AppState.IDLE: frozenset({AppState.PREPARING, AppState.DISABLED}),
-    AppState.PREPARING: frozenset({AppState.RECORDING, AppState.IDLE}),
+    AppState.PREPARING: frozenset({AppState.RECORDING, AppState.IDLE, AppState.DISABLED}),
     AppState.RECORDING: frozenset(
         {AppState.TRANSCRIBING, AppState.IDLE, AppState.DISABLED}
     ),

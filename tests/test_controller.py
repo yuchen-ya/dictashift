@@ -153,6 +153,7 @@ def _make_controller(
     backend: FakeTranslationBackend | None = None,
     paste_func: Callable[[str], bool] | None = None,
     callbacks: RecordedCallbacks | None = None,
+    wait_first_frame: bool = False,
 ) -> tuple[ApplicationController, RecordedCallbacks, FakeAsrService, FakeRecorder, FakeTranslationBackend]:
     asr = asr or FakeAsrService()
     recorder = recorder or FakeRecorder()
@@ -164,6 +165,7 @@ def _make_controller(
         translation_backend=backend,
         paste_func=paste_func if paste_func is not None else (lambda t: True),
         callbacks=cb.as_callbacks(),
+        wait_first_frame=wait_first_frame,
     )
     ctrl.start(enabled=True)
     return ctrl, cb, asr, recorder, backend
@@ -806,3 +808,219 @@ def test_recorder_start_failure_returns_idle_with_error() -> None:
     ctrl.handle_hotkey_press("dictate_zh")
     assert ctrl.state == AppState.IDLE
     assert recorder.start_calls == 2
+
+
+# ==================== wait_first_frame：首帧驱动的 PREPARING -> RECORDING ====================
+
+
+def test_wait_first_frame_press_stays_preparing() -> None:
+    """wait_first_frame=True：press -> start 成功后保持 PREPARING（不是 RECORDING）。"""
+    ctrl, cb, _, recorder, _ = _make_controller(wait_first_frame=True)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert recorder.start_calls == 1
+    assert ctrl.state == AppState.PREPARING
+    # 防兜 timer 已挂起
+    assert ctrl._first_frame_timer is not None
+
+
+def test_wait_first_frame_first_frame_moves_to_recording() -> None:
+    """wait_first_frame=True：press -> PREPARING；手动 _on_first_frame -> RECORDING；
+    之后 release 走正常流水线。"""
+    ctrl, cb, asr, recorder, _ = _make_controller(wait_first_frame=True)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.PREPARING
+
+    # 首帧到达
+    ctrl._on_first_frame()
+    assert ctrl.state == AppState.RECORDING
+    # 防兜 timer 已被取消
+    assert ctrl._first_frame_timer is None
+
+    # release 走正常流水线
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+    assert recorder.stop_calls == 1
+    assert len(asr.transcribe_calls) == 1
+    assert ctrl.state == AppState.IDLE
+
+
+def test_wait_first_frame_safety_timeout_moves_to_recording() -> None:
+    """安全兜底：press 后不手动触发，等 timer（_first_frame_timeout 设为 0.1）-> 自动 RECORDING。"""
+    ctrl, cb, _, recorder, _ = _make_controller(wait_first_frame=True)
+    ctrl._first_frame_timeout = 0.1
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.PREPARING
+
+    # 等待 timer 触发（容差给到 2s）
+    _wait_for_state(cb, AppState.RECORDING, timeout=2.0)
+    assert ctrl.state == AppState.RECORDING
+    assert ctrl._first_frame_timer is None
+
+    # 收尾
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+
+
+def test_wait_first_frame_release_during_preparing_returns_idle() -> None:
+    """PREPARING 中 release（首帧未到）：recorder.stop 被调、空录音 -> IDLE，无 transcribe。"""
+    empty_recorder = FakeRecorder(stop_audio=np.empty(0, dtype=np.float32))
+    ctrl, cb, asr, recorder, _ = _make_controller(
+        recorder=empty_recorder, wait_first_frame=True
+    )
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.PREPARING
+
+    cb.state_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    # 空录音 -> 回 IDLE，不进流水线
+    assert _wait(cb.state_event)
+    assert ctrl.state == AppState.IDLE
+    assert recorder.stop_calls == 1
+    assert asr.transcribe_calls == []
+    # 防兜 timer 已取消
+    assert ctrl._first_frame_timer is None
+
+
+def test_wait_first_frame_release_during_preparing_with_audio_runs_pipeline() -> None:
+    """PREPARING 中 release，但 stop 恰好取到帧（罕见）：补迁 RECORDING 后走流水线。"""
+    ctrl, cb, asr, recorder, _ = _make_controller(wait_first_frame=True)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.PREPARING
+
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    # 取到了默认非空音频 -> 走流水线
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+    assert recorder.stop_calls == 1
+    assert len(asr.transcribe_calls) == 1
+    assert ctrl.state == AppState.IDLE
+
+
+def test_wait_first_frame_cancel_during_preparing_returns_idle() -> None:
+    """PREPARING 中 cancel：discard 被调 -> IDLE。"""
+    ctrl, cb, _, recorder, _ = _make_controller(wait_first_frame=True)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.PREPARING
+
+    ctrl.handle_hotkey_press("cancel")
+    assert recorder.discard_calls == 1
+    assert ctrl.state == AppState.IDLE
+    assert ctrl._first_frame_timer is None
+
+
+def test_wait_first_frame_toggle_disable_during_preparing() -> None:
+    """PREPARING 中 toggle 禁用：discard 被调 -> DISABLED；再 toggle 恢复 IDLE。"""
+    ctrl, cb, _, recorder, _ = _make_controller(wait_first_frame=True)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.PREPARING
+
+    ctrl.handle_hotkey_press("toggle_enabled")
+    assert recorder.discard_calls == 1
+    assert ctrl.state == AppState.DISABLED
+    assert ctrl.enabled is False
+    assert ctrl._first_frame_timer is None
+
+    # 再 toggle 恢复
+    ctrl.handle_hotkey_press("toggle_enabled")
+    assert ctrl.state == AppState.IDLE
+    assert ctrl.enabled is True
+
+
+def test_wait_first_frame_stream_error_during_preparing() -> None:
+    """PREPARING 中 _on_stream_error：discard + on_error + 回 IDLE；随后 _on_first_frame 幂等无副作用。"""
+    ctrl, cb, _, recorder, _ = _make_controller(wait_first_frame=True)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.PREPARING
+
+    cb.error_event.clear()
+    ctrl._on_stream_error("output overflow")
+    assert _wait(cb.error_event)
+    assert recorder.discard_calls == 1
+    assert ctrl.state == AppState.IDLE
+    assert ctrl._first_frame_timer is None
+
+    # 随后的 _on_first_frame 幂等：状态非 PREPARING，无副作用
+    cb.error_event.clear()
+    ctrl._on_first_frame()
+    assert ctrl.state == AppState.IDLE
+    assert not cb.error_event.wait(timeout=0.2)
+    assert recorder.discard_calls == 1  # 未再 discard
+
+
+def test_wait_first_frame_first_frame_idempotent_after_release() -> None:
+    """release 在 PREPARING 取走任务后，迟到的 _on_first_frame 幂等忽略。"""
+    empty_recorder = FakeRecorder(stop_audio=np.empty(0, dtype=np.float32))
+    ctrl, cb, _, recorder, _ = _make_controller(
+        recorder=empty_recorder, wait_first_frame=True
+    )
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.PREPARING
+
+    cb.state_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert _wait(cb.state_event)
+    assert ctrl.state == AppState.IDLE
+
+    # 迟到的首帧回调：幂等忽略
+    ctrl._on_first_frame()
+    assert ctrl.state == AppState.IDLE
+
+
+def test_wait_first_frame_first_frame_idempotent_after_toggle_disable() -> None:
+    """toggle 禁用 PREPARING 后，迟到的 _on_first_frame 幂等忽略。"""
+    ctrl, cb, _, recorder, _ = _make_controller(wait_first_frame=True)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_press("toggle_enabled")
+    assert ctrl.state == AppState.DISABLED
+
+    # 迟到的首帧回调：状态非 PREPARING，幂等
+    ctrl._on_first_frame()
+    assert ctrl.state == AppState.DISABLED
+
+
+def test_default_wait_first_frame_false_press_goes_straight_to_recording() -> None:
+    """默认 wait_first_frame=False：press 后立即 RECORDING（保护旧行为）。"""
+    ctrl, cb, _, recorder, _ = _make_controller()  # 默认 False
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.RECORDING
+    assert ctrl._first_frame_timer is None
+
+    # _on_first_frame 即便被调也是幂等（不是 PREPARING）
+    ctrl._on_first_frame()
+    assert ctrl.state == AppState.RECORDING
+
+    # 收尾
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+
+
+def test_wait_first_frame_shutdown_cancels_timer() -> None:
+    """PREPARING 等待首帧时 shutdown：取消 timer + discard + 回 IDLE。"""
+    ctrl, cb, _, recorder, _ = _make_controller(wait_first_frame=True)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.PREPARING
+    assert ctrl._first_frame_timer is not None
+
+    ctrl.shutdown()
+    assert ctrl._first_frame_timer is None
+    assert recorder.discard_calls == 1
+    assert ctrl.state == AppState.IDLE

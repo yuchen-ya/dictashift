@@ -103,6 +103,7 @@ class DictaShiftApplication:
             device_index=self.settings.asr.mic_device_index,
             on_auto_stop=self._on_auto_stop,
             on_stream_error=self._on_stream_error,
+            on_first_frame=self._on_recorder_first_frame,
         )
 
         callbacks = ControllerCallbacks(
@@ -117,6 +118,7 @@ class DictaShiftApplication:
             translation_backend=self._backend,
             paste_func=type_text_at_cursor,
             callbacks=callbacks,
+            wait_first_frame=True,
         )
 
         # ---- 当前任务 action 跟踪（application 层负责，不修改 controller）----
@@ -417,6 +419,24 @@ class DictaShiftApplication:
 
         threading.Thread(
             target=_handle_in_worker, name="dictashift-stream-error", daemon=True
+        ).start()
+
+    def _on_recorder_first_frame(self) -> None:
+        """recorder 首个音频回调帧到达通知（PortAudio 线程）。
+
+        与 _on_auto_stop / _on_stream_error 同模式：PortAudio 线程只做最小工作——
+        起一次性后台线程调 controller._on_first_frame。不能在音频回调线程直接调
+        controller（后者会取状态机锁、可能触发 _goto 的状态回调，且 _on_first_frame
+        在 wait_first_frame=False 时根本不该被订阅；统一转后台线程保持回调线程轻量）。
+        """
+        def _handle_in_worker() -> None:
+            try:
+                self._controller._on_first_frame()
+            except Exception:  # noqa: BLE001
+                logger.exception("[DictaShiftApplication] on_first_frame 异常")
+
+        threading.Thread(
+            target=_handle_in_worker, name="dictashift-first-frame", daemon=True
         ).start()
 
     # ==================== 托盘槽 ====================

@@ -415,6 +415,95 @@ def test_stream_error_notified_again_after_new_start(fake_sd) -> None:
     rec.stop()
 
 
+# ==================== on_first_frame 首帧一次性通知 ====================
+
+
+def test_first_frame_invoked_once_on_first_callback(fake_sd) -> None:
+    """start 后首个音频回调触发 on_first_frame 恰好一次。"""
+    calls = []
+    rec = recorder_mod.AudioRecorder(on_first_frame=lambda: calls.append(1))
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    stream.feed(np.zeros((4, 1), dtype=np.float32), frames=4)
+    stream.feed(np.zeros((4, 1), dtype=np.float32), frames=4)
+    stream.feed(np.zeros((4, 1), dtype=np.float32), frames=4)
+    assert len(calls) == 1
+    rec.stop()
+
+
+def test_first_frame_not_invoked_without_callback_set(fake_sd) -> None:
+    """不传 on_first_frame 时回调路径仍正常，无副作用。"""
+    rec = recorder_mod.AudioRecorder()  # on_first_frame=None
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    # 不应抛异常
+    stream.feed(np.zeros((4, 1), dtype=np.float32), frames=4)
+    assert not rec._first_frame_pending
+    rec.stop()
+
+
+def test_first_frame_re_arms_on_new_start(fake_sd) -> None:
+    """stop 后再次 start 会再次触发 on_first_frame。"""
+    calls = []
+    rec = recorder_mod.AudioRecorder(on_first_frame=lambda: calls.append(1))
+    rec.start()
+    stream1: FakeInputStream = rec._stream  # type: ignore[assignment]
+    stream1.feed(np.zeros((4, 1), dtype=np.float32), frames=4)
+    assert len(calls) == 1
+    rec.stop()
+
+    rec.start()
+    stream2: FakeInputStream = rec._stream  # type: ignore[assignment]
+    stream2.feed(np.zeros((4, 1), dtype=np.float32), frames=4)
+    assert len(calls) == 2
+    rec.stop()
+
+
+def test_first_frame_not_invoked_after_stop(fake_sd) -> None:
+    """stop 后挂起的回调不再触发 on_first_frame（pending 已重置）。"""
+    calls = []
+    rec = recorder_mod.AudioRecorder(on_first_frame=lambda: calls.append(1))
+    rec.start()
+    # 直接 stop，未喂任何帧
+    rec.stop()
+    assert rec._first_frame_pending is False
+
+    # 即便手动对已停止的 stream 喂回调，也不应触发（pending=False）
+    # 注意：rec._stream 已置 None，但旧 stream 引用的 callback 仍是 rec._callback；
+    # 这里直接调 rec._callback 模拟迟到帧。
+    rec._callback(np.zeros((4, 1), dtype=np.float32), 4, 0, 0)
+    assert calls == []
+
+
+def test_first_frame_not_invoked_after_discard(fake_sd) -> None:
+    """discard 后挂起的回调不再触发 on_first_frame。"""
+    calls = []
+    rec = recorder_mod.AudioRecorder(on_first_frame=lambda: calls.append(1))
+    rec.start()
+    rec.discard()
+    assert rec._first_frame_pending is False
+    rec._callback(np.zeros((4, 1), dtype=np.float32), 4, 0, 0)
+    assert calls == []
+
+
+def test_first_frame_callback_exception_does_not_kill_audio(fake_sd) -> None:
+    """on_first_frame 回调抛异常时不应影响后续音频帧处理（异常只记日志）。"""
+    def boom() -> None:
+        raise RuntimeError("boom")
+
+    rec = recorder_mod.AudioRecorder(on_first_frame=boom)
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    # 首帧回调抛异常，但帧仍应被 append
+    stream.feed(np.full((4, 1), 0.5, dtype=np.float32), frames=4)
+    # 第二帧也应正常处理（音频线程未被打死）
+    stream.feed(np.full((6, 1), 0.6, dtype=np.float32), frames=6)
+    out = rec.stop()
+    assert out.shape == (10,)
+    np.testing.assert_allclose(out[:4], 0.5)
+    np.testing.assert_allclose(out[4:], 0.6)
+
+
 # ==================== list_input_devices ====================
 
 

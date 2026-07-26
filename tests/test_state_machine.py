@@ -22,7 +22,7 @@ from dictashift.core.state import AppState, InvalidTransition, StateMachine
 
 LEGAL_TRANSITIONS: dict[AppState, list[AppState]] = {
     AppState.IDLE: [AppState.PREPARING, AppState.DISABLED],
-    AppState.PREPARING: [AppState.RECORDING, AppState.IDLE],
+    AppState.PREPARING: [AppState.RECORDING, AppState.IDLE, AppState.DISABLED],
     AppState.RECORDING: [AppState.TRANSCRIBING, AppState.IDLE, AppState.DISABLED],
     AppState.TRANSCRIBING: [
         AppState.TRANSLATING,

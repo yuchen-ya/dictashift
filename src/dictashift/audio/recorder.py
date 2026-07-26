@@ -16,9 +16,9 @@ AudioRecorder 用 sounddevice.InputStream 录制 float32 单声道音频，最�
 - Input overflow 仅记 debug 日志（偶发丢帧不算故障）。
 
 不变量 (AGENTS.md 5.1 / 11)：
-- 音频回调 (_callback) 内只做：拷贝 append、自动停止判定、致命 status 一次性
-  通知；严禁磁盘 I/O、网络、模型推理，不抛未处理异常 (回调内 try/except 包住，
-  异常仅记 logging)。
+- 音频回调 (_callback) 内只做：首帧一次性通知、拷贝 append、自动停止判定、
+  致命 status 一次性通知；严禁磁盘 I/O、网络、模型推理，不抛未处理异常
+  (回调内 try/except 包住，异常仅记 logging)。
 - 达到 max_seconds 自动停止：回调内只置标记并调用 on_auto_stop 通知上层，
   实际 stop()/stream.close() 由上层在 on_auto_stop 驱动下调用 (更简单可靠，
   避免 PortAudio 回调内关闭流带来的重入风险)。
@@ -106,6 +106,9 @@ class AudioRecorder:
         device_index: 输入设备索引；None 用系统默认输入设备。
         on_stream_error: 录音中途严重 status（_is_fatal_status）时回调，
             最多触发一次（PortAudio 线程，只通知不阻塞）。
+        on_first_frame: 每次 start() 后首个音频回调帧到达时触发一次
+            （PortAudio 线程，只通知不阻塞）。用于上层把 PREPARING -> RECORDING
+            的迁移推迟到「真的在收音」之时。stop / discard 后挂起的回调不再触发。
     """
 
     def __init__(
@@ -115,6 +118,7 @@ class AudioRecorder:
         on_auto_stop: Callable[[], None] | None = None,
         device_index: int | None = None,
         on_stream_error: Callable[[str], None] | None = None,
+        on_first_frame: Callable[[], None] | None = None,
     ) -> None:
         # ASR 固定 16k；保留 sample_rate 参数以兼容旧调用，但实际目标恒为 _TARGET_SR。
         self._sample_rate = int(sample_rate) if sample_rate else _TARGET_SR
@@ -122,6 +126,13 @@ class AudioRecorder:
         self._on_auto_stop = on_auto_stop
         self._device_index = device_index
         self._on_stream_error = on_stream_error
+        # 每次 start() 后首个音频回调到达时触发一次（PortAudio 线程，只通知不阻塞）。
+        # 用于上层把 PREPARING -> RECORDING 的迁移推迟到「真的在收音」之时
+        # （蓝牙设备 stream.start() 立即返回，但首个回调要数百毫秒后才到）。
+        self._on_first_frame = on_first_frame
+        # 标记本轮是否仍在等待首个回调帧。start() 置 True；首帧到达 / stop / discard
+        # 后置 False。仅在 _on_first_frame 非 None 时才有意义，但无条件维护以简化逻辑。
+        self._first_frame_pending: bool = False
 
         self._lock = threading.Lock()
         self._stream: sd.InputStream | None = None
@@ -200,6 +211,8 @@ class AudioRecorder:
             self._samples_recorded = 0
             self._auto_stopped = False
             self._stream_error_notified = False
+            # 标记本轮等待首个回调帧（_callback 中据此触发一次性 on_first_frame）。
+            self._first_frame_pending = self._on_first_frame is not None
             # 查询设备原生采样率：流以原生采样率打开，stop 时重采样到 16k。
             native_sr = self._query_native_samplerate()
             self._native_sr = native_sr
@@ -240,6 +253,9 @@ class AudioRecorder:
             self._samples_recorded = 0
             self._auto_stopped = False
             self._stream_error_notified = False
+            # pending 已无意义：本轮要么首帧已到（pending 早被清），要么 stop 后
+            # 不再期待任何回调；置 False 防止 stop 后到达的尾帧误触发 on_first_frame。
+            self._first_frame_pending = False
             self._native_sr = _TARGET_SR
 
         if stream is not None:
@@ -274,6 +290,8 @@ class AudioRecorder:
             self._samples_recorded = 0
             self._auto_stopped = False
             self._stream_error_notified = False
+            # 同 stop：discard 后挂起的回调不再触发 on_first_frame。
+            self._first_frame_pending = False
             self._native_sr = _TARGET_SR
 
         if stream is not None:
@@ -292,6 +310,21 @@ class AudioRecorder:
         一次性通知，不做任何阻塞工作，不抛未处理异常。
         """
         try:
+            # 0) 首帧通知：本轮 start 后首个回调到达时触发一次 on_first_frame
+            #    （只通知不阻塞，异常只记日志）。这是「真的在收音」的准确信号——
+            #    蓝牙设备 stream.start() 立即返回，但首个回调要数百毫秒后才到。
+            if self._first_frame_pending:
+                # 先清标记（无锁：仅本回调线程读写，且 stop/discard 也会清；
+                # 即便竞态导致多触发一次 on_first_frame，上层 _on_first_frame 是幂等的）。
+                self._first_frame_pending = False
+                if self._on_first_frame is not None:
+                    try:
+                        self._on_first_frame()
+                    except Exception:  # noqa: BLE001 - 上层回调异常不得打死音频线程
+                        logger.exception(
+                            "[AudioRecorder] on_first_frame 回调抛出异常"
+                        )
+
             # 1) status 判定（Input overflow 仅 debug 日志；致命错误一次性通知）。
             if status:
                 # input_overflow 是输入流的偶发丢帧，正常现象，仅 debug。
