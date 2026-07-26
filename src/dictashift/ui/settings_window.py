@@ -71,6 +71,8 @@ class SettingsWindow(QWidget):
     - model_download_requested()：用户点击「下载模型」（后台执行，无参）。
     - test_popup_requested()：用户点击「测试右下角弹窗」（让 application 层用样例文本
       调 ResultPopup.show_result，验证弹窗可见性与复制功能）。
+    - clear_data_requested()：用户点击「清除全部数据并退出…」并确认二次弹窗后发出
+      （application 层停止服务、删除应用数据目录、退出）。
     """
 
     applied = Signal(AppSettings)
@@ -78,6 +80,7 @@ class SettingsWindow(QWidget):
     test_connection_requested = Signal(object)  # TranslationProfile
     model_download_requested = Signal()
     test_popup_requested = Signal()
+    clear_data_requested = Signal()  # 用户确认「清除全部数据并退出」
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -160,6 +163,19 @@ class SettingsWindow(QWidget):
         reset_row.addWidget(self._reset_status_label)
         reset_row.addStretch(1)
         form.addRow(reset_row)
+
+        # 危险操作：清除全部数据并退出（删除 %APPDATA%\\DictaShift 全部内容后退出）。
+        self._clear_data_btn = QPushButton("清除全部数据并退出…", page)
+        self._clear_data_btn.setObjectName("clear_data_btn")
+        self._clear_data_btn.setStyleSheet(
+            "QPushButton { color: #ff6b6b; border: 1px solid #c0392b; border-radius: 4px; padding: 4px 10px; }"
+            "QPushButton:hover { background-color: rgba(192, 57, 43, 40); }"
+        )
+        self._clear_data_btn.clicked.connect(self._on_clear_data_clicked)
+        clear_row = QHBoxLayout()
+        clear_row.addWidget(self._clear_data_btn)
+        clear_row.addStretch(1)
+        form.addRow(clear_row)
 
         return page
 
@@ -427,6 +443,23 @@ class SettingsWindow(QWidget):
         )
         if btn == QMessageBox.StandardButton.Yes:
             self.reset_to_defaults()
+
+    def _on_clear_data_clicked(self) -> None:
+        """点击「清除全部数据并退出…」：弹确认框，确认才 emit clear_data_requested。
+
+        QMessageBox 直接走模块级 QMessageBox.warning（便于测试 patch
+        dictashift.ui.settings_window.QMessageBox）。取消什么都不做。
+        """
+        btn = QMessageBox.warning(
+            self,
+            "清除全部数据并退出",
+            "此操作将删除全部设置（包含翻译 API Key）、日志与已下载的模型，"
+            "且应用将立即退出（之后需重新下载模型）。\n\n确定继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if btn == QMessageBox.StandardButton.Yes:
+            self.clear_data_requested.emit()
 
     # ==================== ASR 实际设备显示 ====================
 

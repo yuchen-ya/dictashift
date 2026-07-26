@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import shutil
 import threading
 
 from PySide6.QtCore import QObject, Signal, Qt
@@ -33,6 +34,7 @@ from .hotkeys.matcher import HotkeyBinding, parse_hotkey
 from .hotkeys.service import HotkeyService
 from .output.typing import type_text_at_cursor
 from .settings import AppSettings, SettingsRepository
+from .settings.repository import app_data_dir
 from .translation import DispatcherBackend, TranslationProfile, builtin_free_profiles
 from .ui.overlay import StateOverlay
 from .ui.result_popup import ResultPopup
@@ -156,6 +158,10 @@ class DictaShiftApplication:
         # ---- ASR 初始化/重检测/翻译测试 的线程引用（daemon，不 join）----
         self._asr_init_thread: threading.Thread | None = None
 
+        # 「清除全部数据并退出」流程标记：True 时 shutdown 跳过 repo.save（避免重建
+        # settings.json）。
+        self._data_cleared: bool = False
+
         self._connect_signals()
 
     # ==================== 信号连接 ====================
@@ -195,6 +201,9 @@ class DictaShiftApplication:
         )
         self._settings_window.test_popup_requested.connect(
             self._on_test_popup, Qt.QueuedConnection
+        )
+        self._settings_window.clear_data_requested.connect(
+            self._on_clear_data, Qt.QueuedConnection
         )
 
     # ==================== 生命周期 ====================
@@ -241,10 +250,67 @@ class DictaShiftApplication:
             self._asr.release()
         except Exception:  # noqa: BLE001
             logger.exception("[DictaShiftApplication] asr release 异常")
+        # 若已「清除全部数据并退出」则跳过保存设置（否则会重建 settings.json
+        # 与父目录，与已删除的数据目录冲突）。
+        if not getattr(self, "_data_cleared", False):
+            try:
+                self._repo.save(self.settings)
+            except Exception:  # noqa: BLE001
+                logger.exception("[DictaShiftApplication] 保存设置失败")
+
+    # ==================== 清除全部数据并退出 ====================
+
+    def _close_logging_handlers(self) -> None:
+        """关闭并移除 root logger 的所有 handler（释放日志文件句柄）。
+
+        Windows 下文件句柄不关闭会导致 shutil.rmtree 失败（ONNX session 内存映射的
+        模型文件已由 asr.release() 释放；日志文件句柄在此释放）。
+        """
+        root = logging.getLogger()
+        for handler in list(root.handlers):
+            try:
+                handler.close()
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                root.removeHandler(handler)
+
+    def _on_clear_data(self) -> None:
+        """「清除全部数据并退出」：停服务 -> 关日志句柄 -> 删数据目录 -> 标记 -> quit。
+
+        顺序很重要：
+        1. 先停 hotkey / controller.shutdown / asr.release（ONNX session 可能内存映射
+           模型文件，必须先 release 否则 Windows 下删不掉模型）；
+        2. 再关闭日志文件句柄（rmtree 才能删除 logs/dictashift.log）；
+        3. shutil.rmtree(ignore_errors=True) 删除整个应用数据目录；
+        4. 置 _data_cleared=True 防止 shutdown() 重建 settings.json；
+        5. app.quit() 退出（触发主循环退出 -> main 调 da.shutdown()，因 _data_cleared
+           跳过 repo.save）。
+
+        删除失败不阻塞退出（ignore_errors=True + warning 日志）。
+        """
         try:
-            self._repo.save(self.settings)
+            self._hotkeys.stop()
         except Exception:  # noqa: BLE001
-            logger.exception("[DictaShiftApplication] 保存设置失败")
+            logger.exception("[DictaShiftApplication] clear_data: hotkey stop 异常")
+        try:
+            self._controller.shutdown()
+        except Exception:  # noqa: BLE001
+            logger.exception("[DictaShiftApplication] clear_data: controller shutdown 异常")
+        try:
+            self._asr.release()
+        except Exception:  # noqa: BLE001
+            logger.exception("[DictaShiftApplication] clear_data: asr release 异常")
+        self._close_logging_handlers()
+        try:
+            shutil.rmtree(app_data_dir(), ignore_errors=True)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[DictaShiftApplication] clear_data: 删除数据目录失败（已忽略）: %s",
+                app_data_dir(),
+            )
+        self._data_cleared = True
+        self._app.quit()
 
     # ==================== ASR 后台初始化 / 重检测 ====================
 
@@ -528,7 +594,7 @@ class DictaShiftApplication:
             # queued 回主线程更新结果
             self._bridge.test_conn_result.emit(ok, msg)
 
-        threading.Thread(target=_worker, name="dictashift-test-conn", daemon=True)
+        t = threading.Thread(target=_worker, name="dictashift-test-conn", daemon=True)
         t.start()
 
     def _on_model_download_requested(self) -> None:

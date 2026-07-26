@@ -394,3 +394,48 @@ def test_autostart_checkbox_label_has_no_future_version_note(win) -> None:
     text = win._autostart_check.text()
     assert "后续版本" not in text
     assert "生效" not in text
+
+
+# ==================== 清除全部数据并退出 按钮 ====================
+
+
+class TestClearDataButton:
+    def test_button_exists_with_danger_style(self, win) -> None:
+        """按钮存在、文案正确、含危险（红色）样式。"""
+        assert hasattr(win, "_clear_data_btn")
+        btn = win._clear_data_btn
+        assert btn.text() == "清除全部数据并退出…"
+        style = btn.styleSheet()
+        assert "#c0392b" in style or "#ff6b6b" in style  # 红色边框/文字
+
+    def test_cancel_does_not_emit(self, win, monkeypatch) -> None:
+        """确认框返回 Cancel -> 不 emit clear_data_requested。"""
+        from PySide6.QtWidgets import QMessageBox
+
+        from dictashift.ui import settings_window as sw_mod
+
+        monkeypatch.setattr(
+            sw_mod.QMessageBox,
+            "warning",
+            lambda *a, **kw: QMessageBox.StandardButton.Cancel,
+        )
+        got = {}
+        win.clear_data_requested.connect(lambda: got.__setitem__("fired", True))
+        win._clear_data_btn.click()
+        assert got.get("fired") is None
+
+    def test_confirm_emits_once(self, win, monkeypatch) -> None:
+        """确认框返回 Yes -> emit clear_data_requested 一次。"""
+        from PySide6.QtWidgets import QMessageBox
+
+        from dictashift.ui import settings_window as sw_mod
+
+        monkeypatch.setattr(
+            sw_mod.QMessageBox,
+            "warning",
+            lambda *a, **kw: QMessageBox.StandardButton.Yes,
+        )
+        got = []
+        win.clear_data_requested.connect(lambda: got.append(1))
+        win._clear_data_btn.click()
+        assert got == [1]

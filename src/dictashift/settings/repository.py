@@ -20,16 +20,22 @@ from .models import AppSettings
 logger = logging.getLogger(__name__)
 
 
-def _default_settings_path() -> Path:
-    """返回默认配置文件路径。
+def app_data_dir() -> Path:
+    """返回应用用户数据目录（不含子项）。
 
-    优先 %APPDATA%\\DictaShift\\settings.json；
-    无 APPDATA 环境变量时回退到 ~/.dictashift/settings.json。
+    优先 %APPDATA%\\DictaShift；无 APPDATA 环境变量时回退到 ~/.dictashift。
+    判定逻辑与 asr.providers.user_model_dir() / main._default_log_dir() 一致。
+    不保证目录存在。
     """
     appdata = os.environ.get("APPDATA")
     if appdata:
-        return Path(appdata) / "DictaShift" / "settings.json"
-    return Path.home() / ".dictashift" / "settings.json"
+        return Path(appdata) / "DictaShift"
+    return Path.home() / ".dictashift"
+
+
+def _default_settings_path() -> Path:
+    """返回默认配置文件路径：app_data_dir()/settings.json。"""
+    return app_data_dir() / "settings.json"
 
 
 class SettingsRepository:

@@ -136,3 +136,58 @@ def test_on_text_ready_overlay_failure_shows_result() -> None:
     app._on_text_ready("hello", False)
     assert overlay.results == [("hello", True)]
     assert popup.results == []
+
+
+# ==================== _on_test_connection 回归 ====================
+
+
+class _FakeBackend:
+    def __init__(self, result: str = "  hello  ") -> None:
+        self._result = result
+        self.calls: list[tuple[str, object]] = []
+
+    def translate(self, text: str, profile) -> str:
+        self.calls.append((text, profile))
+        return self._result
+
+
+class _FakeSignal:
+    """记录 emit 并通知等待者的 signal 替身。"""
+
+    def __init__(self) -> None:
+        import threading
+
+        self.emitted: list[tuple] = []
+        self.event = threading.Event()
+
+    def emit(self, *args) -> None:
+        self.emitted.append(args)
+        self.event.set()
+
+
+class _FakeBridge:
+    def __init__(self) -> None:
+        self.test_conn_result = _FakeSignal()
+
+
+def test_on_test_connection_runs_worker_and_emits_result() -> None:
+    """「测试连接」应在后台线程调 backend.translate 并 emit 结果（回归：线程对象
+    曾未赋值给 t，t.start() 直接 NameError，按钮一点就崩）。"""
+    from dictashift.translation import TranslationProfile
+
+    app = DictaShiftApplication.__new__(DictaShiftApplication)
+    app._backend = _FakeBackend()
+    app._bridge = _FakeBridge()
+    profile = TranslationProfile(
+        name="t", backend_type="openai", base_url="http://unused/v1",
+        model="m", api_key=None, timeout=5.0,
+    )
+
+    # 不应抛 NameError（回归点）；worker 线程执行 translate 并 emit。
+    app._on_test_connection(profile)
+
+    assert app._bridge.test_conn_result.event.wait(timeout=5.0)
+    assert app._backend.calls and app._backend.calls[0][0] == "你好"
+    ok, msg = app._bridge.test_conn_result.emitted[0]
+    assert ok is True
+    assert msg == "hello"

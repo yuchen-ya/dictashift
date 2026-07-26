@@ -28,6 +28,7 @@ from dictashift.settings.models import (
     profile_from_dict,
     profile_to_dict,
 )
+from dictashift.settings.repository import _default_settings_path, app_data_dir
 from dictashift.translation import TranslationProfile
 
 
@@ -322,4 +323,30 @@ def test_ui_settings_round_trip() -> None:
     """result_ui 往返稳定。"""
     u = UiSettings(result_ui="overlay", launch_at_login=True)
     assert UiSettings.from_dict(u.to_dict()) == u
+
+
+# ==================== app_data_dir / _default_settings_path ====================
+
+
+def test_app_data_dir_with_appdata(monkeypatch) -> None:
+    """有 APPDATA 时 -> %APPDATA%\\DictaShift。"""
+    monkeypatch.setenv("APPDATA", str(Path("C:/Users/fake/AppData/Roaming")))
+    monkeypatch.setattr(Path, "home", lambda: Path("C:/Users/fake"))
+    d = app_data_dir()
+    assert d == Path("C:/Users/fake/AppData/Roaming/DictaShift")
+
+
+def test_app_data_dir_without_appdata(monkeypatch) -> None:
+    """无 APPDATA 时回退 ~/.dictashift。"""
+    monkeypatch.delenv("APPDATA", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: Path("C:/Users/fake"))
+    d = app_data_dir()
+    assert d == Path("C:/Users/fake/.dictashift")
+
+
+def test_default_settings_path_under_app_data_dir(monkeypatch) -> None:
+    """_default_settings_path 指向 app_data_dir()/settings.json。"""
+    monkeypatch.setenv("APPDATA", str(Path("C:/Users/fake/AppData/Roaming")))
+    monkeypatch.setattr(Path, "home", lambda: Path("C:/Users/fake"))
+    assert _default_settings_path() == app_data_dir() / "settings.json"
 
