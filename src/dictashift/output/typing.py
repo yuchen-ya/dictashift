@@ -168,7 +168,11 @@ def type_text_at_cursor(text: str) -> bool:
     """
     if not text:
         return True
-    if not has_focused_caret():
+    has_caret = has_focused_caret()
+    logger.info(
+        "[type_text_at_cursor] has_focused_caret=%s, 文本长度=%d", has_caret, len(text)
+    )
+    if not has_caret:
         return False
     # 过滤 emoji（产品决策：Qt 目标 emoji 错位，默认过滤）。
     # 注意：controller.on_text_ready 仍携带原文，弹窗可显示完整内容。

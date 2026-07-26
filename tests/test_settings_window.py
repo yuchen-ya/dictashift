@@ -254,6 +254,22 @@ def test_recheck_sets_loading_state(win) -> None:
     assert win._recheck_btn.text() == "加载中…"
 
 
+# ==================== 测试右下角弹窗按钮 ====================
+
+
+def test_test_popup_button_emits_signal(win) -> None:
+    """「测试右下角弹窗」按钮点击应 emit test_popup_requested（无参）。"""
+    got = {}
+    win.test_popup_requested.connect(lambda: got.__setitem__("fired", True))
+    win._test_popup_btn.click()
+    assert got.get("fired") is True
+
+
+def test_test_popup_button_exists(win) -> None:
+    assert hasattr(win, "_test_popup_btn")
+    assert win._test_popup_btn.text() == "测试右下角弹窗"
+
+
 # ==================== 模型状态 / 下载 UI ====================
 
 

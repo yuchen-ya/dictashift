@@ -231,6 +231,61 @@ def test_query_devices_failure_falls_back_to_16k(monkeypatch, fake_sd) -> None:
     rec.stop()
 
 
+def test_default_device_uses_kind_input_not_devicelist(monkeypatch) -> None:
+    """device_index=None 时必须用 sd.query_devices(kind="input") 拿默认输入设备 dict，
+    而不是 query_devices(None)（后者返回 DeviceList，无 .get，会触发异常回退）。
+
+    回归：之前每次录音开始都报 query_devices(device_index=None) 失败的 AttributeError
+    并静默回退 16kHz；修复后 None 路径走 kind="input" 并正常返回真实采样率。
+    """
+    monkeypatch.setattr(recorder_mod.sd, "InputStream", FakeInputStream)
+    calls: list[tuple] = []
+
+    # 模拟真实 sounddevice 语义：
+    # - query_devices(None) -> 返回 DeviceList（list 子类，无 .get 属性）
+    # - query_devices(kind="input") -> 返回默认输入设备 dict
+    class _FakeDeviceList(list):
+        """模拟 sounddevice.DeviceList：是 list 但没有 dict 的 .get 方法。"""
+
+    def _q(device=None, *args, **kwargs):
+        calls.append((device, args, kwargs))
+        if "kind" in kwargs:
+            # kind="input" 路径：返回默认输入设备 dict（含真实采样率 48k）。
+            return {"name": "default-input", "default_samplerate": 48000.0,
+                    "max_input_channels": 1}
+        if device is None:
+            # 与真实 sounddevice 行为一致：query_devices(None) 返回 DeviceList。
+            return _FakeDeviceList([
+                {"name": "Mic A", "max_input_channels": 1, "default_samplerate": 48000.0},
+            ])
+        return {"name": "x", "default_samplerate": 16000.0, "max_input_channels": 1}
+
+    monkeypatch.setattr(recorder_mod.sd, "query_devices", _q)
+    rec = recorder_mod.AudioRecorder()  # device_index=None
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    # 必须调用了 kind="input" 路径（拿回 48k），且不能走过异常回退（=16k）。
+    assert any(c[2].get("kind") == "input" for c in calls), \
+        f"未调用 query_devices(kind='input')；calls={calls}"
+    assert stream.kwargs["samplerate"] == 48000
+    rec.stop()
+
+
+def test_default_device_query_failure_still_falls_back(monkeypatch) -> None:
+    """device_index=None 且 query_devices(kind='input') 抛异常时仍回退 16k。"""
+    monkeypatch.setattr(recorder_mod.sd, "InputStream", FakeInputStream)
+
+    def boom(*a, **kw):
+        raise RuntimeError("sd unavailable")
+
+    monkeypatch.setattr(recorder_mod.sd, "query_devices", boom)
+    rec = recorder_mod.AudioRecorder()  # device_index=None
+    rec.start()
+    stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    assert stream.kwargs["samplerate"] == 16000
+    rec.stop()
+
+
 def test_auto_stop_callback_invoked(fake_sd) -> None:
     """达到 max_seconds 时 on_auto_stop 被调用（回调置标记，stop 由测试驱动）。"""
     called = threading.Event()

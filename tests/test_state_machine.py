@@ -3,7 +3,7 @@
 测试目标 (AGENTS.md 5.2)：
 - 全部合法迁移逐条通过。
 - 非法迁移抛 InvalidTransition，重点：
-  * IDLE 之外的任何状态 -> RECORDING 均非法。
+  * PREPARING 之外的任何状态 -> RECORDING 均非法（IDLE 须经 PREPARING）。
   * 任何状态不能直达 ERROR（除 TRANSCRIBING / TRANSLATING / INSERTING）。
   * IDLE -> ERROR 非法。
 - force() 可任意跳转（绕过迁移表）。
@@ -21,7 +21,8 @@ from dictashift.core.state import AppState, InvalidTransition, StateMachine
 # ==================== 合法迁移表（与 src/dictashift/core/state.py 对应）====================
 
 LEGAL_TRANSITIONS: dict[AppState, list[AppState]] = {
-    AppState.IDLE: [AppState.RECORDING, AppState.DISABLED],
+    AppState.IDLE: [AppState.PREPARING, AppState.DISABLED],
+    AppState.PREPARING: [AppState.RECORDING, AppState.IDLE],
     AppState.RECORDING: [AppState.TRANSCRIBING, AppState.IDLE, AppState.DISABLED],
     AppState.TRANSCRIBING: [
         AppState.TRANSLATING,
@@ -43,6 +44,7 @@ LEGAL_TRANSITIONS: dict[AppState, list[AppState]] = {
 
 ALL_STATES = [
     AppState.IDLE,
+    AppState.PREPARING,
     AppState.RECORDING,
     AppState.TRANSCRIBING,
     AppState.TRANSLATING,
@@ -67,6 +69,7 @@ def test_each_legal_transition_succeeds(start: AppState) -> None:
 def test_state_string_enum_values() -> None:
     """StrEnum 取值稳定（持久化/日志依赖）。"""
     assert AppState.IDLE == "idle"
+    assert AppState.PREPARING == "preparing"
     assert AppState.RECORDING == "recording"
     assert AppState.TRANSCRIBING == "transcribing"
     assert AppState.TRANSLATING == "translating"
@@ -95,9 +98,10 @@ def test_each_illegal_transition_raises(start: AppState) -> None:
 
 
 def test_only_idle_can_enter_recording() -> None:
-    """重点不变量：IDLE 之外的任何状态 -> RECORDING 均非法。"""
+    """重点不变量：PREPARING 之外的任何状态 -> RECORDING 均非法
+    （IDLE 也必须先经 PREPARING 再到 RECORDING）。"""
     for start in ALL_STATES:
-        if start == AppState.IDLE:
+        if start == AppState.PREPARING:
             continue
         sm = StateMachine(initial=start)
         with pytest.raises(InvalidTransition):

@@ -69,12 +69,15 @@ class SettingsWindow(QWidget):
     - recheck_hardware_requested()：用户点击「重新检测硬件」（无参，固定重新初始化）。
     - test_connection_requested(profile)：用户点击「测试连接」（后台执行）。
     - model_download_requested()：用户点击「下载模型」（后台执行，无参）。
+    - test_popup_requested()：用户点击「测试右下角弹窗」（让 application 层用样例文本
+      调 ResultPopup.show_result，验证弹窗可见性与复制功能）。
     """
 
     applied = Signal(AppSettings)
     recheck_hardware_requested = Signal()
     test_connection_requested = Signal(object)  # TranslationProfile
     model_download_requested = Signal()
+    test_popup_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -135,7 +138,14 @@ class SettingsWindow(QWidget):
         self._result_ui_combo.addItem(
             "常驻悬浮窗（置顶显示状态与结果）", "overlay"
         )
-        form.addRow("结果展示方式：", self._result_ui_combo)
+        # 紧邻结果展示方式：让用户手动验证右下角弹窗可见性与复制功能
+        # （诊断「没有光标时弹窗也不弹、文本无处可复制」）。
+        self._test_popup_btn = QPushButton("测试右下角弹窗", page)
+        self._test_popup_btn.clicked.connect(self._on_test_popup_clicked)
+        result_ui_row = QHBoxLayout()
+        result_ui_row.addWidget(self._result_ui_combo, stretch=1)
+        result_ui_row.addWidget(self._test_popup_btn)
+        form.addRow("结果展示方式：", result_ui_row)
 
         form.addRow(QLabel("全局禁用快捷键：", page))
         self._toggle_hotkey = HotkeyEdit(page)
@@ -519,6 +529,13 @@ class SettingsWindow(QWidget):
         self._recheck_btn.setText("加载中…")
         # 重新检测 = 重新初始化（设备固定 AUTO/0）。
         self.recheck_hardware_requested.emit()
+
+    def _on_test_popup_clicked(self) -> None:
+        """点击「测试右下角弹窗」：仅发信号给 application 层弹 ResultPopup。
+
+        UI 自身不直接调用 ResultPopup（由 application 持有）。
+        """
+        self.test_popup_requested.emit()
 
     def _on_download_model_clicked(self) -> None:
         """点击「下载模型」：禁用按钮、显示进度条、发信号给 application 后台下载。

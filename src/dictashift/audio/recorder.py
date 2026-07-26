@@ -169,9 +169,17 @@ class AudioRecorder:
     # ==================== 生命周期 ====================
 
     def _query_native_samplerate(self) -> int:
-        """查询设备原生采样率，失败回退 16k 并记 warning。"""
+        """查询设备原生采样率，失败回退 16k 并记 warning。
+
+        注意：device_index=None 时不能调用 sd.query_devices(None)——sounddevice
+        在该参数下返回 DeviceList（无 .get 属性），会触发 AttributeError 并走入
+        异常回退。正确做法是用 sd.query_devices(kind="input") 拿默认输入设备 dict。
+        """
         try:
-            info = sd.query_devices(self._device_index)
+            if self._device_index is None:
+                info = sd.query_devices(kind="input")
+            else:
+                info = sd.query_devices(self._device_index)
             sr = int(info.get("default_samplerate", _TARGET_SR))
             if sr <= 0:
                 return _TARGET_SR

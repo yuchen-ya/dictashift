@@ -1,7 +1,7 @@
 """应用运行时状态机。
 
 不变量 (AGENTS.md 5.2)：
-- 只有 IDLE 可进入 RECORDING。
+- 只有 IDLE 可进入 PREPARING；只有 PREPARING 可进入 RECORDING。
 - DISABLED 状态不启动录音、不调用模型、不修改剪贴板。
 - 全局切换快捷键在 DISABLED 状态仍可恢复启用（DISABLED -> IDLE）。
 - 录音中禁用时停止并丢弃本次录音（RECORDING -> DISABLED）。
@@ -9,7 +9,8 @@
   （状态层面允许 TRANSCRIBING/TRANSLATING -> DISABLED 迁移）。
 
 合法迁移表（严格实现）：
-- IDLE        -> RECORDING, DISABLED
+- IDLE        -> PREPARING, DISABLED
+- PREPARING   -> RECORDING, IDLE（打开麦克风失败回 IDLE）
 - RECORDING   -> TRANSCRIBING, IDLE, DISABLED
 - TRANSCRIBING-> TRANSLATING, INSERTING, IDLE, DISABLED, ERROR
 - TRANSLATING -> INSERTING, IDLE, DISABLED, ERROR
@@ -17,6 +18,9 @@
 - ERROR       -> IDLE, DISABLED
 - DISABLED    -> IDLE
 - 任何状态 -> ERROR 不允许（ERROR 只能从上表列出的状态进入）
+
+PREPARING 语义：按下听写快捷键后、麦克风流真正打开之前的过渡状态，
+让 UI 能如实显示「准备中…」而不是提前声称「录音中」。
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ class AppState(StrEnum):
 
     DISABLED = "disabled"
     IDLE = "idle"
+    PREPARING = "preparing"
     RECORDING = "recording"
     TRANSCRIBING = "transcribing"
     TRANSLATING = "translating"
@@ -49,7 +54,8 @@ class InvalidTransition(RuntimeError):
 # value 为从该状态允许迁移到的目标状态集合。
 # 注意：ERROR 只能从 TRANSCRIBING / TRANSLATING / INSERTING 进入。
 _TRANSITIONS: dict[AppState, frozenset[AppState]] = {
-    AppState.IDLE: frozenset({AppState.RECORDING, AppState.DISABLED}),
+    AppState.IDLE: frozenset({AppState.PREPARING, AppState.DISABLED}),
+    AppState.PREPARING: frozenset({AppState.RECORDING, AppState.IDLE}),
     AppState.RECORDING: frozenset(
         {AppState.TRANSCRIBING, AppState.IDLE, AppState.DISABLED}
     ),

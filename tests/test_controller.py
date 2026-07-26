@@ -203,6 +203,31 @@ def test_dictate_zh_full_pipeline() -> None:
     assert ctrl.state == AppState.IDLE
 
 
+def test_dictate_zh_full_pipeline_logs_timings(caplog) -> None:
+    """成功路径末尾输出一行流水线耗时汇总日志（音频/转写/翻译/粘贴）。"""
+    import logging
+
+    ctrl, cb, asr, recorder, _ = _make_controller()
+    with caplog.at_level(logging.INFO, logger="dictashift.core.controller"):
+        ctrl.handle_hotkey_press("dictate_zh")
+        cb.state_event.clear()
+        cb.text_event.clear()
+        ctrl.handle_hotkey_release("dictate_zh")
+        assert _wait(cb.text_event)
+        _wait_for_state(cb, AppState.IDLE)
+
+    # 汇总日志一行，含关键字「流水线完成」与各项耗时标签。
+    summary = [r.message for r in caplog.records if "流水线完成" in r.message]
+    assert len(summary) == 1, f"期望恰好一条汇总日志，实际 {summary}"
+    msg = summary[0]
+    assert "音频" in msg
+    assert "转写" in msg
+    assert "翻译" in msg
+    assert "粘贴" in msg
+    # dictate_zh 无翻译分支，翻译耗时应为 0.00。
+    assert "翻译 0.00s" in msg
+
+
 def _wait_for_state(cb: RecordedCallbacks, target: AppState, timeout: float = 5.0) -> None:
     """轮询回调状态列表，直到出现 target 或超时。"""
     deadline = time.monotonic() + timeout
@@ -462,6 +487,63 @@ def test_paste_failure_reports_not_pasted() -> None:
     assert cb.texts == [("你好世界", False)]
 
 
+# ==================== ASR 返回空识别文本 ====================
+
+
+def test_empty_asr_text_reports_error_and_returns_idle() -> None:
+    """ASR transcribe 返回空文本 -> on_error 收到「未识别到语音内容」提示，
+    状态最终回 IDLE（不进入翻译/粘贴），且不触发 on_text_ready。
+    """
+    paste_calls: list[str] = []
+    asr = FakeAsrService(text="   ")  # 仅空白字符，strip() 后为空
+    ctrl, cb, _asr, recorder, _ = _make_controller(
+        asr=asr, paste_func=lambda t: paste_calls.append(t) or True
+    )
+
+    cb.error_event.clear()
+    cb.text_event.clear()
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+
+    # 等待 on_error 触发
+    assert _wait(cb.error_event)
+    _wait_for_state(cb, AppState.IDLE)
+
+    # 错误提示含「未识别到语音内容」语义
+    assert len(cb.errors) == 1
+    assert "未识别到语音内容" in cb.errors[0]
+    # 不应进入翻译/粘贴路径
+    assert cb.texts == []
+    assert paste_calls == []
+    assert ctrl.state == AppState.IDLE
+
+
+def test_empty_asr_text_suppressed_does_not_report_error() -> None:
+    """对照：ASR 返回空文本，但任务在 _should_suppress_output 检查点已被取消
+    抑制时，走 _finish_suppressed 分支，不走空文本的 on_error。
+
+    实现要点：让 transcribe 阻塞到取消信号发出后才放行，确保 worker 走到
+    _should_suppress_output 检查点时 _cancel_requested 已为 True。
+    """
+    block = threading.Event()
+    asr = FakeAsrService(text="", block_event=block)
+    ctrl, cb, _asr, recorder, _ = _make_controller(asr=asr)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+    _wait_for_state(cb, AppState.TRANSCRIBING)
+
+    # 推理中取消（worker 仍阻塞在 transcribe）
+    ctrl.handle_hotkey_press("cancel")
+    # 放行 transcribe，使 worker 走到 _should_suppress_output 检查点（已被取消）
+    block.set()
+
+    _wait_for_state(cb, AppState.IDLE, timeout=5.0)
+    time.sleep(0.2)
+    # 被抑制路径不应触发空文本的 on_error
+    assert cb.errors == []
+
+
 # ==================== worker 异常 ====================
 
 
@@ -660,3 +742,67 @@ def test_controller_instance_default_paste_is_typing_function() -> None:
         callbacks=RecordedCallbacks().as_callbacks(),
     )
     assert ctrl._paste is type_text_at_cursor
+
+
+# ==================== PREPARING 过渡状态 ====================
+
+
+class _BlockingStartRecorder(FakeRecorder):
+    """start 阻塞直到放行，用于观察 PREPARING 过渡状态。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered_start = threading.Event()
+        self.release_start = threading.Event()
+
+    def start(self) -> None:
+        self.start_calls += 1
+        self.entered_start.set()
+        self.release_start.wait(timeout=5.0)
+
+
+def test_press_enters_preparing_until_recorder_start_completes() -> None:
+    """按下听写键后、recorder.start 完成前状态必须是 PREPARING（而非提前声称
+    RECORDING）；start 完成后才迁移到 RECORDING。"""
+    recorder = _BlockingStartRecorder()
+    ctrl, cb, _, _, _ = _make_controller(recorder=recorder)
+
+    t = threading.Thread(
+        target=ctrl.handle_hotkey_press, args=("dictate_zh",), daemon=True
+    )
+    t.start()
+    assert recorder.entered_start.wait(timeout=2.0)
+    # start 阻塞中：状态应为 PREPARING，且 on_state_changed 已通知过
+    assert ctrl.state == AppState.PREPARING
+    assert AppState.PREPARING in cb.states
+
+    recorder.release_start.set()
+    t.join(timeout=2.0)
+    assert ctrl.state == AppState.RECORDING
+
+    # 收尾：release 结束任务，回 IDLE
+    ctrl.handle_hotkey_release("dictate_zh")
+    _wait_for_state(cb, AppState.IDLE)
+
+
+def test_recorder_start_failure_returns_idle_with_error() -> None:
+    """recorder.start 抛异常 -> on_error 提示麦克风不可用，状态 PREPARING -> IDLE，
+    状态机不卡死，可再次发起听写（再次失败仍回 IDLE）。"""
+
+    class _FailingStartRecorder(FakeRecorder):
+        def start(self) -> None:
+            self.start_calls += 1
+            raise RuntimeError("mock open failure")
+
+    ctrl, cb, _, recorder, _ = _make_controller(recorder=_FailingStartRecorder())
+    cb.error_event.clear()
+    ctrl.handle_hotkey_press("dictate_zh")
+
+    assert _wait(cb.error_event)
+    assert any("麦克风不可用" in m for m in cb.errors)
+    assert ctrl.state == AppState.IDLE
+
+    # 再次按下：流程可重入（同步失败 -> 仍回 IDLE，错误再报一次）
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.IDLE
+    assert recorder.start_calls == 2

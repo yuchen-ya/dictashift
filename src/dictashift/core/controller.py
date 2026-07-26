@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable, Protocol
 
@@ -372,6 +373,9 @@ class ApplicationController:
             self._report_error(no_profile_msg)
             return
 
+        # 先迁移到 PREPARING：麦克风流打开需要数十~数百毫秒（蓝牙设备更久），
+        # 让 UI 如实显示「准备中…」而非提前声称「录音中」。
+        self._goto(AppState.PREPARING)
         # 开始录音（锁外，recorder.start 可能涉及 PortAudio）。
         try:
             self._recorder.start()
@@ -381,6 +385,8 @@ class ApplicationController:
                 self._current_task = None
             # 设备占用/打开失败的语义提示（不改 recorder 异常类型，仅文案）。
             self._report_error("麦克风不可用：可能被其他应用独占或已拔出")
+            # PREPARING -> IDLE 合法迁移。
+            self._goto(AppState.IDLE)
             return
         self._goto(AppState.RECORDING)
 
@@ -440,10 +446,17 @@ class ApplicationController:
 
         任何异常 -> ERROR + on_error。取消/禁用标记在关键检查点生效。
         """
+        # 流水线耗时统计（成功路径末尾汇总记录，便于排查"等半天出结果"的瓶颈）。
+        audio_seconds = len(audio) / 16000.0
+        t_transcribe = 0.0
+        t_translate = 0.0
+        t_paste = 0.0
         try:
             # ---- TRANSCRIBING ----
             lid = _LID_BY_ACTION.get(task.action, "auto")
+            t0 = time.perf_counter()
             result = self._asr.transcribe(audio, lid=lid, itn=True)
+            t_transcribe = time.perf_counter() - t0
             text = getattr(result, "text", "") or ""
 
             if self._should_suppress_output():
@@ -451,7 +464,9 @@ class ApplicationController:
                 return
 
             if not text.strip():
-                # 无识别文本，直接回 IDLE。
+                # 无识别文本：给用户可见提示，再回 IDLE。
+                # 此分支已在 _should_suppress_output 检查之后，被抑制（取消/禁用）时不报错。
+                self._report_error("未识别到语音内容，请靠近麦克风重试")
                 self._goto_safe(AppState.IDLE)
                 return
 
@@ -461,7 +476,9 @@ class ApplicationController:
                 if self._should_suppress_output():
                     self._finish_suppressed()
                     return
+                t1 = time.perf_counter()
                 translated = self._translation.translate(text, task.profile_snapshot)
+                t_translate = time.perf_counter() - t1
                 text = translated
 
             if self._should_suppress_output():
@@ -479,10 +496,16 @@ class ApplicationController:
                 self._finish_suppressed()
                 return
 
+            t2 = time.perf_counter()
             pasted = self._paste(text)
+            t_paste = time.perf_counter() - t2
             # 粘贴成功与否都通过 on_text_ready 通知；pasted=False 表示直输失败，由上层弹窗展示文本。
             self._fire_text_ready(text, bool(pasted))
             self._goto_safe(AppState.IDLE)
+            logger.info(
+                "[ApplicationController] 流水线完成: 音频 %.1fs, 转写 %.2fs, 翻译 %.2fs, 粘贴 %.2fs",
+                audio_seconds, t_transcribe, t_translate, t_paste,
+            )
         except Exception as e:  # noqa: BLE001
             logger.exception("[ApplicationController] 流水线异常")
             self._report_error(self._safe_error_message(e))

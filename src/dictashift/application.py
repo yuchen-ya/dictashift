@@ -10,11 +10,16 @@
 - 模型加载/网络请求/阻塞等待一律放后台线程；完成后 queued 通知 UI。
 - 不修改 controller；当前任务 action 在本层自行跟踪（on_press 记录，
   recorder on_auto_stop 时据此调 handle_hotkey_release）。
+- pynput 回调（_on_hotkey_press / _on_hotkey_release / _on_tray_toggle）只做
+  最小工作：更新 _current_action + 把事件入 FIFO 队列后立即返回。controller 调用
+  （含 recorder.start/stop 的 PortAudio 阻塞）由单线程消费线程按序执行，
+  避免 pynput 监听线程被阻塞导致按键不跟手、松开事件延迟处理。
 """
 
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 
 from PySide6.QtCore import QObject, Signal, Qt
@@ -118,6 +123,19 @@ class DictaShiftApplication:
         self._current_action: str | None = None
         self._action_lock = threading.Lock()
 
+        # ---- pynput 回调异步串行化：回调只入队，消费线程按 FIFO 调 controller ----
+        # 解决根因：pynput 监听线程串行处理键事件，若在回调里同步调用
+        # controller.handle_hotkey_press/release（含 recorder.start/stop 的
+        # PortAudio 阻塞），会导致后续键事件排队 -> 按键不跟手、松开事件延迟
+        # 处理 -> 松手后仍在录音 -> 录音尾巴长 -> ASR 更慢。
+        self._hotkey_queue: queue.Queue = queue.Queue()
+        self._hotkey_exec_thread = threading.Thread(
+            target=self._hotkey_consumer_loop,
+            name="dictashift-hotkey-exec",
+            daemon=True,
+        )
+        self._hotkey_exec_thread.start()
+
         # ---- hotkey service（先构造，startup 时 start）----
         self._hotkeys = HotkeyService(
             bindings=self._bindings_from_settings(self.settings),
@@ -173,6 +191,9 @@ class DictaShiftApplication:
         self._settings_window.model_download_requested.connect(
             self._on_model_download_requested, Qt.QueuedConnection
         )
+        self._settings_window.test_popup_requested.connect(
+            self._on_test_popup, Qt.QueuedConnection
+        )
 
     # ==================== 生命周期 ====================
 
@@ -203,6 +224,13 @@ class DictaShiftApplication:
             self._hotkeys.stop()
         except Exception:  # noqa: BLE001
             logger.exception("[DictaShiftApplication] hotkey stop 异常")
+        # 投递哨兵并等待消费线程处理完排队事件（尤其 release），保证在
+        # controller shutdown 前已结束录音/启动 worker；2s 超时兜底避免卡死。
+        try:
+            self._hotkey_queue.put(None)
+            self._hotkey_exec_thread.join(timeout=2.0)
+        except Exception:  # noqa: BLE001
+            logger.exception("[DictaShiftApplication] hotkey exec 线程 join 异常")
         try:
             self._controller.shutdown()
         except Exception:  # noqa: BLE001
@@ -257,21 +285,35 @@ class DictaShiftApplication:
         self._overlay.set_state(state)
 
     def _on_text_ready(self, text: str, pasted: bool) -> None:
-        # pasted=True：直输成功，不打扰用户。
-        # pasted=False：直输失败（无聚焦控件或 UIPI 拦截），按 result_ui 路由：
-        #   "popup"  -> 右下角弹通知式卡片（平时无悬浮窗）；
-        #   "overlay"-> 转译内容+复制按钮显示在常驻悬浮窗里（不弹 ResultPopup）。
+        # 按 result_ui 路由：
+        #   "overlay" -> 直输成功（pasted=True）不打扰用户（悬浮窗不显示结果）；
+        #                直输失败（pasted=False）在悬浮窗显示结果文本。
+        #   "popup"   -> 直输成功（pasted=True）不打扰用户，直接 return；
+        #                直输失败（无聚焦控件或 UIPI 拦截）弹右下角 ResultPopup。
         # AGENTS.md 5.5：输出失败必须给可操作兜底，且不默认覆盖剪贴板。
+        logger.info(
+            "[DictaShiftApplication] on_text_ready: pasted=%s, result_ui=%s, 文本长度=%d",
+            pasted, self.settings.ui.result_ui, len(text),
+        )
+        if self.settings.ui.result_ui == "overlay":
+            if pasted:
+                return
+            self._overlay.show_result(text, failed=True)
+            return
+        # popup 模式：成功不打扰，失败弹窗展示文本。
         if pasted:
             return
-        if self.settings.ui.result_ui == "overlay":
-            self._overlay.show_result(text)
-        else:
-            self._result_popup.show_result(text)
+        self._result_popup.show_result(text)
 
     def _on_error(self, message: str) -> None:
         self._tray.show_message("DictaShift", message)
         self._overlay.set_state(AppState.ERROR)
+        # 按 result_ui 路由可见的错误展示：overlay 在悬浮窗显示；
+        # 否则弹 ResultPopup.show_error（标题「出错了」，可复制错误文本）。
+        if self.settings.ui.result_ui == "overlay":
+            self._overlay.show_error(message)
+        else:
+            self._result_popup.show_error(message)
 
     def _on_enabled_changed(self, enabled: bool) -> None:
         self._tray.set_enabled(enabled)
@@ -285,21 +327,58 @@ class DictaShiftApplication:
         )
         self._settings_window.set_recheck_loading(False)
 
+    # ==================== pynput 回调异步串行化 ====================
+
+    def _hotkey_consumer_loop(self) -> None:
+        """单线程 FIFO 消费 (kind, action) 事件，串行调用 controller。
+
+        kind == "press"  -> controller.handle_hotkey_press(action)
+        kind == "release"-> controller.handle_hotkey_release(action)
+        哨兵 None 退出循环（shutdown 时投递）。
+
+        controller 内部已捕获异常，这里再加一层 try/except 防止消费线程
+        被意外打死导致后续热键事件全部失效。
+        """
+        while True:
+            item = self._hotkey_queue.get()
+            if item is None:
+                # 哨兵：正常退出。
+                return
+            kind, action = item
+            try:
+                if kind == "press":
+                    self._controller.handle_hotkey_press(action)
+                elif kind == "release":
+                    self._controller.handle_hotkey_release(action)
+            except Exception:  # noqa: BLE001 - 消费线程不得被打死
+                logger.exception(
+                    "[DictaShiftApplication] hotkey consumer 处理事件异常 kind=%s action=%s",
+                    kind, action,
+                )
+
     # ==================== hotkey -> controller ====================
 
     def _on_hotkey_press(self, action: str) -> None:
-        """pynput 监听线程调用。记录当前 action，转发给 controller。"""
+        """pynput 监听线程调用。只做最小工作：记录 action + 入队，立即返回。
+
+        controller 调用（含 recorder.start 的 PortAudio 阻塞）由消费线程
+        按序执行，避免阻塞 pynput 监听线程导致按键不跟手。
+        """
         with self._action_lock:
             if action in ("dictate_zh", "dictate_en"):
                 self._current_action = action
-        self._controller.handle_hotkey_press(action)
+        self._hotkey_queue.put(("press", action))
 
     def _on_hotkey_release(self, action: str) -> None:
-        """pynput 监听线程调用。转发给 controller。"""
+        """pynput 监听线程调用。只做最小工作：清除 action + 入队，立即返回。
+
+        松开事件及时入队（不阻塞），消费线程随后按序调 controller.handle_hotkey_release
+        结束录音，避免松手后仍在录音。
+        """
         with self._action_lock:
             if self._current_action == action:
                 self._current_action = None
-        self._controller.handle_hotkey_release(action)
+        self._hotkey_queue.put(("release", action))
 
     def _on_auto_stop(self) -> None:
         """recorder 达到最长录音时回调（PortAudio 线程）。
@@ -343,8 +422,12 @@ class DictaShiftApplication:
     # ==================== 托盘槽 ====================
 
     def _on_tray_toggle(self) -> None:
-        """托盘「启用」勾选：模拟 toggle_enabled 按键。"""
-        self._controller.handle_hotkey_press("toggle_enabled")
+        """托盘「启用」勾选：模拟 toggle_enabled 按键（入队，避免阻塞主线程）。
+
+        录音中 toggle 会让 controller discard（PortAudio 关流阻塞），若直接在
+        UI 主线程调用会卡顿；统一走队列由消费线程执行。
+        """
+        self._hotkey_queue.put(("press", "toggle_enabled"))
 
     # ==================== 设置窗口槽 ====================
 
@@ -393,6 +476,18 @@ class DictaShiftApplication:
         self._settings_window.set_recheck_loading(True)
         self._start_asr_init_thread(AsrDevice.AUTO, 0)
 
+    def _on_test_popup(self) -> None:
+        """设置窗口「测试右下角弹窗」：用固定样例文本调 ResultPopup.show_result，
+        让用户手动验证弹窗可见性与复制功能（诊断「弹窗不弹 / 文本无处可复制」）。
+
+        ResultPopup 的文本区是 QTextEdit，直接显示原文（\\n 换行没问题）；
+        注：SendInput 直输路径会把 \\n 替换为空格，但这里是直接显示，不受影响。
+        """
+        self._result_popup.show_result(
+            "这是一条弹窗测试文本。\n如果你能看到这个弹窗，说明弹窗路径工作正常；"
+            "点击「复制」按钮应把本段文本写入剪贴板。"
+        )
+
     def _on_test_connection(self, profile: TranslationProfile) -> None:
         """设置窗口「测试连接」：后台线程调 backend.translate。
 
@@ -413,7 +508,7 @@ class DictaShiftApplication:
             # queued 回主线程更新结果
             self._bridge.test_conn_result.emit(ok, msg)
 
-        t = threading.Thread(target=_worker, name="dictashift-test-conn", daemon=True)
+        threading.Thread(target=_worker, name="dictashift-test-conn", daemon=True)
         t.start()
 
     def _on_model_download_requested(self) -> None:
