@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6.svg)](https://github.com/yuchen-ya/dictashift)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB.svg)](https://www.python.org/)
-[![Release](https://img.shields.io/badge/Release-v0.2.0-green.svg)](https://github.com/yuchen-ya/dictashift/releases)
+[![Release](https://img.shields.io/badge/Release-v0.3.0-green.svg)](https://github.com/yuchen-ya/dictashift/releases)
 
 [English](#english) · [功能特性](#-功能特性) · [安装](#-安装) · [快捷键](#-快捷键) · [隐私](#-隐私说明) · [开发](#-开发)
 
@@ -26,11 +26,14 @@
 | --- | --- |
 | 🎤 本地语音识别 | SenseVoice ONNX int8 本地推理，音频不出本机 |
 | 🌐 多翻译后端 | 内置免登录 Google / Bing（限流自动互切），OpenAI 兼容接口，本地 llama-server 预设 |
-| ⌨️ 光标直输 | 结果直接键入光标处（不占用剪贴板）；失败时弹窗/悬浮窗兜底，点击才复制 |
-| 🪟 状态悬浮窗 | 可选常驻置顶，实时显示录音/识别/翻译状态 |
-| 🔁 状态机流水线 | 录音 → 识别 → 翻译 → 输出，禁用/取消/错误全路径可恢复 |
+| ⌨️ 光标直输 | 结果直接键入光标处（不占用剪贴板）；无输入焦点（桌面/任务栏）自动识别并走弹窗/悬浮窗兜底，点击才复制 |
+| 🪟 状态悬浮窗 | 可选常驻置顶单行卡片，宽度随内容自适应；直输失败时显示结果文本，点击卡片即复制 |
+| 🚦 状态如实反馈 | 「◌ 准备中 / ● 录音中」由首个音频帧驱动——麦克风真正开始收音才亮红灯；错误在弹窗/悬浮窗可见提示，绝不静默 |
+| ⚡ 低延迟流水线 | 热键事件异步化，松手即停；高效多相重采样，说完即出字 |
+| 🔁 状态机流水线 | 准备 → 录音 → 识别 → 翻译 → 输出，禁用/取消/错误全路径可恢复 |
 | 📥 模型自动下载 | 首次运行一键从 GitHub Releases 下载模型（SHA256 校验） |
 | 🚀 开机自启 | 一键开关（注册表 Run 项） |
+| 🧹 一键清除数据 | 设置面板「清除全部数据并退出」，卸载前彻底删除 API Key / 日志 / 模型 |
 | 🔒 隐私优先 | 无遥测，日志不含 API Key 与翻译内容 |
 
 ## 🖼️ 界面预览
@@ -39,9 +42,13 @@
 <img src="docs/images/settings-translation.png" width="640" alt="翻译设置">
 <br/><em>翻译设置：内置免登录服务与 OpenAI 兼容配置平级选择</em>
 <br/><br/>
-<img src="docs/images/overlay-recording.png" alt="录音悬浮窗">&nbsp;&nbsp;&nbsp;
+<img src="docs/images/overlay-preparing.png" alt="准备中">&nbsp;&nbsp;
+<img src="docs/images/overlay-recording.png" alt="录音中">&nbsp;&nbsp;
+<img src="docs/images/overlay-result.png" width="305" alt="结果悬浮窗">
+<br/><em>状态悬浮窗：◌ 准备中（橙，麦克风预热）→ ● 录音中（红，真正在收音）；直输失败时结果直接替换状态文字，点击卡片即复制</em>
+<br/><br/>
 <img src="docs/images/result-popup.png" width="360" alt="结果弹窗">
-<br/><em>状态悬浮窗（左）与直输失败时的结果弹窗（右，点击「复制」才写入剪贴板）</em>
+<br/><em>右下角结果弹窗（直输失败时弹出，点击「复制」才写入剪贴板）</em>
 </div>
 
 ## ⌨️ 快捷键
@@ -98,7 +105,7 @@ uv run python -m dictashift
 
 ```bash
 uv sync
-uv run pytest                 # 347+ 用例（硬件相关测试默认跳过）
+uv run pytest                 # 460+ 用例（硬件相关测试默认跳过）
 uv run python -m dictashift   # 运行
 uv run python scripts/build.py  # 打包（PyInstaller → dist/DictaShift）
 ```
@@ -129,8 +136,6 @@ src/dictashift/
 ## 🗺️ Roadmap
 
 - [ ] macOS (ARM) 支持
-- [ ] llama-server 子进程管理（本地翻译开箱即用）
-- [ ] DirectML 实验性推理后端
 
 ## English
 

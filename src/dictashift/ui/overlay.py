@@ -264,7 +264,9 @@ class StateOverlay(QWidget):
         text = self._text_label.text()
         lines = text.splitlines() or [""]
         natural = max(fm.horizontalAdvance(line) for line in lines)
-        content_w = min(natural, _TEXT_MAX_WIDTH)
+        # horizontalAdvance 与 QLabel(QTextLayout) 换行判定存在数像素偏差：
+        # 实测宽度恰好等于 advance 时仍会误换行，加少量余量避免短文本折行。
+        content_w = min(natural + 6, _TEXT_MAX_WIDTH)
         self._text_label.setFixedWidth(content_w)
         # 卡片整体宽 = 文本内容宽 + 圆点 + 间距 + 卡片左右内边距(14*2)。
         card_w = content_w + _DOT_SIZE + 8 + 14 * 2
