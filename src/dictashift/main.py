@@ -13,6 +13,7 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication
 
 from .application import DictaShiftApplication
+from .resources import load_app_icon
 
 
 def _default_log_dir() -> Path:
@@ -56,6 +57,10 @@ def main() -> int:
     app.setOrganizationName("DictaShift")
     # 避免在最后一个窗口关闭时退出（托盘常驻）。
     app.setQuitOnLastWindowClosed(False)
+    # 统一窗口图标（标题栏 + 任务栏）；图标文件缺失时保持 Qt 默认，不阻塞启动。
+    icon = load_app_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
 
     da = DictaShiftApplication(app)
     da.startup()

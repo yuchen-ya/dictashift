@@ -27,6 +27,16 @@ from PySide6.QtWidgets import (
 )
 
 from ..output.clipboard import OutputError, set_clipboard_text
+from .theme import (
+    CARD_BG_POPUP,
+    CARD_TEXT,
+    POPUP_BTN_BG,
+    POPUP_BTN_BORDER,
+    POPUP_BTN_HOVER,
+    POPUP_BTN_PRESSED,
+    POPUP_TEXT_BG,
+    POPUP_TEXT_DARK,
+)
 
 
 # 自动关闭超时（毫秒）；无任何用户操作（点击复制/移动窗口）15 秒后自动关闭。
@@ -73,18 +83,19 @@ class ResultPopup(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # 卡片容器：承载标题/文本区/按钮行，统一深色圆角半透明背景 + 按钮美化。
+        # 卡片容器：承载标题/文本区/按钮行，统一深色圆角半透明背景 + 按钮美化
+        # （配色常量见 ui/theme.py，与 overlay 卡片同源）。
         card = QWidget(self)
         card.setObjectName("popupCard")
         card.setStyleSheet(
-            "#popupCard { background-color: rgba(30, 30, 30, 215); border-radius: 12px; }"
-            " QLabel { color: #f0f0f0; background: transparent; }"
-            " QTextEdit { background-color: rgba(255, 255, 255, 235); color: #1f2937;"
+            f"#popupCard {{ background-color: {CARD_BG_POPUP}; border-radius: 12px; }}"
+            f" QLabel {{ color: {CARD_TEXT}; background: transparent; }}"
+            f" QTextEdit {{ background-color: {POPUP_TEXT_BG}; color: {POPUP_TEXT_DARK};"
             " border: none; border-radius: 8px; }"
-            " QPushButton { background-color: rgba(255, 255, 255, 25); color: #f0f0f0;"
-            " border: 1px solid rgba(255, 255, 255, 70); border-radius: 6px; padding: 3px 12px; }"
-            " QPushButton:hover { background-color: rgba(255, 255, 255, 55); }"
-            " QPushButton:pressed { background-color: rgba(255, 255, 255, 80); }"
+            f" QPushButton {{ background-color: {POPUP_BTN_BG}; color: {CARD_TEXT};"
+            f" border: 1px solid {POPUP_BTN_BORDER}; border-radius: 6px; padding: 3px 12px; }}"
+            f" QPushButton:hover {{ background-color: {POPUP_BTN_HOVER}; }}"
+            f" QPushButton:pressed {{ background-color: {POPUP_BTN_PRESSED}; }}"
         )
         root.addWidget(card)
 

@@ -22,9 +22,17 @@
 - numpy：sounddevice/onnxruntime 运行期依赖，整体收集保证 ABI 一致。
 
 不收集：assets/models（模型走下载）、tests（无运行期价值）。
+assets/icons（应用图标）按下文显式加入 datas，运行时经
+dictashift.resources.resource_path 解析（_internal/assets/icons）。
 """
 
+import os
+
 from PyInstaller.utils.hooks import collect_all, collect_submodules
+
+# 仓库内图标资源（spec 位于 scripts/ 下，SPECPATH 即 scripts 目录）。
+_ICONS_SRC = os.path.join(SPECPATH, "..", "assets", "icons")
+_ICON_ICO = os.path.join(_ICONS_SRC, "dictashift.ico")
 
 # 逐包收集，返回 (datas, binaries, hiddenimports) 三元组。
 datas = []
@@ -46,6 +54,11 @@ for pkg, reason in [
 
 # pynput 的 win32 后端按平台动态 import，作为 hiddenimports 兜底。
 hiddenimports += collect_submodules("pynput") + collect_submodules("pynput.win32")
+
+# 应用图标（assets/icons -> _internal/assets/icons）：托盘/窗口/设置页 logo 运行时加载。
+# 图标由 scripts/gen_icon.py 生成，需在打包前运行一次。
+if os.path.isdir(_ICONS_SRC):
+    datas += [(_ICONS_SRC, "assets/icons")]
 
 # 未使用的 Qt 模块（GUI 只用 Widgets/Gui/Core + 托盘/输入法相关插件）。
 _QT_UNUSED = [
@@ -106,6 +119,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    # 应用图标（多尺寸 ico，由 scripts/gen_icon.py 生成）。
+    icon=_ICON_ICO if os.path.isfile(_ICON_ICO) else None,
 )
 
 coll = COLLECT(
