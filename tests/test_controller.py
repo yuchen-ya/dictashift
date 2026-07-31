@@ -282,6 +282,121 @@ def test_dictate_en_uses_snapshot_profile() -> None:
     assert cb.texts == [("hello world", True)]
 
 
+# ==================== 个性化后处理钩子 ====================
+
+
+class FakePersonalizeProcessor:
+    """记录 apply 调用、可控制是否实际改写的 fake 个性化处理器。"""
+
+    def __init__(self, *, rewrite: bool = True, suffix: str = "") -> None:
+        self._rewrite = rewrite
+        self._suffix = suffix
+        self.apply_calls: list[str] = []
+
+    def rewrite_active(self) -> bool:
+        return self._rewrite
+
+    def apply(self, text: str) -> str:
+        self.apply_calls.append(text)
+        result = ("改写:" + text) if self._rewrite else text
+        return result + self._suffix
+
+
+def _make_controller_with_personalize(processor):
+    """构造带个性化处理器的 controller（复用现有 fake）。"""
+    asr = FakeAsrService()
+    recorder = FakeRecorder()
+    backend = FakeTranslationBackend()
+    cb = RecordedCallbacks()
+    ctrl = ApplicationController(
+        asr_service=asr,
+        recorder=recorder,
+        translation_backend=backend,
+        paste_func=lambda t: True,
+        callbacks=cb.as_callbacks(),
+        personalize_processor=processor,
+    )
+    ctrl.start(enabled=True)
+    return ctrl, cb, asr, recorder, backend
+
+
+def test_pipeline_personalize_rewrite_enters_rewriting_state() -> None:
+    """实际执行改写时：进入 REWRITING 状态，apply 结果作为最终文本粘贴。"""
+    processor = FakePersonalizeProcessor(rewrite=True, suffix="喵")
+    ctrl, cb, asr, recorder, _ = _make_controller_with_personalize(processor)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+
+    # apply 收到转写原文；最终文本 = 改写 + 后缀
+    assert processor.apply_calls == ["你好世界"]
+    assert cb.texts == [("改写:你好世界喵", True)]
+    # 经历过 REWRITING 状态
+    assert AppState.REWRITING in cb.states
+
+
+def test_pipeline_personalize_suffix_only_no_rewriting_state() -> None:
+    """仅后缀（rewrite_active=False）时不进入 REWRITING 状态。"""
+    processor = FakePersonalizeProcessor(rewrite=False, suffix="喵")
+    ctrl, cb, asr, recorder, _ = _make_controller_with_personalize(processor)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+
+    assert cb.texts == [("你好世界喵", True)]
+    assert AppState.REWRITING not in cb.states
+
+
+def test_pipeline_personalize_after_translation() -> None:
+    """改写发生在翻译之后：apply 收到的是译文。"""
+    processor = FakePersonalizeProcessor(rewrite=True)
+    ctrl, cb, asr, recorder, backend = _make_controller_with_personalize(processor)
+    ctrl.set_translation_profiles([_PROFILE_OLD], active_name="old")
+
+    ctrl.handle_hotkey_press("dictate_en")
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_en")
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+
+    # apply 收到译文 "hello world"，最终粘贴改写结果
+    assert processor.apply_calls == ["hello world"]
+    assert cb.texts == [("改写:hello world", True)]
+    # 状态序列经过 TRANSLATING 与 REWRITING
+    assert AppState.TRANSLATING in cb.states
+    assert AppState.REWRITING in cb.states
+
+
+def test_pipeline_without_personalize_processor_unchanged() -> None:
+    """无 processor（默认 None）：行为与旧版本一致。"""
+    ctrl, cb, asr, recorder, _ = _make_controller()
+    ctrl.handle_hotkey_press("dictate_zh")
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+    assert cb.texts == [("你好世界", True)]
+    assert AppState.REWRITING not in cb.states
+
+
+def test_set_personalize_processor_swaps_for_next_task() -> None:
+    """set_personalize_processor 只影响后续任务。"""
+    ctrl, cb, asr, recorder, _ = _make_controller()
+    ctrl.set_personalize_processor(FakePersonalizeProcessor(rewrite=False, suffix="捏"))
+    ctrl.handle_hotkey_press("dictate_zh")
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert _wait(cb.text_event)
+    _wait_for_state(cb, AppState.IDLE)
+    assert cb.texts == [("你好世界捏", True)]
+
+
 # ==================== 处理期间拒绝新任务 ====================
 
 

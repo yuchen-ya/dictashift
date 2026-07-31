@@ -55,14 +55,18 @@ def _parse_sse_line(line: str) -> str | None:
     return content
 
 
-def _build_request_body(text: str, profile: TranslationProfile) -> dict:
+def _build_request_body(
+    text: str,
+    profile: TranslationProfile,
+    system_prompt: str = SYSTEM_PROMPT_ZH2EN,
+) -> dict:
     """构造 chat/completions 请求体。"""
     return {
         "model": profile.model,
         "stream": True,
         "temperature": profile.temperature,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT_ZH2EN},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": text},
         ],
         # 关闭 Qwen3 系思考模式
@@ -92,8 +96,22 @@ class OpenAICompatibleBackend(TranslationBackend):
         - httpx.TransportError / 超时：包装为 TranslationError(status_code=None)。
         - 任何异常信息中不含 api_key 或 Authorization 头内容。
         """
+        yield from self._stream(text, profile, SYSTEM_PROMPT_ZH2EN)
+
+    def rewrite_stream(
+        self, text: str, profile: TranslationProfile, system_prompt: str
+    ):
+        """与 translate_stream 相同的流式请求，但使用自定义 system prompt。
+
+        供个性化语气改写复用（复用翻译活动档案的 base_url/model/api_key/
+        temperature）；错误语义与 translate_stream 完全一致。
+        """
+        yield from self._stream(text, profile, system_prompt)
+
+    def _stream(self, text: str, profile: TranslationProfile, system_prompt: str):
+        """流式 chat/completions 请求的统一实现（translate/rewrite 共用）。"""
         endpoint = _join_endpoint(profile.base_url)
-        body = _build_request_body(text, profile)
+        body = _build_request_body(text, profile, system_prompt)
         headers = self._build_headers(profile)
 
         try:

@@ -12,8 +12,9 @@
 - IDLE        -> PREPARING, DISABLED
 - PREPARING   -> RECORDING, IDLE, DISABLED（打开麦克风失败回 IDLE；准备中禁用）
 - RECORDING   -> TRANSCRIBING, IDLE, DISABLED
-- TRANSCRIBING-> TRANSLATING, INSERTING, IDLE, DISABLED, ERROR
-- TRANSLATING -> INSERTING, IDLE, DISABLED, ERROR
+- TRANSCRIBING-> TRANSLATING, REWRITING, INSERTING, IDLE, DISABLED, ERROR
+- TRANSLATING -> REWRITING, INSERTING, IDLE, DISABLED, ERROR
+- REWRITING   -> INSERTING, IDLE, DISABLED, ERROR
 - INSERTING   -> IDLE, DISABLED, ERROR
 - ERROR       -> IDLE, DISABLED
 - DISABLED    -> IDLE
@@ -41,6 +42,7 @@ class AppState(StrEnum):
     RECORDING = "recording"
     TRANSCRIBING = "transcribing"
     TRANSLATING = "translating"
+    REWRITING = "rewriting"
     INSERTING = "inserting"
     ERROR = "error"
 
@@ -60,9 +62,12 @@ _TRANSITIONS: dict[AppState, frozenset[AppState]] = {
         {AppState.TRANSCRIBING, AppState.IDLE, AppState.DISABLED}
     ),
     AppState.TRANSCRIBING: frozenset(
-        {AppState.TRANSLATING, AppState.INSERTING, AppState.IDLE, AppState.DISABLED, AppState.ERROR}
+        {AppState.TRANSLATING, AppState.REWRITING, AppState.INSERTING, AppState.IDLE, AppState.DISABLED, AppState.ERROR}
     ),
     AppState.TRANSLATING: frozenset(
+        {AppState.REWRITING, AppState.INSERTING, AppState.IDLE, AppState.DISABLED, AppState.ERROR}
+    ),
+    AppState.REWRITING: frozenset(
         {AppState.INSERTING, AppState.IDLE, AppState.DISABLED, AppState.ERROR}
     ),
     AppState.INSERTING: frozenset({AppState.IDLE, AppState.DISABLED, AppState.ERROR}),

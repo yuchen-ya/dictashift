@@ -4,7 +4,7 @@
 - 全部合法迁移逐条通过。
 - 非法迁移抛 InvalidTransition，重点：
   * PREPARING 之外的任何状态 -> RECORDING 均非法（IDLE 须经 PREPARING）。
-  * 任何状态不能直达 ERROR（除 TRANSCRIBING / TRANSLATING / INSERTING）。
+  * 任何状态不能直达 ERROR（除 TRANSCRIBING / TRANSLATING / REWRITING / INSERTING）。
   * IDLE -> ERROR 非法。
 - force() 可任意跳转（绕过迁移表）。
 
@@ -26,12 +26,20 @@ LEGAL_TRANSITIONS: dict[AppState, list[AppState]] = {
     AppState.RECORDING: [AppState.TRANSCRIBING, AppState.IDLE, AppState.DISABLED],
     AppState.TRANSCRIBING: [
         AppState.TRANSLATING,
+        AppState.REWRITING,
         AppState.INSERTING,
         AppState.IDLE,
         AppState.DISABLED,
         AppState.ERROR,
     ],
     AppState.TRANSLATING: [
+        AppState.REWRITING,
+        AppState.INSERTING,
+        AppState.IDLE,
+        AppState.DISABLED,
+        AppState.ERROR,
+    ],
+    AppState.REWRITING: [
         AppState.INSERTING,
         AppState.IDLE,
         AppState.DISABLED,
@@ -48,6 +56,7 @@ ALL_STATES = [
     AppState.RECORDING,
     AppState.TRANSCRIBING,
     AppState.TRANSLATING,
+    AppState.REWRITING,
     AppState.INSERTING,
     AppState.ERROR,
     AppState.DISABLED,
@@ -73,6 +82,7 @@ def test_state_string_enum_values() -> None:
     assert AppState.RECORDING == "recording"
     assert AppState.TRANSCRIBING == "transcribing"
     assert AppState.TRANSLATING == "translating"
+    assert AppState.REWRITING == "rewriting"
     assert AppState.INSERTING == "inserting"
     assert AppState.ERROR == "error"
     assert AppState.DISABLED == "disabled"
@@ -110,10 +120,11 @@ def test_only_idle_can_enter_recording() -> None:
 
 
 def test_direct_to_error_only_from_processing_states() -> None:
-    """任何状态不能直达 ERROR，除 TRANSCRIBING / TRANSLATING / INSERTING 外。"""
+    """任何状态不能直达 ERROR，除 TRANSCRIBING / TRANSLATING / REWRITING / INSERTING 外。"""
     error_legal_from = {
         AppState.TRANSCRIBING,
         AppState.TRANSLATING,
+        AppState.REWRITING,
         AppState.INSERTING,
     }
     for start in ALL_STATES:

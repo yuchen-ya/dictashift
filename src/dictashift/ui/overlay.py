@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
 
 from ..core.state import AppState
 from ..output.clipboard import OutputError, set_clipboard_text
+from .theme import ACCENT, CARD_BG, CARD_TEXT
 
 
 # ==================== 状态文案与颜色映射 ====================
@@ -58,6 +59,7 @@ _STATE_TEXT: dict[AppState, str] = {
     AppState.RECORDING: "● 录音中…",
     AppState.TRANSCRIBING: "识别中…",
     AppState.TRANSLATING: "翻译中…",
+    AppState.REWRITING: "改写中…",
     AppState.INSERTING: "粘贴中…",
     AppState.DISABLED: "已禁用",
     AppState.ERROR: "出错了",
@@ -69,6 +71,7 @@ _STATE_COLOR: dict[AppState, str] = {
     AppState.RECORDING: "#ef4444",     # 红，醒目
     AppState.TRANSCRIBING: "#3b82f6",  # 蓝
     AppState.TRANSLATING: "#8b5cf6",   # 紫
+    AppState.REWRITING: ACCENT,        # 主题 accent 紫
     AppState.INSERTING: "#10b981",     # 绿
     AppState.DISABLED: "#6b7280",      # 暗灰
     AppState.ERROR: "#ef4444",         # 红
@@ -131,12 +134,12 @@ class StateOverlay(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # 卡片容器：统一深色圆角半透明背景 + 文字美化。
+        # 卡片容器：统一深色圆角半透明背景 + 文字美化（配色常量见 ui/theme.py）。
         card = QWidget(self)
         card.setObjectName("overlayCard")
         card.setStyleSheet(
-            "#overlayCard { background-color: rgba(30, 30, 30, 200); border-radius: 12px; }"
-            " QLabel { color: #f0f0f0; background: transparent; }"
+            f"#overlayCard {{ background-color: {CARD_BG}; border-radius: 12px; }}"
+            f" QLabel {{ color: {CARD_TEXT}; background: transparent; }}"
         )
         root.addWidget(card)
         self._card = card

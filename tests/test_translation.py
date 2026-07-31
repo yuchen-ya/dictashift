@@ -24,6 +24,7 @@ from dictashift.translation import (
     BUILTIN_GOOGLE,
     LlamaServerBackend,
     OpenAICompatibleBackend,
+    SYSTEM_PROMPT_ZH2EN,
     TranslationError,
     TranslationProfile,
     builtin_free_profiles,
@@ -145,6 +146,39 @@ def test_translate_streams_and_concatenates(monkeypatch) -> None:
 
     result = backend.translate("你好", profile)
     assert result == "Hello World"
+
+
+def test_build_request_body_custom_system_prompt() -> None:
+    """自定义 system prompt 覆盖默认翻译提示词（向后兼容：缺省仍用 ZH2EN）。"""
+    body = _build_request_body("你好", _profile(), system_prompt="自定义提示词")
+    assert body["messages"][0]["content"] == "自定义提示词"
+    # 缺省仍为默认翻译提示词
+    body_default = _build_request_body("你好", _profile())
+    assert body_default["messages"][0]["content"] == SYSTEM_PROMPT_ZH2EN
+
+
+def test_rewrite_stream_uses_custom_prompt(monkeypatch) -> None:
+    """rewrite_stream：请求体使用自定义 system prompt，流式聚合正常。"""
+    backend = OpenAICompatibleBackend()
+    profile = _profile(base_url="http://test.local/v1")
+
+    captured = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(req.content.decode("utf-8"))
+        return httpx.Response(200, content=_sse_lines(["毒舌", "版"]))
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.Client
+    monkeypatch.setattr(
+        "dictashift.translation.openai_compatible.httpx.Client",
+        lambda *a, **k: real_client(*a, transport=transport, **k),
+    )
+
+    result = "".join(backend.rewrite_stream("原文", profile, "自定义提示词"))
+    assert result == "毒舌版"
+    assert captured["body"]["messages"][0]["content"] == "自定义提示词"
+    assert captured["body"]["messages"][-1]["content"] == "原文"
 
 
 def test_translate_http_500_raises_with_status(monkeypatch) -> None:

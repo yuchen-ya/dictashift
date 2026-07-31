@@ -33,6 +33,7 @@ from .core import ApplicationController, AppState, ControllerCallbacks
 from .hotkeys.matcher import HotkeyBinding, parse_hotkey
 from .hotkeys.service import HotkeyService
 from .output.typing import type_text_at_cursor
+from .personalize import build_personalize_processor
 from .settings import AppSettings, SettingsRepository
 from .settings.repository import app_data_dir
 from .translation import DispatcherBackend, TranslationProfile, builtin_free_profiles
@@ -225,6 +226,10 @@ class DictaShiftApplication:
         # 初始化翻译 profiles：内置免登录项 + 用户 LLM profiles
         self._controller.set_translation_profiles(
             self._translation_profiles_for_controller(), self.settings.translation.active_profile
+        )
+        # 初始化个性化后处理器（语气改写/句尾后缀，复用翻译活动档案的 LLM 配置）
+        self._controller.set_personalize_processor(
+            build_personalize_processor(self.settings)
         )
         # 后台初始化 ASR（不阻塞 UI）。设备固定 AUTO/0（GPU 路线已移除）。
         self._start_asr_init_thread(AsrDevice.AUTO, 0)
@@ -547,6 +552,11 @@ class DictaShiftApplication:
         self._controller.set_translation_profiles(
             self._translation_profiles_for_controller(),
             self.settings.translation.active_profile,
+        )
+
+        # 更新个性化后处理器（与翻译共用活动档案，随「应用/确定」生效）
+        self._controller.set_personalize_processor(
+            build_personalize_processor(self.settings)
         )
 
         # overlay 显隐：仅 result_ui=="overlay" 时显示，切换即时生效。

@@ -236,12 +236,58 @@ class UiSettings:
         )
 
 
+# ==================== 个性化（输出后处理） ====================
+
+# rewrite_style 合法值：off=不改写；toxic=毒舌；tsundere=傲娇。
+REWRITE_STYLES = ("off", "toxic", "tsundere")
+
+
+@dataclass
+class PersonalizeSettings:
+    """个性化输出后处理配置。
+
+    管线顺序：翻译（如启用）-> 语气改写（rewrite_style != off 时走 LLM）
+    -> 句尾后缀（纯字符串拼接，不走大模型）。三个环节独立开关、可叠加。
+
+    默认值：suffix_enabled=False, suffix_text="喵", rewrite_style="off"
+    （全部关闭，行为与旧版本一致）。
+
+    迁移（from_dict）：缺失键用默认值；rewrite_style 非法值归一为 "off"
+    （与 UiSettings.result_ui 的校验模式一致）。
+    """
+
+    suffix_enabled: bool = False
+    suffix_text: str = "喵"
+    rewrite_style: str = "off"
+
+    def to_dict(self) -> dict:
+        return {
+            "suffix_enabled": self.suffix_enabled,
+            "suffix_text": self.suffix_text,
+            "rewrite_style": self.rewrite_style,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict | None = None) -> "PersonalizeSettings":
+        if not d:
+            return cls()
+        rewrite_style = d.get("rewrite_style", "off")
+        if rewrite_style not in REWRITE_STYLES:
+            # 非法值归一为 off。
+            rewrite_style = "off"
+        return cls(
+            suffix_enabled=d.get("suffix_enabled", False),
+            suffix_text=d.get("suffix_text", "喵"),
+            rewrite_style=rewrite_style,
+        )
+
+
 # ==================== 顶层配置 ====================
 
 
 @dataclass
 class AppSettings:
-    """应用顶层配置：enabled + 四个子配置。
+    """应用顶层配置：enabled + 五个子配置。
 
     默认 enabled=True。
     """
@@ -251,6 +297,7 @@ class AppSettings:
     asr: AsrSettings = field(default_factory=AsrSettings)
     translation: TranslationSettings = field(default_factory=TranslationSettings)
     ui: UiSettings = field(default_factory=UiSettings)
+    personalize: PersonalizeSettings = field(default_factory=PersonalizeSettings)
 
     def to_dict(self) -> dict:
         return {
@@ -259,6 +306,7 @@ class AppSettings:
             "asr": self.asr.to_dict(),
             "translation": self.translation.to_dict(),
             "ui": self.ui.to_dict(),
+            "personalize": self.personalize.to_dict(),
         }
 
     @classmethod
@@ -271,4 +319,5 @@ class AppSettings:
             asr=AsrSettings.from_dict(d.get("asr")),
             translation=TranslationSettings.from_dict(d.get("translation")),
             ui=UiSettings.from_dict(d.get("ui")),
+            personalize=PersonalizeSettings.from_dict(d.get("personalize")),
         )

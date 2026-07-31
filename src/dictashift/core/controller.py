@@ -103,12 +103,16 @@ class ApplicationController:
         paste_func: Callable[[str], bool] = type_text_at_cursor,
         callbacks: ControllerCallbacks | None = None,
         wait_first_frame: bool = False,
+        personalize_processor=None,
     ) -> None:
         self._asr = asr_service
         self._recorder = recorder
         self._translation = translation_backend
         self._paste = paste_func
         self._callbacks = callbacks or ControllerCallbacks()
+        # 个性化输出后处理器（PersonalizeProcessor；None 表示不做任何后处理）。
+        # 协议：rewrite_active() -> bool；apply(text) -> str（绝不抛出）。
+        self._personalize = personalize_processor
 
         self._sm = StateMachine(initial=AppState.IDLE)
 
@@ -162,6 +166,14 @@ class ApplicationController:
         with self._lock:
             self._translation_profiles = list(profiles)
             self._active_profile_name = active_name
+
+    def set_personalize_processor(self, processor) -> None:
+        """运行时更换个性化输出后处理器（设置「应用/确定」后由装配层调用）。
+
+        只影响后续任务；传 None 关闭全部后处理。
+        """
+        with self._lock:
+            self._personalize = processor
 
     # ==================== 生命周期 ====================
 
@@ -333,6 +345,7 @@ class ApplicationController:
                     AppState.RECORDING,
                     AppState.TRANSCRIBING,
                     AppState.TRANSLATING,
+                    AppState.REWRITING,
                     AppState.INSERTING,
                 ):
                     # RECORDING/PREPARING 也置标记作为竞态安全网：若 release 恰好在本决策
@@ -349,7 +362,12 @@ class ApplicationController:
                 with self._lock:
                     self._current_task = None
                 self._goto(AppState.DISABLED)
-            elif current_state in (AppState.TRANSCRIBING, AppState.TRANSLATING, AppState.INSERTING):
+            elif current_state in (
+                AppState.TRANSCRIBING,
+                AppState.TRANSLATING,
+                AppState.REWRITING,
+                AppState.INSERTING,
+            ):
                 # 推理/插入中：让任务自然结束（_disabled_mid_task 已置位，
                 # worker 结束时跳过粘贴）。状态立即 force 到 DISABLED 以对外
                 # 反映禁用语义；worker 后续迁移用 force 兜底。
@@ -509,7 +527,7 @@ class ApplicationController:
                 self._current_task = None
             # PREPARING -> IDLE 合法；RECORDING -> IDLE 合法。
             self._goto(AppState.IDLE)
-        elif current in (AppState.TRANSCRIBING, AppState.TRANSLATING):
+        elif current in (AppState.TRANSCRIBING, AppState.TRANSLATING, AppState.REWRITING):
             # 推理中取消：设置取消标记，任务自然结束但不粘贴。
             # 设计选择：立即把状态 force 到 IDLE，让 UI 即时反馈取消，
             # worker 结束时检查标记跳过粘贴。worker 内的状态迁移用 try/except
@@ -567,6 +585,20 @@ class ApplicationController:
             if self._should_suppress_output():
                 self._finish_suppressed()
                 return
+
+            # ---- 个性化后处理（语气改写 -> 句尾后缀）----
+            with self._lock:
+                personalize = self._personalize
+            if personalize is not None:
+                # 仅当实际执行 LLM 改写时才进入 REWRITING 状态；
+                # 仅后缀/全关时不出现在状态显示中。
+                if personalize.rewrite_active():
+                    self._goto_safe(AppState.REWRITING)
+                    if self._should_suppress_output():
+                        self._finish_suppressed()
+                        return
+                # apply 内部失败静默回退（绝不抛出），这里不再额外兜底。
+                text = personalize.apply(text)
 
             # ---- INSERTING ----
             self._goto_safe(AppState.INSERTING)

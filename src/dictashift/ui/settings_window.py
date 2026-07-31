@@ -1,8 +1,8 @@
-"""设置窗口（四页 QTabWidget）。
+"""设置窗口（五页 QTabWidget）。
 
 页面结构：
 1. 常规：启用语音输入、开机启动(仅保存设置)、结果展示方式(右下角弹窗/常驻悬浮窗)、
-   全局禁用快捷键、恢复默认设置按钮（重置常规/快捷键/语音识别/界面，不影响翻译配置）。
+   全局禁用快捷键、恢复默认设置按钮（重置常规/快捷键/语音识别/界面/个性化，不影响翻译配置）。
 2. 快捷键：中文输入(f8)、中文→英文(f9)、取消当前任务(esc)。
 3. 语音识别：模型(已安装/未安装 状态 + 下载按钮 + 进度条)、实际运行设备(只读)、
    麦克风、最长录音秒数、重新检测硬件、测试识别(禁用占位)。
@@ -10,6 +10,8 @@
 4. 翻译：当前配置 ComboBox（内置免登录 Google/Bing + 用户 LLM profiles）、
    编辑区(base_url/model/api_key/temperature，仅作用于用户 LLM 配置)、
    保存为新配置、测试连接(后台)。
+5. 个性化：句尾后缀（开关 + 文本，纯字符串拼接）、语气改写（关闭/毒舌/傲娇
+   互斥单选，复用翻译页活动档案的 LLM 配置）。
 
 线程模型：
 - 控件值 <-> AppSettings 双向绑定（load_from_settings / apply_to_settings）。
@@ -22,18 +24,21 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -50,10 +55,13 @@ from ..settings.launch_at_login import (
 from ..settings.models import (
     AsrSettings,
     HotkeySettings,
+    PersonalizeSettings,
     UiSettings,
 )
+from ..resources import app_icon_png_path
 from ..translation import TranslationProfile, builtin_free_profiles, builtin_profile_names
 from .hotkey_editor import HotkeyEdit
+from .theme import app_stylesheet
 
 
 # 内置免登录翻译项顺序（与「当前翻译配置」ComboBox 内置段顺序一致）。
@@ -85,7 +93,7 @@ class SettingsWindow(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("DictaShift 设置")
-        self.resize(520, 460)
+        self.resize(560, 520)
 
         # 最近一次 load_from_settings 缓存的 settings 副本，供 ok/apply 作为基底。
         self._last_loaded: AppSettings = AppSettings()
@@ -95,6 +103,7 @@ class SettingsWindow(QWidget):
         self._tabs.addTab(self._build_hotkeys_tab(), "快捷键")
         self._tabs.addTab(self._build_asr_tab(), "语音识别")
         self._tabs.addTab(self._build_translation_tab(), "翻译")
+        self._tabs.addTab(self._build_personalize_tab(), "个性化")
 
         # 底部按钮
         btn_row = QHBoxLayout()
@@ -107,12 +116,45 @@ class SettingsWindow(QWidget):
         btn_row.addWidget(self._cancel_btn)
 
         root = QVBoxLayout(self)
+        root.addLayout(self._build_header())
+        # header 与 tab 之间的细分隔线（样式见 theme.py 的 QFrame#headerDivider）。
+        divider = QFrame(self)
+        divider.setObjectName("headerDivider")
+        divider.setFrameShape(QFrame.HLine)
+        root.addWidget(divider)
         root.addWidget(self._tabs, stretch=1)
         root.addLayout(btn_row)
+
+        # 整体深色主题（见 ui/theme.py）；危险按钮等个别样式仍为局部内联。
+        self.setStyleSheet(app_stylesheet())
 
         self._ok_btn.clicked.connect(self._on_ok)
         self._apply_btn.clicked.connect(self._on_apply)
         self._cancel_btn.clicked.connect(self.hide)
+
+    def _build_header(self) -> QHBoxLayout:
+        """顶部 header：左侧窗口标题文字「DictaShift」，右上角应用 logo。
+
+        logo 资源缺失（如开发期未运行 scripts/gen_icon.py）时隐藏 logo 标签，
+        不影响其余界面。
+        """
+        header = QHBoxLayout()
+        title_label = QLabel("DictaShift", self)
+        title_label.setObjectName("appTitle")
+        header.addWidget(title_label)
+        header.addStretch(1)
+
+        self._logo_label = QLabel(self)
+        self._logo_label.setObjectName("appLogo")
+        logo_pm = QPixmap(str(app_icon_png_path()))
+        if logo_pm.isNull():
+            self._logo_label.hide()
+        else:
+            self._logo_label.setPixmap(
+                logo_pm.scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            )
+        header.addWidget(self._logo_label)
+        return header
 
     def showEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
         """窗口显示时刷新一次模型状态（用户可能刚下载完模型）。"""
@@ -306,6 +348,67 @@ class SettingsWindow(QWidget):
 
         return page
 
+    # ==================== 个性化页 ====================
+
+    def _build_personalize_tab(self) -> QWidget:
+        page = QWidget(self)
+        outer = QVBoxLayout(page)
+
+        # ---- 句尾后缀组：开关 + 文本（纯字符串拼接，不走大模型）----
+        suffix_group_label = QLabel("句尾后缀：", page)
+        outer.addWidget(suffix_group_label)
+        suffix_form = QFormLayout()
+        self._suffix_check = QCheckBox("启用句尾后缀", page)
+        suffix_form.addRow(self._suffix_check)
+        self._suffix_edit = QLineEdit(page)
+        self._suffix_edit.setPlaceholderText("喵")
+        # 输入框随开关 enable/disable（初始与开关默认未勾选一致）。
+        self._suffix_check.toggled.connect(self._suffix_edit.setEnabled)
+        self._suffix_edit.setEnabled(self._suffix_check.isChecked())
+        suffix_form.addRow("后缀文本：", self._suffix_edit)
+        outer.addLayout(suffix_form)
+
+        # ---- 语气改写组：互斥单选（关闭/毒舌/傲娇）----
+        rewrite_group_label = QLabel("语气改写：", page)
+        outer.addWidget(rewrite_group_label)
+        rewrite_form = QFormLayout()
+        self._rewrite_off_radio = QRadioButton("关闭", page)
+        self._rewrite_toxic_radio = QRadioButton("毒舌", page)
+        self._rewrite_tsundere_radio = QRadioButton("傲娇", page)
+        self._rewrite_off_radio.setChecked(True)
+        rewrite_form.addRow(self._rewrite_off_radio)
+        rewrite_form.addRow(self._rewrite_toxic_radio)
+        rewrite_form.addRow(self._rewrite_tsundere_radio)
+        outer.addLayout(rewrite_form)
+
+        # 说明：改写复用翻译页活动档案的 LLM 配置；非 OpenAI 兼容型自动跳过。
+        hint_label = QLabel(
+            "改写使用「翻译」页当前活动档案的大模型配置；"
+            "活动档案需为 OpenAI 兼容型，否则改写自动跳过。",
+            page,
+        )
+        hint_label.setWordWrap(True)
+        outer.addWidget(hint_label)
+        outer.addStretch(1)
+
+        return page
+
+    def _set_rewrite_style(self, value: str) -> None:
+        """把 rewrite_style 值同步到单选按钮；非法值回退到 off。"""
+        if value == "toxic":
+            self._rewrite_toxic_radio.setChecked(True)
+        elif value == "tsundere":
+            self._rewrite_tsundere_radio.setChecked(True)
+        else:
+            self._rewrite_off_radio.setChecked(True)
+
+    def _current_rewrite_style(self) -> str:
+        if self._rewrite_toxic_radio.isChecked():
+            return "toxic"
+        if self._rewrite_tsundere_radio.isChecked():
+            return "tsundere"
+        return "off"
+
     # ==================== 双向绑定 ====================
 
     def load_from_settings(self, settings: AppSettings) -> None:
@@ -339,6 +442,11 @@ class SettingsWindow(QWidget):
         # 翻译
         self._profiles = list(settings.translation.profiles)
         self._rebuild_profile_combo(settings.translation.active_profile)
+        # 个性化
+        self._suffix_check.setChecked(settings.personalize.suffix_enabled)
+        self._suffix_edit.setText(settings.personalize.suffix_text)
+        self._suffix_edit.setEnabled(settings.personalize.suffix_enabled)
+        self._set_rewrite_style(settings.personalize.rewrite_style)
 
     def apply_to_settings(self, settings: AppSettings) -> AppSettings:
         """把控件当前值写回 settings 并返回。
@@ -404,6 +512,14 @@ class SettingsWindow(QWidget):
             active_profile=active,
         )
         settings.translation = tr
+        # 个性化
+        personalize = dataclasses.replace(
+            settings.personalize,
+            suffix_enabled=self._suffix_check.isChecked(),
+            suffix_text=self._suffix_edit.text(),
+            rewrite_style=self._current_rewrite_style(),
+        )
+        settings.personalize = personalize
         return settings
 
     # ==================== 一键重置 ====================
@@ -412,12 +528,14 @@ class SettingsWindow(QWidget):
         """把非翻译页控件重置为 dataclass 默认值（仅改 UI，不持久化）。
 
         重置范围：常规(enabled=True + UiSettings 默认)、快捷键(HotkeySettings 默认)、
-        语音识别(AsrSettings 默认)。翻译页内容（profiles / active / 编辑区）完全不动。
+        语音识别(AsrSettings 默认)、个性化(PersonalizeSettings 默认)。
+        翻译页内容（profiles / active / 编辑区）完全不动。
         用户仍需点「应用/确定」才落盘，与现有编辑行为一致。
         """
         default_ui = UiSettings()
         default_hk = HotkeySettings()
         default_asr = AsrSettings()
+        default_personalize = PersonalizeSettings()
         # 常规
         self._enable_check.setChecked(True)
         self._autostart_check.setChecked(default_ui.launch_at_login)
@@ -430,6 +548,11 @@ class SettingsWindow(QWidget):
         # ASR
         self._max_record_spin.setValue(int(default_asr.max_record_seconds))
         self._select_mic(default_asr.mic_device_index)
+        # 个性化
+        self._suffix_check.setChecked(default_personalize.suffix_enabled)
+        self._suffix_edit.setText(default_personalize.suffix_text)
+        self._suffix_edit.setEnabled(default_personalize.suffix_enabled)
+        self._set_rewrite_style(default_personalize.rewrite_style)
         # 状态提示
         self._reset_status_label.setText("已恢复默认值，点击应用生效")
 
@@ -437,7 +560,7 @@ class SettingsWindow(QWidget):
         btn = QMessageBox.question(
             self,
             "恢复默认设置",
-            "将恢复常规、快捷键、语音识别、界面设置为默认值，翻译配置不受影响。是否继续？",
+            "将恢复常规、快捷键、语音识别、界面、个性化设置为默认值，翻译配置不受影响。是否继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )

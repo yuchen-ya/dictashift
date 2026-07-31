@@ -19,7 +19,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from dictashift.settings import AppSettings, AsrSettings, HotkeySettings, UiSettings
+from dictashift.settings import (
+    AppSettings,
+    AsrSettings,
+    HotkeySettings,
+    PersonalizeSettings,
+    UiSettings,
+)
 from dictashift.translation import (
     BUILTIN_BING,
     BUILTIN_GOOGLE,
@@ -236,6 +242,78 @@ class TestResultUiCombo:
         win.load_from_settings(s)
         win.reset_to_defaults()
         assert win._current_result_ui() == UiSettings().result_ui == "popup"
+
+
+# ==================== 个性化页 ====================
+
+
+class TestPersonalizeTab:
+    def test_tab_added_as_fifth_page(self, win) -> None:
+        assert win._tabs.count() == 5
+        assert win._tabs.tabText(4) == "个性化"
+
+    def test_suffix_edit_follows_checkbox(self, win) -> None:
+        win._suffix_check.setChecked(False)
+        assert not win._suffix_edit.isEnabled()
+        win._suffix_check.setChecked(True)
+        assert win._suffix_edit.isEnabled()
+
+    def test_load_from_settings(self, win) -> None:
+        s = AppSettings()
+        s.personalize = PersonalizeSettings(
+            suffix_enabled=True, suffix_text="捏", rewrite_style="toxic"
+        )
+        win.load_from_settings(s)
+        assert win._suffix_check.isChecked() is True
+        assert win._suffix_edit.text() == "捏"
+        assert win._suffix_edit.isEnabled()
+        assert win._rewrite_toxic_radio.isChecked()
+        assert not win._rewrite_off_radio.isChecked()
+        assert not win._rewrite_tsundere_radio.isChecked()
+
+    def test_load_defaults(self, win) -> None:
+        win.load_from_settings(AppSettings())
+        assert win._suffix_check.isChecked() is False
+        assert win._suffix_edit.text() == "喵"
+        assert not win._suffix_edit.isEnabled()
+        assert win._rewrite_off_radio.isChecked()
+
+    def test_radio_mutually_exclusive(self, win) -> None:
+        win._rewrite_tsundere_radio.setChecked(True)
+        assert win._current_rewrite_style() == "tsundere"
+        win._rewrite_toxic_radio.setChecked(True)
+        assert not win._rewrite_tsundere_radio.isChecked()
+        assert win._current_rewrite_style() == "toxic"
+
+    def test_apply_writes_personalize(self, win) -> None:
+        win.load_from_settings(AppSettings())
+        win._suffix_check.setChecked(True)
+        win._suffix_edit.setText("哦")
+        win._rewrite_tsundere_radio.setChecked(True)
+        out = win.apply_to_settings(AppSettings())
+        assert out.personalize.suffix_enabled is True
+        assert out.personalize.suffix_text == "哦"
+        assert out.personalize.rewrite_style == "tsundere"
+
+    def test_load_apply_round_trip(self, win) -> None:
+        s = AppSettings()
+        s.personalize = PersonalizeSettings(
+            suffix_enabled=True, suffix_text="捏", rewrite_style="toxic"
+        )
+        win.load_from_settings(s)
+        out = win.apply_to_settings(s)
+        assert out.personalize == s.personalize
+
+    def test_reset_to_defaults_resets_personalize(self, win) -> None:
+        s = AppSettings()
+        s.personalize = PersonalizeSettings(
+            suffix_enabled=True, suffix_text="捏", rewrite_style="tsundere"
+        )
+        win.load_from_settings(s)
+        win.reset_to_defaults()
+        assert win._suffix_check.isChecked() is False
+        assert win._suffix_edit.text() == PersonalizeSettings().suffix_text
+        assert win._rewrite_off_radio.isChecked()
 
 
 # ==================== recheck 信号无参 ====================
