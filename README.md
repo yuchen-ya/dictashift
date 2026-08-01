@@ -44,10 +44,19 @@
 <img src="docs/images/settings-translation.png" width="640" alt="翻译设置">
 <br/><em>翻译设置：内置免登录服务与 OpenAI 兼容配置平级选择</em>
 <br/><br/>
+<img src="docs/images/settings-general.png" width="318" alt="常规设置">&nbsp;&nbsp;
+<img src="docs/images/settings-hotkeys.png" width="318" alt="快捷键设置">
+<br/><em>常规：结果展示方式与一键清除数据；快捷键：全部热键可自定义</em>
+<br/><br/>
+<img src="docs/images/settings-asr.png" width="318" alt="语音识别设置">&nbsp;&nbsp;
+<img src="docs/images/settings-personalize.png" width="318" alt="个性化设置">
+<br/><em>语音识别：模型一键下载与麦克风选择；个性化：句尾后缀与语气改写（关闭/毒舌/傲娇）</em>
+<br/><br/>
 <img src="docs/images/overlay-preparing.png" alt="准备中">&nbsp;&nbsp;
 <img src="docs/images/overlay-recording.png" alt="录音中">&nbsp;&nbsp;
+<img src="docs/images/overlay-rewriting.png" alt="改写中">&nbsp;&nbsp;
 <img src="docs/images/overlay-result.png" width="305" alt="结果悬浮窗">
-<br/><em>状态悬浮窗：◌ 准备中（橙，麦克风预热）→ ● 录音中（红，真正在收音）；直输失败时结果直接替换状态文字，点击卡片即复制</em>
+<br/><em>状态悬浮窗：◌ 准备中（橙，麦克风预热）→ ● 录音中（红，真正在收音）→ 改写中（紫，语气改写）；直输失败时结果直接替换状态文字，点击卡片即复制</em>
 <br/><br/>
 <img src="docs/images/result-popup.png" width="360" alt="结果弹窗">
 <br/><em>右下角结果弹窗（直输失败时弹出，点击「复制」才写入剪贴板）</em>
