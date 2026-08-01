@@ -186,4 +186,34 @@ QToolTip {{
     color: {TEXT_PRIMARY};
     border: 1px solid {BORDER};
 }}
+
+/* ---- 分段按钮组（语气改写 关闭/毒舌/傲娇）----
+   深色主题下 QRadioButton 选中态不明显，改用 checkable QPushButton + QButtonGroup。
+   选中按钮用 accent 紫填充 + 白字；未选中为普通暗色按钮；相邻按钮无缝拼接（首圆左角、末圆右角）。 */
+QPushButton#segmentBtn {{
+    background-color: {BG_INPUT};
+    color: {TEXT_SECONDARY};
+    border: 1px solid {BORDER};
+    padding: 6px 18px;
+}}
+QPushButton#segmentBtn:first {{
+    border-top-left-radius: 6px;
+    border-bottom-left-radius: 6px;
+}}
+QPushButton#segmentBtn:last {{
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+}}
+QPushButton#segmentBtn[segmentBtn="selected"] {{
+    background-color: {ACCENT};
+    color: {TEXT_PRIMARY};
+    border-color: {ACCENT};
+}}
+QPushButton#segmentBtn:hover {{
+    border-color: {ACCENT_LIGHT};
+}}
+QPushButton#segmentBtn:hover[segmentBtn="selected"], QPushButton#segmentBtn:pressed[segmentBtn="selected"] {{
+    background-color: {ACCENT_DARK};
+    border-color: {ACCENT_DARK};
+}}
 """

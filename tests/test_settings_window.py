@@ -267,29 +267,45 @@ class TestPersonalizeTab:
         assert win._suffix_check.isChecked() is True
         assert win._suffix_edit.text() == "捏"
         assert win._suffix_edit.isEnabled()
-        assert win._rewrite_toxic_radio.isChecked()
-        assert not win._rewrite_off_radio.isChecked()
-        assert not win._rewrite_tsundere_radio.isChecked()
+        assert win._rewrite_toxic_btn.isChecked()
+        assert not win._rewrite_off_btn.isChecked()
+        assert not win._rewrite_tsundere_btn.isChecked()
 
     def test_load_defaults(self, win) -> None:
         win.load_from_settings(AppSettings())
         assert win._suffix_check.isChecked() is False
         assert win._suffix_edit.text() == "喵"
         assert not win._suffix_edit.isEnabled()
-        assert win._rewrite_off_radio.isChecked()
+        assert win._rewrite_off_btn.isChecked()
 
-    def test_radio_mutually_exclusive(self, win) -> None:
-        win._rewrite_tsundere_radio.setChecked(True)
+    def test_segment_buttons_mutually_exclusive(self, win) -> None:
+        win._rewrite_tsundere_btn.setChecked(True)
         assert win._current_rewrite_style() == "tsundere"
-        win._rewrite_toxic_radio.setChecked(True)
-        assert not win._rewrite_tsundere_radio.isChecked()
+        win._rewrite_toxic_btn.setChecked(True)
+        assert not win._rewrite_tsundere_btn.isChecked()
         assert win._current_rewrite_style() == "toxic"
+
+    def test_segment_button_object_name_set(self, win) -> None:
+        """分段按钮均带 objectName=segmentBtn（驱动 theme.py 定向样式）。"""
+        for btn in (
+            win._rewrite_off_btn,
+            win._rewrite_toxic_btn,
+            win._rewrite_tsundere_btn,
+        ):
+            assert btn.objectName() == "segmentBtn"
+            assert btn.isCheckable()
+
+    def test_selected_button_has_selected_property(self, win) -> None:
+        """选中按钮的 segmentBtn 属性为 selected（QSS 高亮判定依据）。"""
+        win._set_rewrite_style("tsundere")
+        assert win._rewrite_tsundere_btn.property("segmentBtn") == "selected"
+        assert win._rewrite_off_btn.property("segmentBtn") != "selected"
 
     def test_apply_writes_personalize(self, win) -> None:
         win.load_from_settings(AppSettings())
         win._suffix_check.setChecked(True)
         win._suffix_edit.setText("哦")
-        win._rewrite_tsundere_radio.setChecked(True)
+        win._rewrite_tsundere_btn.setChecked(True)
         out = win.apply_to_settings(AppSettings())
         assert out.personalize.suffix_enabled is True
         assert out.personalize.suffix_text == "哦"
@@ -313,7 +329,7 @@ class TestPersonalizeTab:
         win.reset_to_defaults()
         assert win._suffix_check.isChecked() is False
         assert win._suffix_edit.text() == PersonalizeSettings().suffix_text
-        assert win._rewrite_off_radio.isChecked()
+        assert win._rewrite_off_btn.isChecked()
 
 
 # ==================== recheck 信号无参 ====================

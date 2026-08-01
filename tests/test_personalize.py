@@ -180,12 +180,94 @@ class TestProcessorApply:
             backend=backend,
         )
         assert proc.rewrite_active() is False
+        # 无句末标点 -> 末尾追加
         assert proc.apply("原文") == "原文喵"
         assert backend.calls == []
 
     def test_empty_suffix_text_not_appended(self) -> None:
         proc = PersonalizeProcessor(suffix_enabled=True, suffix_text="")
         assert proc.apply("原文") == "原文"
+
+
+# ==================== 句尾后缀：逐句插入 ====================
+
+
+class TestSuffixPerSentence:
+    """逐句插入：在句末标点之前插入 suffix；无标点末尾追加。
+
+    测试直接用 PersonalizeProcessor(suffix_enabled=True)，后缀逻辑不走 LLM。
+    """
+
+    def _proc(self, suffix: str) -> PersonalizeProcessor:
+        return PersonalizeProcessor(suffix_enabled=True, suffix_text=suffix)
+
+    def test_multi_chinese_sentences(self) -> None:
+        # 用户实际反馈场景
+        assert self._proc("喵").apply("这是一次对话测试。你好。") == "这是一次对话测试喵。你好喵。"
+
+    def test_exclamation_and_question_marks(self) -> None:
+        # ！？!? 均触发
+        assert self._proc("喵").apply("真的吗？太好了！") == "真的吗喵？太好了喵！"
+        assert self._proc("nya").apply("What? Yes!") == "Whatnya? Yesnya!"
+
+    def test_english_period(self) -> None:
+        assert self._proc("nya").apply("Hello world.") == "Hello worldnya."
+
+    def test_no_sentence_end_appends_at_tail(self) -> None:
+        assert self._proc("喵").apply("你好") == "你好喵"
+        assert self._proc("nya").apply("Hi there") == "Hi therenya"
+
+    def test_comma_not_treated_as_sentence_end(self) -> None:
+        # 逗号、顿号是句中标点，不触发；无句末标点 -> 末尾追加
+        assert self._proc("喵").apply("你好，世界") == "你好，世界喵"
+        assert self._proc("喵").apply("测试、顿号") == "测试、顿号喵"
+
+    def test_mixed_cn_en_punctuation(self) -> None:
+        # 中英文标点混合
+        assert (
+            self._proc("喵").apply("你好。World! 结束。")
+            == "你好喵。World喵! 结束喵。"
+        )
+
+    def test_ellipsis_treated_as_whole(self) -> None:
+        # 省略号 ... 不拆成三个句末；末尾因无其他句末标点 -> 末尾追加
+        # 行为锁定：... 中的点不触发，整段视为无句末标点 -> 末尾追加。
+        assert self._proc("喵").apply("What...") == "What...喵"
+
+    def test_empty_or_whitespace_no_suffix(self) -> None:
+        assert self._proc("喵").apply("") == ""
+        assert self._proc("喵").apply("   ") == "   "
+        assert self._proc("喵").apply("\n\t") == "\n\t"
+
+    def test_empty_suffix_no_change(self) -> None:
+        assert self._proc("").apply("你好。") == "你好。"
+
+    def test_multiple_english_sentences(self) -> None:
+        assert self._proc(".").apply("a. b. c.") == "a.. b.. c.."
+
+    def test_suffix_after_rewrite_uses_per_sentence(self) -> None:
+        """改写后再逐句加后缀：改写结果含句末标点时按句插入。"""
+        backend = FakeRewriteBackend(chunks=["第一句。第二句。"])
+        proc = PersonalizeProcessor(
+            profile=_PROFILE,
+            suffix_enabled=True,
+            suffix_text="喵",
+            rewrite_style="toxic",
+            backend=backend,
+        )
+        assert proc.apply("原文") == "第一句喵。第二句喵。"
+
+    def test_rewrite_exception_falls_back_and_per_sentence_suffix(self) -> None:
+        """改写失败回退原文时，逐句加后缀逻辑照常生效。"""
+        backend = FakeRewriteBackend(raise_on_call=RuntimeError("boom"))
+        proc = PersonalizeProcessor(
+            profile=_PROFILE,
+            suffix_enabled=True,
+            suffix_text="喵",
+            rewrite_style="toxic",
+            backend=backend,
+        )
+        assert proc.apply("第一句。第二句。") == "第一句喵。第二句喵。"
 
 
 # ==================== build_personalize_processor ====================

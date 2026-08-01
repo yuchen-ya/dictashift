@@ -27,6 +27,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
@@ -38,7 +39,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QRadioButton,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -368,18 +368,38 @@ class SettingsWindow(QWidget):
         suffix_form.addRow("后缀文本：", self._suffix_edit)
         outer.addLayout(suffix_form)
 
-        # ---- 语气改写组：互斥单选（关闭/毒舌/傲娇）----
+        # ---- 语气改写组：分段按钮组（关闭/毒舌/傲娇，互斥）----
+        # 深色主题下 QRadioButton 选中态不明显，改用 checkable QPushButton + QButtonGroup，
+        # 选中按钮由 theme.py 的 #segBtn[segmentBtn="selected"] 紫 accent 高亮显示。
         rewrite_group_label = QLabel("语气改写：", page)
         outer.addWidget(rewrite_group_label)
-        rewrite_form = QFormLayout()
-        self._rewrite_off_radio = QRadioButton("关闭", page)
-        self._rewrite_toxic_radio = QRadioButton("毒舌", page)
-        self._rewrite_tsundere_radio = QRadioButton("傲娇", page)
-        self._rewrite_off_radio.setChecked(True)
-        rewrite_form.addRow(self._rewrite_off_radio)
-        rewrite_form.addRow(self._rewrite_toxic_radio)
-        rewrite_form.addRow(self._rewrite_tsundere_radio)
-        outer.addLayout(rewrite_form)
+        seg_row = QHBoxLayout()
+        seg_row.setSpacing(0)
+        self._rewrite_off_btn = QPushButton("关闭", page)
+        self._rewrite_off_btn.setObjectName("segmentBtn")
+        self._rewrite_toxic_btn = QPushButton("毒舌", page)
+        self._rewrite_toxic_btn.setObjectName("segmentBtn")
+        self._rewrite_tsundere_btn = QPushButton("傲娇", page)
+        self._rewrite_tsundere_btn.setObjectName("segmentBtn")
+        for btn in (
+            self._rewrite_off_btn,
+            self._rewrite_toxic_btn,
+            self._rewrite_tsundere_btn,
+        ):
+            btn.setCheckable(True)
+            seg_row.addWidget(btn)
+        seg_row.addStretch(1)
+        outer.addLayout(seg_row)
+        # 互斥：QButtonGroup(exclusive=True)。
+        self._rewrite_group = QButtonGroup(page)
+        self._rewrite_group.setExclusive(True)
+        self._rewrite_group.addButton(self._rewrite_off_btn)
+        self._rewrite_group.addButton(self._rewrite_toxic_btn)
+        self._rewrite_group.addButton(self._rewrite_tsundere_btn)
+        # 按钮被点击切换 checked 时，刷新 objectName 触发定向样式更新。
+        self._rewrite_group.buttonClicked.connect(self._refresh_rewrite_segment_style)
+        self._rewrite_off_btn.setChecked(True)
+        self._refresh_rewrite_segment_style()
 
         # 说明：改写复用翻译页活动档案的 LLM 配置；非 OpenAI 兼容型自动跳过。
         hint_label = QLabel(
@@ -393,19 +413,31 @@ class SettingsWindow(QWidget):
 
         return page
 
+    def _refresh_rewrite_segment_style(self, *_args) -> None:
+        """按当前选中态刷新分段按钮的 segmentBtn 属性（驱动 theme.py 定向样式）。"""
+        for btn, style in (
+            (self._rewrite_off_btn, "selected" if self._rewrite_off_btn.isChecked() else ""),
+            (self._rewrite_toxic_btn, "selected" if self._rewrite_toxic_btn.isChecked() else ""),
+            (self._rewrite_tsundere_btn, "selected" if self._rewrite_tsundere_btn.isChecked() else ""),
+        ):
+            btn.setProperty("segmentBtn", style)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
     def _set_rewrite_style(self, value: str) -> None:
-        """把 rewrite_style 值同步到单选按钮；非法值回退到 off。"""
+        """把 rewrite_style 值同步到分段按钮；非法值回退到 off。"""
         if value == "toxic":
-            self._rewrite_toxic_radio.setChecked(True)
+            self._rewrite_toxic_btn.setChecked(True)
         elif value == "tsundere":
-            self._rewrite_tsundere_radio.setChecked(True)
+            self._rewrite_tsundere_btn.setChecked(True)
         else:
-            self._rewrite_off_radio.setChecked(True)
+            self._rewrite_off_btn.setChecked(True)
+        self._refresh_rewrite_segment_style()
 
     def _current_rewrite_style(self) -> str:
-        if self._rewrite_toxic_radio.isChecked():
+        if self._rewrite_toxic_btn.isChecked():
             return "toxic"
-        if self._rewrite_tsundere_radio.isChecked():
+        if self._rewrite_tsundere_btn.isChecked():
             return "tsundere"
         return "off"
 
