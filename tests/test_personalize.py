@@ -245,6 +245,19 @@ class TestSuffixPerSentence:
     def test_multiple_english_sentences(self) -> None:
         assert self._proc(".").apply("a. b. c.") == "a.. b.. c.."
 
+    def test_decimal_dot_not_treated_as_sentence_end(self) -> None:
+        # 小数点（. 后跟数字）不触发插入；中文句号正常生效。
+        assert self._proc("喵").apply("价格是3.14。") == "价格是3.14喵。"
+        # 纯小数无句末标点 -> 末尾追加。
+        assert self._proc("喵").apply("3.14") == "3.14喵"
+        # 句中含小数点：句点正常插入，小数点跳过。
+        assert (
+            self._proc("nya").apply("I like it. 3.5 is fine.")
+            == "I like itnya. 3.5 is finenya."
+        )
+        # 中文混合小数 + 句末标点。
+        assert self._proc("喵").apply("价格9.9元。") == "价格9.9元喵。"
+
     def test_suffix_after_rewrite_uses_per_sentence(self) -> None:
         """改写后再逐句加后缀：改写结果含句末标点时按句插入。"""
         backend = FakeRewriteBackend(chunks=["第一句。第二句。"])

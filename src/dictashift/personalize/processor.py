@@ -6,8 +6,8 @@
 句尾后缀语义（逐句插入）：
 - 按句末标点（。！？!? 与英文 .）切分文本，在**每一个句子的句末标点之前**
   插入 suffix（如 "测试。你好。" -> "测试喵。你好喵。"）。
-- 英文省略号 "..." 视为整体，不拆成三个句点；小数/缩写中的 . 同理不作为切分点
-  ——实现采用「...」或连续多个 . 视为整体，孤立单个 . 才作句末标点。
+- 英文省略号 "..." 视为整体，不拆成三个句点；小数点（. 后跟数字，如
+  3.14、价格9.9元）也不作为句末标点 —— 两者都用占位符保护后处理。
 - 文本无任何句末标点 -> 末尾直接加 suffix（"你好" -> "你好喵"）。
 - 空文本/全空白 -> 不加。
 - 后缀纯字符串拼接，绝不走大模型。
@@ -53,9 +53,11 @@ _STYLE_PROMPTS = {
 }
 
 
-# 句末标点匹配：。！？!?；以及英文单个 .（... 由下方正则先整体跳过）。
+# 句末标点匹配：。！？!?；以及英文单个 .（... 与小数点由下方逻辑排除）。
 # 命中即在该标点之前插入 suffix；末尾若无句末标点则整体作为一段末尾追加。
 _SENTENCE_END_RE = re.compile(r"[。！？!?]")
+# 小数点：. 后紧跟数字字符（如 3.14、9.9元）-> 不视为句末标点。
+_DECIMAL_DOT_RE = re.compile(r"\.(?=\d)")
 
 
 def _insert_suffix_per_sentence(text: str, suffix: str) -> str:
@@ -65,27 +67,30 @@ def _insert_suffix_per_sentence(text: str, suffix: str) -> str:
     - 句末标点：。！？!? 与英文句点 .（孤立单个）。
     - 英文省略号 "..."（连续 >=2 个 .）视为整体不拆分：先把连续句点替换为
       占位符、在剩余单点上做插入、再把占位符还原为原始的连续句点。
+    - 小数点特判：. 后紧跟数字（如 3.14、价格9.9元）不视为句末标点，不插入。
     - 整段文本无任何句末标点 -> 直接在末尾追加 suffix。
     - 空文本/全空白 -> 原样返回。
     """
     if not text or not text.strip() or not suffix:
         return text
 
-    # 1) 临时用占位符保护连续的英文句点（省略号 ...），避免被当作三个单点。
+    # 1) 临时用占位符保护：a) 连续英文句点（省略号 ...）；b) 小数点（. 后跟数字）。
+    #    保护后两者都不会被单点插入逻辑误命中，结束时再还原。
     _DOTS_PLACEHOLDER = "\x00DOTS\x01"
+    _DECIMAL_PLACEHOLDER = "\x00DEC\x01"
     protected = re.sub(r"\.{2,}", _DOTS_PLACEHOLDER, text)
+    protected = _DECIMAL_DOT_RE.sub(_DECIMAL_PLACEHOLDER, protected)
 
-    # 2) 在每个句末标点（中文标点 或 英文单 .）之前插入 suffix。
+    # 2) 在每个句末标点（中文标点 或 剩余英文单 .）之前插入 suffix。
     def _insert_before_punct(m: re.Match) -> str:
         return suffix + m.group(0)
 
-    # 中文句末标点直接插。
     inserted = _SENTENCE_END_RE.sub(_insert_before_punct, protected)
-    # 英文单 .：保护占位符之外的单个 .（... 已被占位符取代，不会被命中）。
     inserted = re.sub(r"\.", _insert_before_punct, inserted)
 
-    # 3) 还原占位符为原始的省略号。
+    # 3) 还原占位符：省略号 -> 原始连续句点；小数点 -> 原始 . 。
     inserted = inserted.replace(_DOTS_PLACEHOLDER, "...")
+    inserted = inserted.replace(_DECIMAL_PLACEHOLDER, ".")
 
     # 4) 若原文本完全没有任何句末标点 -> 末尾追加 suffix。
     if not _has_sentence_end(text):
@@ -96,13 +101,14 @@ def _insert_suffix_per_sentence(text: str, suffix: str) -> str:
 def _has_sentence_end(text: str) -> bool:
     """文本是否含至少一个句末标点（中文标点 或 英文孤立单点）。
 
-    连续的英文句点（省略号 ...）整体不算句末标点：判定时先把 ... 屏蔽，
-    再看是否还有孤立的单点或中文句末标点。
+    连续的英文句点（省略号 ...）整体不算句末标点：判定时先把 ... 屏蔽。
+    小数点（. 后跟数字，如 3.14）也不算句末标点：判定时先屏蔽，与插入逻辑一致。
     """
     if any(ch in text for ch in "。！？!?"):
         return True
-    # 屏蔽连续句点（...）后看是否还有单点。
+    # 屏蔽连续句点（...）与小数点（.\d），再看是否还有孤立单点。
     masked = re.sub(r"\.{2,}", "", text)
+    masked = _DECIMAL_DOT_RE.sub("", masked)
     return "." in masked
 
 
