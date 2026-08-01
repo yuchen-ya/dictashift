@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6.svg)](https://github.com/yuchen-ya/dictashift)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB.svg)](https://www.python.org/)
-[![Release](https://img.shields.io/badge/Release-v0.3.0-green.svg)](https://github.com/yuchen-ya/dictashift/releases)
+[![Release](https://img.shields.io/badge/Release-v0.4.0-green.svg)](https://github.com/yuchen-ya/dictashift/releases)
 
 [English](#english) · [功能特性](#-功能特性) · [安装](#-安装) · [快捷键](#-快捷键) · [隐私](#-隐私说明) · [开发](#-开发)
 
@@ -30,7 +30,9 @@
 | 🪟 状态悬浮窗 | 可选常驻置顶单行卡片，宽度随内容自适应；直输失败时显示结果文本，点击卡片即复制 |
 | 🚦 状态如实反馈 | 「◌ 准备中 / ● 录音中」由首个音频帧驱动——麦克风真正开始收音才亮红灯；错误在弹窗/悬浮窗可见提示，绝不静默 |
 | ⚡ 低延迟流水线 | 热键事件异步化，松手即停；高效多相重采样，说完即出字 |
-| 🔁 状态机流水线 | 准备 → 录音 → 识别 → 翻译 → 输出，禁用/取消/错误全路径可恢复 |
+| 🔁 状态机流水线 | 准备 → 录音 → 识别 → 翻译 → 改写 → 输出，禁用/取消/错误全路径可恢复 |
+| 🎀 个性化输出 | 句尾后缀逐句插入（默认「喵」，纯字符串不走大模型）；语气改写（关闭/毒舌/傲娇）复用翻译页 OpenAI 兼容档案，改写失败静默回退原文 |
+| 🎨 图标与主题 | 全套程序生成的扁平麦克风图标（窗口/任务栏/托盘统一），深色主题美化设置窗口 |
 | 📥 模型自动下载 | 首次运行一键从 GitHub Releases 下载模型（SHA256 校验） |
 | 🚀 开机自启 | 一键开关（注册表 Run 项） |
 | 🧹 一键清除数据 | 设置面板「清除全部数据并退出」，卸载前彻底删除 API Key / 日志 / 模型 |
@@ -139,7 +141,7 @@ src/dictashift/
 
 ## English
 
-DictaShift is a Windows background dictation tool: hold **F8** to dictate Chinese, hold **F9** to dictate Chinese and input English translation, release to type the result at the cursor. Speech recognition runs **entirely on-device** (SenseVoice ONNX int8, from FunASR); translation works with login-free Google/Bing or any OpenAI-compatible endpoint (including local llama-server). No telemetry. MIT License.
+DictaShift is a Windows background dictation tool: hold **F8** to dictate Chinese, hold **F9** to dictate Chinese and input English translation, release to type the result at the cursor. Speech recognition runs **entirely on-device** (SenseVoice ONNX int8, from FunASR); translation works with login-free Google/Bing or any OpenAI-compatible endpoint (including local llama-server). Optional personalization: per-sentence suffix insertion and tone rewriting (off / sarcastic / tsundere) reusing your OpenAI-compatible profile. No telemetry. MIT License.
 
 ## 📄 License
 
