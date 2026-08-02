@@ -293,11 +293,26 @@ class SettingsWindow(QWidget):
         page = QWidget(self)
         outer = QVBoxLayout(page)
 
-        top_form = QFormLayout()
+        # 配置行：标签 + 下拉（拉伸占满）+「＋新建」+「删除」。
         self._profile_combo = QComboBox(page)
         self._profile_combo.currentIndexChanged.connect(self._on_profile_selected)
-        top_form.addRow("当前翻译配置：", self._profile_combo)
-        outer.addLayout(top_form)
+        self._new_profile_btn = QPushButton("＋新建", page)
+        self._new_profile_btn.clicked.connect(self._on_new_profile_clicked)
+        # 删除为危险操作，沿用常规页 clear_data_btn 的内联红样式。
+        self._delete_profile_btn = QPushButton("删除", page)
+        self._delete_profile_btn.setStyleSheet(
+            "QPushButton { color: #ff6b6b; border: 1px solid #c0392b; border-radius: 4px; padding: 4px 10px; }"
+            "QPushButton:hover { background-color: rgba(192, 57, 43, 40); }"
+        )
+        # 初始未加载任何配置，删除不可用（随后由 _on_profile_selected 同步）。
+        self._delete_profile_btn.setEnabled(False)
+        self._delete_profile_btn.clicked.connect(self._on_delete_profile_clicked)
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("当前翻译配置：", page))
+        profile_row.addWidget(self._profile_combo, stretch=1)
+        profile_row.addWidget(self._new_profile_btn)
+        profile_row.addWidget(self._delete_profile_btn)
+        outer.addLayout(profile_row)
 
         # 内置项选中时显示的提示标签（免登录服务，无需配置）。
         self._builtin_hint_label = QLabel("免登录翻译服务，无需配置", page)
@@ -345,6 +360,10 @@ class SettingsWindow(QWidget):
         # 内存中维护的用户 LLM profiles 列表（编辑/保存时操作；apply 时同步到 settings）。
         # 内置免登录项不在此列表中，由 _rebuild_profile_combo 拼接到下拉顶部。
         self._profiles: list[TranslationProfile] = []
+
+        # 是否处于「＋新建」草稿态：True 时编辑区内容尚未绑定到任何 profile，
+        # apply/下拉切换时不应被 flush 回写为某已有配置（见 _flush_edit_to_active_profile）。
+        self._new_profile_draft: bool = False
 
         return page
 
@@ -474,6 +493,8 @@ class SettingsWindow(QWidget):
         # 翻译
         self._profiles = list(settings.translation.profiles)
         self._rebuild_profile_combo(settings.translation.active_profile)
+        # 载入新设置即丢弃任何残留草稿态。
+        self._new_profile_draft = False
         # 个性化
         self._suffix_check.setChecked(settings.personalize.suffix_enabled)
         self._suffix_edit.setText(settings.personalize.suffix_text)
@@ -772,6 +793,48 @@ class SettingsWindow(QWidget):
         if not replaced:
             self._profiles.append(profile)
         self._rebuild_profile_combo(profile.name)
+        # 草稿已落定为真实 profile，退出草稿态。
+        self._new_profile_draft = False
+
+    def _on_new_profile_clicked(self) -> None:
+        """点击「＋新建」：进入新建态，清空并启用编辑区，等待「保存为新配置」。
+
+        不改动下拉框选中项、不插入临时项；填写后点「保存为新配置」才真正
+        追加到 profiles（落盘仍走应用/确定时的现有路径）。
+        """
+        self._activate_user_edit_mode()
+        self._clear_edit()  # 含 Temperature 复位默认值 0.30
+        self._name_edit.setFocus()
+        # 进入草稿态：未点「保存为新配置」前，编辑区内容不归属任何 profile，
+        # 切换下拉/apply 时都不应被 flush 写回（见 _flush_edit_to_active_profile）。
+        self._new_profile_draft = True
+        self._test_result_label.setText("正在新建配置：填写后点击『保存为新配置』")
+        # 下拉选中项未变，删除可用态按其重新同步一次。
+        self._sync_delete_profile_btn()
+
+    def _on_delete_profile_clicked(self) -> None:
+        """点击「删除」：二次确认后从内存 profiles 移除当前选中的用户配置。
+
+        仅用户自建配置可删（内置项/未匹配时按钮已禁用，此处防御性兜底）。
+        不写盘，沿用「应用/确定」统一落盘的现有路径；取消不做任何改动。
+        """
+        name = self._profile_combo.currentText()
+        if name in _BUILTIN_NAMES or not any(p.name == name for p in self._profiles):
+            return
+        btn = QMessageBox.warning(
+            self,
+            "删除翻译配置",
+            f"将删除配置「{name}」，删除结果在点击「应用/确定」后生效。\n\n确定删除？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if btn != QMessageBox.StandardButton.Yes:
+            return
+        self._profiles = [p for p in self._profiles if p.name != name]
+        # 回退选中：优先剩余的第一个用户配置，否则第一个内置项（active_name 为空时
+        # _rebuild_profile_combo 自动选中 index 0）。
+        fallback = self._profiles[0].name if self._profiles else ""
+        self._rebuild_profile_combo(fallback)
 
     # ==================== 翻译 profiles 编辑辅助 ====================
 
@@ -780,17 +843,19 @@ class SettingsWindow(QWidget):
 
         - 内置项：编辑区整体禁用、显示提示标签、「保存为新配置」禁用。
         - 用户项：编辑区启用、隐藏提示标签、「保存为新配置」启用。
+        - 两个分支都会同步「删除」按钮可用态（仅用户自建配置可删）。
         """
         name = self._profile_combo.currentText()
+        self._sync_delete_profile_btn()
+        # 下拉切换即离开草稿态（草稿内容视为放弃，载入新选中项覆盖编辑区）。
+        self._new_profile_draft = False
         if name in _BUILTIN_NAMES:
             self._builtin_hint_label.show()
             self._set_edit_enabled(False)
             self._save_new_btn.setEnabled(False)
             self._load_profile_to_edit(self._builtin_profile(name))
             return
-        self._builtin_hint_label.hide()
-        self._set_edit_enabled(True)
-        self._save_new_btn.setEnabled(True)
+        self._activate_user_edit_mode()
         for p in self._profiles:
             if p.name == name:
                 self._load_profile_to_edit(p)
@@ -820,7 +885,11 @@ class SettingsWindow(QWidget):
         """把当前编辑区内容写回当前选中的用户 profile（若存在且非内置项）。
 
         内置项选中时不写回（编辑区内容是上次载入的内置占位，不应污染用户列表）。
+        草稿态（点了「＋新建」但未保存）不写回：草稿不归属任何 profile，未保存即
+        apply/切换视为放弃草稿，避免静默以下拉选中项名字覆盖已有配置。
         """
+        if self._new_profile_draft:
+            return
         name = self._profile_combo.currentText()
         if not name or name in _BUILTIN_NAMES:
             return
@@ -856,6 +925,19 @@ class SettingsWindow(QWidget):
             self._temperature_spin,
         ):
             w.setEnabled(enabled)
+
+    def _activate_user_edit_mode(self) -> None:
+        """切换到用户配置编辑态：隐藏内置提示、启用编辑区与「保存为新配置」。"""
+        self._builtin_hint_label.hide()
+        self._set_edit_enabled(True)
+        self._save_new_btn.setEnabled(True)
+
+    def _sync_delete_profile_btn(self) -> None:
+        """按下拉当前选中项同步「删除」可用态（仅用户自建配置可删）。"""
+        name = self._profile_combo.currentText()
+        self._delete_profile_btn.setEnabled(
+            name not in _BUILTIN_NAMES and any(p.name == name for p in self._profiles)
+        )
 
     def _profile_from_edit(self, name: str | None = None) -> TranslationProfile:
         """从编辑区控件构造用户 LLM profile。
