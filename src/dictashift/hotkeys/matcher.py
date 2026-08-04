@@ -30,8 +30,9 @@ class HotkeyBinding:
     """快捷键绑定。
 
     keys 为归一化后的键名 frozenset，如 frozenset({'f8'}) 或
-    frozenset({'ctrl', 'alt', 'f12'})。action 由上层 controller 解释，
-    约定取值："dictate_zh" | "dictate_en" | "toggle_enabled" | "cancel"。
+    frozenset({'ctrl', 'alt', 'f12'})。action 由上层 controller/application 解释，
+    约定取值："dictate_zh" | "dictate_en" | "toggle_enabled" | "cancel"
+    | "selection_translate"（划词翻译，由 application 层直接路由，不进 controller）。
 
     不变量：
     - keys 必须非空 frozenset，且每个元素都已通过 normalize_key_name 归一化。

@@ -27,10 +27,20 @@ logger = logging.getLogger(__name__)
 _JWT_EXPIRY_MARGIN = 60.0
 
 _BING_AUTH_URL = "https://edge.microsoft.com/translate/auth"
-_BING_TRANSLATE_URL = (
-    "https://api-edge.cognitive.microsofttranslator.com/translate"
-    "?api-version=3.0&from=zh-Hans&to=en"
-)
+_BING_TRANSLATE_URL_BASE = "https://api-edge.cognitive.microsofttranslator.com/translate"
+
+
+def _build_translate_url(direction: str = "zh2en") -> str:
+    """按翻译方向构造 translate URL。
+
+    zh2en -> from=zh-Hans&to=en；en2zh -> from=en&to=zh-Hans。
+    未知 direction 值一律按 zh2en 处理（防御性）。
+    """
+    if direction == "en2zh":
+        from_lang, to_lang = "en", "zh-Hans"
+    else:
+        from_lang, to_lang = "zh-Hans", "en"
+    return f"{_BING_TRANSLATE_URL_BASE}?api-version=3.0&from={from_lang}&to={to_lang}"
 
 _DESKTOP_CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -157,7 +167,7 @@ class BingEdgeBackend(TranslationBackend):
         - 网络/超时：TranslationError(status_code=None)。
         - 响应 JSON 结构不符：TranslationError(status_code=None)。
         """
-        result = self._translate_once(text, profile.timeout)
+        result = self._translate_once(text, profile.timeout, profile.direction)
         if result is not None:
             yield result
             return
@@ -165,7 +175,7 @@ class BingEdgeBackend(TranslationBackend):
         # 第一次 401（或其它可重试的 None 信号由 _translate_once 内部不抛而返回 None 表示 401）
         logger.warning("[Translation/Bing] 翻译返回 401，刷新 JWT 重试一次")
         self._force_refresh_jwt(profile.timeout)
-        result = self._translate_once(text, profile.timeout)
+        result = self._translate_once(text, profile.timeout, profile.direction)
         if result is not None:
             yield result
             return
@@ -176,7 +186,9 @@ class BingEdgeBackend(TranslationBackend):
             status_code=401,
         )
 
-    def _translate_once(self, text: str, timeout: float) -> str | None:
+    def _translate_once(
+        self, text: str, timeout: float, direction: str = "zh2en"
+    ) -> str | None:
         """执行一次翻译请求。
 
         返回值：
@@ -194,7 +206,9 @@ class BingEdgeBackend(TranslationBackend):
 
         try:
             with httpx.Client(timeout=timeout) as client:
-                response = client.post(_BING_TRANSLATE_URL, headers=headers, json=body)
+                response = client.post(
+                    _build_translate_url(direction), headers=headers, json=body
+                )
         except httpx.TimeoutException as e:
             logger.warning("[Translation/Bing] 翻译请求超时")
             raise TranslationError(

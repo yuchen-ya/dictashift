@@ -2,14 +2,15 @@
 
 页面结构：
 1. 常规：启用语音输入、开机启动(仅保存设置)、结果展示方式(右下角弹窗/常驻悬浮窗)、
-   全局禁用快捷键、恢复默认设置按钮（重置常规/快捷键/语音识别/界面/个性化，不影响翻译配置）。
-2. 快捷键：中文输入(f8)、中文→英文(f9)、取消当前任务(esc)。
+   全局禁用快捷键、恢复默认设置按钮（重置常规/快捷键/语音识别/界面/个性化/划词翻译，
+   不影响翻译配置）。
+2. 快捷键：中文输入(f8)、中文→英文(f9)、取消当前任务(esc)、划词翻译(f7)。
 3. 语音识别：模型(已安装/未安装 状态 + 下载按钮 + 进度条)、实际运行设备(只读)、
    麦克风、最长录音秒数、重新检测硬件、测试识别(禁用占位)。
    注：推理设备/GPU 设备控件已随 GPU 路线移除（设备固定为 AUTO/CPU，等价）。
 4. 翻译：当前配置 ComboBox（内置免登录 Google/Bing + 用户 LLM profiles）、
    编辑区(base_url/model/api_key/temperature，仅作用于用户 LLM 配置)、
-   保存为新配置、测试连接(后台)。
+   保存为新配置、测试连接(后台)；划词翻译分组（总开关/自动弹出/弹窗显示时长）。
 5. 个性化：句尾后缀（开关 + 文本，纯字符串拼接）、语气改写（关闭/毒舌/傲娇
    互斥单选，复用翻译页活动档案的 LLM 配置）。
 
@@ -56,6 +57,7 @@ from ..settings.models import (
     AsrSettings,
     HotkeySettings,
     PersonalizeSettings,
+    SelectionTranslateSettings,
     UiSettings,
 )
 from ..resources import app_icon_png_path
@@ -236,6 +238,9 @@ class SettingsWindow(QWidget):
         self._cancel_edit = HotkeyEdit(page)
         form.addRow("取消当前任务：", self._cancel_edit)
 
+        self._selection_translate_edit = HotkeyEdit(page)
+        form.addRow("划词翻译：", self._selection_translate_edit)
+
         return page
 
     # ==================== 语音识别页 ====================
@@ -356,6 +361,29 @@ class SettingsWindow(QWidget):
 
         self._test_result_label = QLabel("", page)
         outer.addWidget(self._test_result_label)
+
+        # ---- 划词翻译组：总开关 + 自动弹出 + 弹窗显示时长 ----
+        # 值绑定到 settings.selection_translate（随「应用/确定」生效）；
+        # 手动触发快捷键在「快捷键」页录入（默认 F7）。
+        selection_divider = QFrame(page)
+        selection_divider.setObjectName("headerDivider")
+        selection_divider.setFrameShape(QFrame.HLine)
+        outer.addWidget(selection_divider)
+        outer.addWidget(QLabel("划词翻译：", page))
+        selection_form = QFormLayout()
+        self._selection_enabled_check = QCheckBox("启用划词翻译", page)
+        selection_form.addRow(self._selection_enabled_check)
+        self._selection_auto_check = QCheckBox("划选文字后自动弹出翻译", page)
+        # 依赖总开关：未启用划词翻译时置灰（快捷键手动触发仍可用，不在此体现）。
+        self._selection_enabled_check.toggled.connect(self._selection_auto_check.setEnabled)
+        self._selection_auto_check.setEnabled(self._selection_enabled_check.isChecked())
+        selection_form.addRow(self._selection_auto_check)
+        self._selection_timeout_spin = QSpinBox(page)
+        self._selection_timeout_spin.setRange(5, 60)
+        self._selection_timeout_spin.setSuffix(" 秒")
+        selection_form.addRow("弹窗显示时长：", self._selection_timeout_spin)
+        outer.addLayout(selection_form)
+        outer.addStretch(1)
 
         # 内存中维护的用户 LLM profiles 列表（编辑/保存时操作；apply 时同步到 settings）。
         # 内置免登录项不在此列表中，由 _rebuild_profile_combo 拼接到下拉顶部。
@@ -485,6 +513,7 @@ class SettingsWindow(QWidget):
         self._dictate_zh_edit.set_config_text(settings.hotkeys.dictate_zh)
         self._dictate_en_edit.set_config_text(settings.hotkeys.dictate_en)
         self._cancel_edit.set_config_text(settings.hotkeys.cancel)
+        self._selection_translate_edit.set_config_text(settings.hotkeys.selection_translate)
         # ASR
         self._max_record_spin.setValue(int(settings.asr.max_record_seconds))
         self._select_mic(settings.asr.mic_device_index)
@@ -500,6 +529,13 @@ class SettingsWindow(QWidget):
         self._suffix_edit.setText(settings.personalize.suffix_text)
         self._suffix_edit.setEnabled(settings.personalize.suffix_enabled)
         self._set_rewrite_style(settings.personalize.rewrite_style)
+        # 划词翻译
+        self._selection_enabled_check.setChecked(settings.selection_translate.enabled)
+        self._selection_auto_check.setChecked(settings.selection_translate.auto_trigger)
+        self._selection_auto_check.setEnabled(settings.selection_translate.enabled)
+        self._selection_timeout_spin.setValue(
+            int(settings.selection_translate.popup_timeout_s)
+        )
 
     def apply_to_settings(self, settings: AppSettings) -> AppSettings:
         """把控件当前值写回 settings 并返回。
@@ -543,6 +579,10 @@ class SettingsWindow(QWidget):
             dictate_zh=self._dictate_zh_edit.config_text() or settings.hotkeys.dictate_zh,
             dictate_en=self._dictate_en_edit.config_text() or settings.hotkeys.dictate_en,
             cancel=self._cancel_edit.config_text() or settings.hotkeys.cancel,
+            selection_translate=(
+                self._selection_translate_edit.config_text()
+                or settings.hotkeys.selection_translate
+            ),
         )
         settings.hotkeys = hk
         # ASR
@@ -573,6 +613,14 @@ class SettingsWindow(QWidget):
             rewrite_style=self._current_rewrite_style(),
         )
         settings.personalize = personalize
+        # 划词翻译
+        selection_translate = dataclasses.replace(
+            settings.selection_translate,
+            enabled=self._selection_enabled_check.isChecked(),
+            auto_trigger=self._selection_auto_check.isChecked(),
+            popup_timeout_s=int(self._selection_timeout_spin.value()),
+        )
+        settings.selection_translate = selection_translate
         return settings
 
     # ==================== 一键重置 ====================
@@ -581,7 +629,8 @@ class SettingsWindow(QWidget):
         """把非翻译页控件重置为 dataclass 默认值（仅改 UI，不持久化）。
 
         重置范围：常规(enabled=True + UiSettings 默认)、快捷键(HotkeySettings 默认)、
-        语音识别(AsrSettings 默认)、个性化(PersonalizeSettings 默认)。
+        语音识别(AsrSettings 默认)、个性化(PersonalizeSettings 默认)、
+        划词翻译(SelectionTranslateSettings 默认)。
         翻译页内容（profiles / active / 编辑区）完全不动。
         用户仍需点「应用/确定」才落盘，与现有编辑行为一致。
         """
@@ -589,6 +638,7 @@ class SettingsWindow(QWidget):
         default_hk = HotkeySettings()
         default_asr = AsrSettings()
         default_personalize = PersonalizeSettings()
+        default_selection = SelectionTranslateSettings()
         # 常规
         self._enable_check.setChecked(True)
         self._autostart_check.setChecked(default_ui.launch_at_login)
@@ -598,6 +648,7 @@ class SettingsWindow(QWidget):
         self._dictate_zh_edit.set_config_text(default_hk.dictate_zh)
         self._dictate_en_edit.set_config_text(default_hk.dictate_en)
         self._cancel_edit.set_config_text(default_hk.cancel)
+        self._selection_translate_edit.set_config_text(default_hk.selection_translate)
         # ASR
         self._max_record_spin.setValue(int(default_asr.max_record_seconds))
         self._select_mic(default_asr.mic_device_index)
@@ -606,6 +657,11 @@ class SettingsWindow(QWidget):
         self._suffix_edit.setText(default_personalize.suffix_text)
         self._suffix_edit.setEnabled(default_personalize.suffix_enabled)
         self._set_rewrite_style(default_personalize.rewrite_style)
+        # 划词翻译
+        self._selection_enabled_check.setChecked(default_selection.enabled)
+        self._selection_auto_check.setChecked(default_selection.auto_trigger)
+        self._selection_auto_check.setEnabled(default_selection.enabled)
+        self._selection_timeout_spin.setValue(int(default_selection.popup_timeout_s))
         # 状态提示
         self._reset_status_label.setText("已恢复默认值，点击应用生效")
 
@@ -613,7 +669,7 @@ class SettingsWindow(QWidget):
         btn = QMessageBox.question(
             self,
             "恢复默认设置",
-            "将恢复常规、快捷键、语音识别、界面、个性化设置为默认值，翻译配置不受影响。是否继续？",
+            "将恢复常规、快捷键、语音识别、界面、个性化、划词翻译设置为默认值，翻译配置不受影响。是否继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )

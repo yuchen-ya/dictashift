@@ -56,7 +56,11 @@ class GoogleFreeBackend(TranslationBackend):
         - HTTP 非 200：TranslationError(status_code=实际码)。
         - 网络/超时：TranslationError(status_code=None)。
         """
-        url = _build_gtx_url(text)
+        # 按 profile.direction 决定 source/target；未知值一律按 zh2en 处理（防御性）。
+        if profile.direction == "en2zh":
+            url = _build_gtx_url(text, source="en", target="zh-CN")
+        else:
+            url = _build_gtx_url(text, source="zh-CN", target="en")
         headers = {"User-Agent": _DESKTOP_CHROME_UA}
 
         try:

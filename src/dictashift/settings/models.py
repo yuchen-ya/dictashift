@@ -37,6 +37,7 @@ def profile_to_dict(profile: TranslationProfile) -> dict:
         "temperature": profile.temperature,
         "timeout": profile.timeout,
         "backend_type": profile.backend_type,
+        "direction": profile.direction,
     }
 
 
@@ -51,6 +52,9 @@ def profile_from_dict(d: dict) -> TranslationProfile:
         timeout=d.get("timeout", 60.0),
         # 缺失时默认 openai_compatible（旧配置无感迁移）
         backend_type=d.get("backend_type", "openai_compatible"),
+        # 缺失时默认 zh2en（旧配置无感迁移）；未知值不在此归一，
+        # 由后端防御性按 zh2en 处理（见 translation/base.py 字段注释）
+        direction=d.get("direction", "zh2en"),
     )
 
 
@@ -76,13 +80,15 @@ def default_cloud_profile() -> TranslationProfile:
 class HotkeySettings:
     """快捷键配置（归一化前的配置字符串）。
 
-    默认值：dictate_zh=f8, dictate_en=f9, toggle_enabled=ctrl+alt+f12, cancel=esc。
+    默认值：dictate_zh=f8, dictate_en=f9, toggle_enabled=ctrl+alt+f12, cancel=esc,
+    selection_translate=f7（划词翻译手动触发；旧配置缺该键时回退 f7）。
     """
 
     dictate_zh: str = "f8"
     dictate_en: str = "f9"
     toggle_enabled: str = "ctrl+alt+f12"
     cancel: str = "esc"
+    selection_translate: str = "f7"
 
     def to_dict(self) -> dict:
         return {
@@ -90,6 +96,7 @@ class HotkeySettings:
             "dictate_en": self.dictate_en,
             "toggle_enabled": self.toggle_enabled,
             "cancel": self.cancel,
+            "selection_translate": self.selection_translate,
         }
 
     @classmethod
@@ -101,6 +108,7 @@ class HotkeySettings:
             dictate_en=d.get("dictate_en", "f9"),
             toggle_enabled=d.get("toggle_enabled", "ctrl+alt+f12"),
             cancel=d.get("cancel", "esc"),
+            selection_translate=d.get("selection_translate", "f7"),
         )
 
 
@@ -282,12 +290,50 @@ class PersonalizeSettings:
         )
 
 
+# ==================== 划词翻译 ====================
+
+
+@dataclass
+class SelectionTranslateSettings:
+    """划词翻译配置。
+
+    enabled：总开关，默认 False（功能默认关闭，需用户显式开启）。
+    auto_trigger：划选文字后自动弹出翻译，默认 True；关闭时鼠标划选不触发，
+        仅手动快捷键（hotkeys.selection_translate，默认 F7）可用。
+    popup_timeout_s：悬浮卡片自动关闭秒数，默认 10（设置页可调 5~60）。
+
+    迁移（from_dict）：旧 settings.json 无 selection_translate 键时整体取默认值；
+    字段缺失逐项回退默认；忽略未知键。
+    """
+
+    enabled: bool = False
+    auto_trigger: bool = True
+    popup_timeout_s: int = 10
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "auto_trigger": self.auto_trigger,
+            "popup_timeout_s": self.popup_timeout_s,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict | None = None) -> "SelectionTranslateSettings":
+        if not d:
+            return cls()
+        return cls(
+            enabled=d.get("enabled", False),
+            auto_trigger=d.get("auto_trigger", True),
+            popup_timeout_s=d.get("popup_timeout_s", 10),
+        )
+
+
 # ==================== 顶层配置 ====================
 
 
 @dataclass
 class AppSettings:
-    """应用顶层配置：enabled + 五个子配置。
+    """应用顶层配置：enabled + 六个子配置。
 
     默认 enabled=True。
     """
@@ -298,6 +344,9 @@ class AppSettings:
     translation: TranslationSettings = field(default_factory=TranslationSettings)
     ui: UiSettings = field(default_factory=UiSettings)
     personalize: PersonalizeSettings = field(default_factory=PersonalizeSettings)
+    selection_translate: SelectionTranslateSettings = field(
+        default_factory=SelectionTranslateSettings
+    )
 
     def to_dict(self) -> dict:
         return {
@@ -307,6 +356,7 @@ class AppSettings:
             "translation": self.translation.to_dict(),
             "ui": self.ui.to_dict(),
             "personalize": self.personalize.to_dict(),
+            "selection_translate": self.selection_translate.to_dict(),
         }
 
     @classmethod
@@ -320,4 +370,7 @@ class AppSettings:
             translation=TranslationSettings.from_dict(d.get("translation")),
             ui=UiSettings.from_dict(d.get("ui")),
             personalize=PersonalizeSettings.from_dict(d.get("personalize")),
+            selection_translate=SelectionTranslateSettings.from_dict(
+                d.get("selection_translate")
+            ),
         )

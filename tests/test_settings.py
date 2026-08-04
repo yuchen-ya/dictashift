@@ -20,6 +20,7 @@ from dictashift.settings import (
     AppSettings,
     AsrSettings,
     HotkeySettings,
+    SelectionTranslateSettings,
     SettingsRepository,
     TranslationSettings,
     UiSettings,
@@ -349,4 +350,67 @@ def test_default_settings_path_under_app_data_dir(monkeypatch) -> None:
     monkeypatch.setenv("APPDATA", str(Path("C:/Users/fake/AppData/Roaming")))
     monkeypatch.setattr(Path, "home", lambda: Path("C:/Users/fake"))
     assert _default_settings_path() == app_data_dir() / "settings.json"
+
+
+# ==================== SelectionTranslateSettings ====================
+
+
+def test_selection_translate_settings_defaults() -> None:
+    """默认关闭（enabled=False），自动触发开，弹窗 10 秒。"""
+    s = SelectionTranslateSettings()
+    assert s.enabled is False
+    assert s.auto_trigger is True
+    assert s.popup_timeout_s == 10
+
+
+def test_selection_translate_settings_round_trip() -> None:
+    """to_dict/from_dict 序列化往返稳定。"""
+    s = SelectionTranslateSettings(enabled=True, auto_trigger=False, popup_timeout_s=30)
+    assert SelectionTranslateSettings.from_dict(s.to_dict()) == s
+
+
+def test_selection_translate_settings_from_dict_partial_fallback() -> None:
+    """字段缺失逐项回退默认；未知键忽略。"""
+    s = SelectionTranslateSettings.from_dict({"enabled": True, "unknown": 1})
+    assert s.enabled is True
+    assert s.auto_trigger is True
+    assert s.popup_timeout_s == 10
+
+
+def test_selection_translate_settings_from_dict_none_uses_defaults() -> None:
+    assert SelectionTranslateSettings.from_dict(None) == SelectionTranslateSettings()
+
+
+def test_app_settings_selection_translate_defaults() -> None:
+    s = AppSettings()
+    assert isinstance(s.selection_translate, SelectionTranslateSettings)
+    assert s.selection_translate.enabled is False
+
+
+def test_app_settings_round_trip_includes_selection_translate() -> None:
+    s = AppSettings()
+    s.selection_translate = SelectionTranslateSettings(
+        enabled=True, auto_trigger=False, popup_timeout_s=45
+    )
+    s.hotkeys = HotkeySettings(selection_translate="ctrl+f7")
+    s2 = AppSettings.from_dict(s.to_dict())
+    assert s2 == s
+
+
+def test_app_settings_old_json_without_selection_translate() -> None:
+    """旧 settings.json 无 selection_translate 键 -> 整体取默认值（无感迁移）。"""
+    d = AppSettings().to_dict()
+    del d["selection_translate"]
+    s = AppSettings.from_dict(d)
+    assert s.selection_translate == SelectionTranslateSettings()
+
+
+def test_hotkey_settings_selection_translate_default_f7() -> None:
+    """新 action selection_translate 默认绑定 F7；旧配置缺该键回退 f7。"""
+    assert HotkeySettings().selection_translate == "f7"
+    hk = HotkeySettings.from_dict({"dictate_zh": "f8"})
+    assert hk.selection_translate == "f7"
+    # 自定义值往返稳定
+    hk2 = HotkeySettings(selection_translate="ctrl+shift+f7")
+    assert HotkeySettings.from_dict(hk2.to_dict()).selection_translate == "ctrl+shift+f7"
 

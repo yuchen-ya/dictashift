@@ -24,6 +24,7 @@ from dictashift.settings import (
     AsrSettings,
     HotkeySettings,
     PersonalizeSettings,
+    SelectionTranslateSettings,
     UiSettings,
 )
 from dictashift.translation import (
@@ -533,3 +534,82 @@ class TestClearDataButton:
         win.clear_data_requested.connect(lambda: got.append(1))
         win._clear_data_btn.click()
         assert got == [1]
+
+
+# ==================== 划词翻译设置项 ====================
+
+
+class TestSelectionTranslateUi:
+    def test_hotkeys_tab_has_selection_row(self, win) -> None:
+        """「快捷键」页新增划词翻译录入行（复用 HotkeyEdit）。"""
+        assert hasattr(win, "_selection_translate_edit")
+
+    def test_translation_tab_controls_exist(self, win) -> None:
+        """「翻译」页划词翻译分组：总开关/自动弹出/弹窗时长（5~60 秒）。"""
+        assert hasattr(win, "_selection_enabled_check")
+        assert hasattr(win, "_selection_auto_check")
+        assert hasattr(win, "_selection_timeout_spin")
+        assert win._selection_timeout_spin.minimum() == 5
+        assert win._selection_timeout_spin.maximum() == 60
+
+    def test_auto_check_follows_master_switch(self, win) -> None:
+        """「自动弹出」依赖总开关：未启用划词翻译时置灰。"""
+        win._selection_enabled_check.setChecked(False)
+        assert win._selection_auto_check.isEnabled() is False
+        win._selection_enabled_check.setChecked(True)
+        assert win._selection_auto_check.isEnabled() is True
+
+    def test_load_from_settings(self, win) -> None:
+        s = AppSettings()
+        s.selection_translate = SelectionTranslateSettings(
+            enabled=True, auto_trigger=False, popup_timeout_s=30
+        )
+        s.hotkeys = HotkeySettings(selection_translate="ctrl+f7")
+        win.load_from_settings(s)
+        assert win._selection_enabled_check.isChecked() is True
+        assert win._selection_auto_check.isChecked() is False
+        assert win._selection_auto_check.isEnabled() is True
+        assert win._selection_timeout_spin.value() == 30
+        assert win._selection_translate_edit.config_text() == "ctrl+f7"
+
+    def test_load_defaults_master_off_greys_auto(self, win) -> None:
+        """默认（总开关关）载入后「自动弹出」置灰。"""
+        win.load_from_settings(AppSettings())
+        assert win._selection_enabled_check.isChecked() is False
+        assert win._selection_auto_check.isEnabled() is False
+        assert win._selection_timeout_spin.value() == 10
+        assert win._selection_translate_edit.config_text() == "f7"
+
+    def test_apply_to_settings(self, win) -> None:
+        win.load_from_settings(AppSettings())
+        win._selection_enabled_check.setChecked(True)
+        win._selection_auto_check.setChecked(False)
+        win._selection_timeout_spin.setValue(45)
+        win._selection_translate_edit.set_config_text("shift+f7")
+        out = win.apply_to_settings(AppSettings())
+        assert out.selection_translate.enabled is True
+        assert out.selection_translate.auto_trigger is False
+        assert out.selection_translate.popup_timeout_s == 45
+        assert out.hotkeys.selection_translate == "shift+f7"
+
+    def test_load_apply_round_trip(self, win) -> None:
+        s = AppSettings()
+        s.selection_translate = SelectionTranslateSettings(
+            enabled=True, auto_trigger=True, popup_timeout_s=20
+        )
+        win.load_from_settings(s)
+        out = win.apply_to_settings(s)
+        assert out.selection_translate == s.selection_translate
+
+    def test_reset_to_defaults(self, win) -> None:
+        s = AppSettings()
+        s.selection_translate = SelectionTranslateSettings(
+            enabled=True, auto_trigger=False, popup_timeout_s=50
+        )
+        s.hotkeys = HotkeySettings(selection_translate="ctrl+f7")
+        win.load_from_settings(s)
+        win.reset_to_defaults()
+        assert win._selection_enabled_check.isChecked() is False
+        assert win._selection_auto_check.isChecked() is True
+        assert win._selection_timeout_spin.value() == 10
+        assert win._selection_translate_edit.config_text() == "f7"

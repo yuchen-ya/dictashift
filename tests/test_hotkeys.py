@@ -256,3 +256,20 @@ def test_double_start_raises_runtime_error() -> None:
             svc.start()
     finally:
         svc.stop()
+
+
+def test_selection_translate_is_press_only() -> None:
+    """selection_translate（划词翻译）是 press-only action：只触发 on_press。"""
+    assert "selection_translate" in _PRESS_ONLY_ACTIONS
+
+    presses: list[str] = []
+    releases: list[str] = []
+    svc = _make_service(
+        [HotkeyBinding(action="selection_translate", keys=frozenset({"f7"}))],
+        on_press=presses.append,
+        on_release=releases.append,
+    )
+    _press(svc, "f7")
+    _release(svc, "f7")
+    assert presses == ["selection_translate"]
+    assert releases == []

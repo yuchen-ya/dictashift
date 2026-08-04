@@ -10,7 +10,7 @@ import logging
 import httpx
 
 from .base import TranslationBackend, TranslationProfile, TranslationError
-from .profiles import SYSTEM_PROMPT_ZH2EN
+from .profiles import SYSTEM_PROMPT_EN2ZH, SYSTEM_PROMPT_ZH2EN
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,13 @@ class OpenAICompatibleBackend(TranslationBackend):
         - httpx.TransportError / 超时：包装为 TranslationError(status_code=None)。
         - 任何异常信息中不含 api_key 或 Authorization 头内容。
         """
-        yield from self._stream(text, profile, SYSTEM_PROMPT_ZH2EN)
+        # 按 profile.direction 选择系统提示词；未知值一律按 zh2en 处理（防御性）。
+        prompt = (
+            SYSTEM_PROMPT_EN2ZH
+            if profile.direction == "en2zh"
+            else SYSTEM_PROMPT_ZH2EN
+        )
+        yield from self._stream(text, profile, prompt)
 
     def rewrite_stream(
         self, text: str, profile: TranslationProfile, system_prompt: str

@@ -22,6 +22,10 @@ class TranslationProfile:
     # 后端类型路由：openai_compatible | google | bing
     # 默认 openai_compatible 保证旧配置/旧代码构造不受影响。
     backend_type: str = "openai_compatible"
+    # 翻译方向：zh2en（中→英）| en2zh（英→中）。
+    # 默认 zh2en 保证旧配置/旧代码构造不受影响；
+    # 后端对未知 direction 值一律按 zh2en 处理（防御性）。
+    direction: str = "zh2en"
 
 
 class TranslationError(Exception):
