@@ -5,8 +5,8 @@
   空剪贴板、不可复制格式跳过计数、SetClipboardData 失败时句柄释放、GDI 格式路径。
 - capture：本进程守卫 skipped_self；序列号未变 no_text 且不还原；无文本/空白
   no_text 且还原；超长 too_long；正常 success；simulate_copy 抛错也完成还原。
-- SelectionService：拖拽阈值 / 冷却期抑制；手动与自动触发走同一处理路径；
-  start/stop 生命周期。
+- SelectionService：拖拽阈值（含从右往左划选各向同性）/ 冷却期抑制；
+  on_press_activity 任意左键按下通知；start/stop 生命周期。
 
 Win32 / pynput 全部 monkeypatch 掉，不依赖真实剪贴板与全局监听。
 """
@@ -678,8 +678,16 @@ def test_drag_above_threshold_triggered() -> None:
     svc = _make_service(drag_threshold_px=10.0)
     _drag(svc, 100, 100, 130, 100)  # 距离 30 > 10
     event = svc._queue.get_nowait()
-    assert event.kind == "drag"
     assert (event.x, event.y) == (130, 100)
+
+
+def test_drag_right_to_left_triggered() -> None:
+    """从右往左划选回归：press(200,100) -> release(40,100)，
+    距离 160 超阈值必须触发（距离判定各向同性）。"""
+    svc = _make_service(drag_threshold_px=10.0)
+    _drag(svc, 200, 100, 40, 100)
+    event = svc._queue.get_nowait()
+    assert (event.x, event.y) == (40, 100)
 
 
 def test_cooldown_suppresses_repeat_trigger() -> None:
@@ -715,8 +723,8 @@ def test_right_button_ignored() -> None:
         svc._queue.get_nowait()
 
 
-def test_manual_and_drag_share_same_path() -> None:
-    """手动触发与划选触发走同一队列 -> 同一 capture -> 同一 on_result。"""
+def test_two_drags_share_same_capture_path() -> None:
+    """连续两次划选走同一队列 -> 同一 capture -> 同一 on_result。"""
     from dictashift.selection.capture import CaptureResult
 
     results: list[CaptureResult] = []
@@ -730,6 +738,7 @@ def test_manual_and_drag_share_same_path() -> None:
         on_result=results.append,
         capture_func=fake_capture,
         drag_threshold_px=10.0,
+        cooldown_s=0.0,
     )
 
     class _FakeListener:
@@ -745,8 +754,8 @@ def test_manual_and_drag_share_same_path() -> None:
     svc._create_listener = lambda: _FakeListener()  # type: ignore[method-assign]
     svc.start()
     try:
-        _drag(svc, 100, 100, 140, 100)  # 自动划选
-        svc.trigger_manual()  # 手动触发
+        _drag(svc, 100, 100, 140, 100)
+        _drag(svc, 200, 200, 240, 200)
         svc._queue.join()  # 等消费线程处理完两个事件
     finally:
         svc.stop()
@@ -793,7 +802,9 @@ def test_capture_exception_does_not_kill_consumer() -> None:
             raise RuntimeError("模拟取词异常")
         return CaptureResult(CaptureStatus.SUCCESS, text="ok")
 
-    svc = _make_service(on_result=results.append, capture_func=flaky_capture)
+    svc = _make_service(
+        on_result=results.append, capture_func=flaky_capture, cooldown_s=0.0
+    )
 
     class _FakeListener:
         def start(self) -> None:
@@ -808,8 +819,8 @@ def test_capture_exception_does_not_kill_consumer() -> None:
     svc._create_listener = lambda: _FakeListener()  # type: ignore[method-assign]
     svc.start()
     try:
-        svc.trigger_manual()
-        svc.trigger_manual()
+        _drag(svc, 100, 100, 140, 100)
+        _drag(svc, 200, 200, 240, 200)
         svc._queue.join()
     finally:
         svc.stop()
@@ -819,19 +830,6 @@ def test_capture_exception_does_not_kill_consumer() -> None:
 
 
 # ==================== SelectionService.set_auto_trigger ====================
-
-
-class _FakeListener:
-    """不启动真实全局监听的 listener 替身。"""
-
-    def start(self) -> None:
-        pass
-
-    def stop(self) -> None:
-        pass
-
-    def join(self, timeout=None) -> None:
-        pass
 
 
 def test_auto_trigger_disabled_ignores_drag() -> None:
@@ -850,7 +848,7 @@ def test_auto_trigger_reenable_restores_drag() -> None:
     svc.set_auto_trigger(True)
     _drag(svc, 100, 100, 140, 100)
     event = svc._queue.get_nowait()
-    assert event.kind == "drag"
+    assert (event.x, event.y) == (140, 100)
 
 
 def test_auto_trigger_disable_clears_pending_press() -> None:
@@ -864,24 +862,45 @@ def test_auto_trigger_disable_clears_pending_press() -> None:
         svc._queue.get_nowait()
 
 
-def test_auto_trigger_disabled_still_allows_manual() -> None:
-    """auto_trigger 关闭时手动触发仍可用（与划选同一处理路径）。"""
-    from dictashift.selection.capture import CaptureResult
+# ==================== SelectionService.on_press_activity ====================
 
-    results: list[CaptureResult] = []
 
-    def fake_capture() -> CaptureResult:
-        return CaptureResult(CaptureStatus.SUCCESS, text="manual-ok")
+def test_press_activity_fired_on_left_press_only() -> None:
+    """on_press_activity：左键按下触发一次；松开与右键不触发。"""
+    calls: list[int] = []
+    svc = SelectionService(
+        on_result=lambda r: None,
+        on_press_activity=lambda: calls.append(1),
+        cooldown_s=0.0,
+    )
+    svc._on_click(100, 100, mouse.Button.left, True)
+    svc._on_click(100, 100, mouse.Button.left, False)
+    svc._on_click(100, 100, mouse.Button.right, True)
+    assert calls == [1]
 
-    svc = _make_service(on_result=results.append, capture_func=fake_capture)
-    svc._create_listener = lambda: _FakeListener()  # type: ignore[method-assign]
-    svc.start()
-    try:
-        svc.set_auto_trigger(False)
-        _drag(svc, 100, 100, 140, 100)  # 划选被丢弃
-        svc.trigger_manual()  # 手动触发可用
-        svc._queue.join()
-    finally:
-        svc.stop()
 
-    assert [r.text for r in results] == ["manual-ok"]
+def test_press_activity_fired_even_when_auto_trigger_disabled() -> None:
+    """auto_trigger 关闭时按下活动通知仍触发（供装配层收起旧弹窗）。"""
+    calls: list[int] = []
+    svc = SelectionService(
+        on_result=lambda r: None,
+        on_press_activity=lambda: calls.append(1),
+    )
+    svc.set_auto_trigger(False)
+    svc._on_click(100, 100, mouse.Button.left, True)
+    assert calls == [1]
+
+
+def test_press_activity_exception_does_not_break_click() -> None:
+    """on_press_activity 抛异常：不影响后续划选判定（按下位置仍被记录）。"""
+    def boom() -> None:
+        raise RuntimeError("模拟活动回调异常")
+
+    svc = SelectionService(
+        on_result=lambda r: None,
+        on_press_activity=boom,
+        drag_threshold_px=10.0,
+    )
+    _drag(svc, 100, 100, 140, 100)
+    event = svc._queue.get_nowait()
+    assert (event.x, event.y) == (140, 100)

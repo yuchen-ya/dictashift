@@ -14,10 +14,12 @@
   最小工作：更新 _current_action + 把事件入 FIFO 队列后立即返回。controller 调用
   （含 recorder.start/stop 的 PortAudio 阻塞）由单线程消费线程按序执行，
   避免 pynput 监听线程被阻塞导致按键不跟手、松开事件延迟处理。
-- 划词翻译：热键 action selection_translate 在本层直接路由到
-  SelectionService.trigger_manual()（单次触发语义），不进入 controller 听写流水线；
+- 划词翻译：热键 action selection_translate 是「划词翻译开关」（单次触发语义），
+  在本层路由为翻转 settings.selection_translate.enabled 并落盘，
+  不进入 controller 听写流水线；
   SelectionService 消费线程取词后经 _Bridge queued signal 驱动 SelectionPopup，
-  翻译（网络阻塞）在一次性后台线程执行，不进 UI 线程也不占用取词消费线程。
+  翻译（网络阻塞，失败自动重试一次）在一次性后台线程执行，
+  不进 UI 线程也不占用取词消费线程；弹窗只在有最终结果时出现（无 loading 态）。
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import logging
 import queue
 import shutil
 import threading
+import time
 
 from PySide6.QtCore import QObject, Signal, Qt
 from PySide6.QtWidgets import QApplication
@@ -52,6 +55,10 @@ from .ui.tray import TrayIcon
 
 logger = logging.getLogger(__name__)
 
+# 划词翻译网络错误自动重试间隔（秒）：瞬断（如 RemoteProtocolError）常见，
+# 首次失败后间隔重试一次，再失败才弹错误卡片。
+_SELECTION_RETRY_DELAY_S = 0.8
+
 
 # ==================== 回调 -> 主线程桥接 ====================
 
@@ -71,7 +78,8 @@ class _Bridge(QObject):
     test_conn_result = Signal(bool, str)  # 翻译测试连接结果（ok, message）
     model_progress = Signal(int)       # 模型下载进度百分比（<0 表示总大小未知）
     model_download_done = Signal(bool, str)  # 模型下载完成（ok, message）
-    selection_loading = Signal()       # 划词取词成功，翻译进行中
+    selection_toggle = Signal()      # 划词翻译开关热键按下（pynput 线程 emit）
+    press_activity = Signal()        # 任意左键按下（用于立即收起划词弹窗）
     selection_result = Signal(str)     # 划词翻译译文
     selection_error = Signal(str)      # 划词翻译错误提示（简短脱敏）
 
@@ -170,13 +178,18 @@ class DictaShiftApplication:
         self._result_popup = ResultPopup()
 
         # ---- 划词翻译：取词服务 + 悬浮卡片 ----
-        # 悬浮卡片在主线程创建，经 queued signal 驱动（show_loading/show_result/show_error）。
+        # 悬浮卡片在主线程创建，经 queued signal 驱动（show_result/show_error）。
         self._selection_popup = SelectionPopup(
             auto_close_seconds=self.settings.selection_translate.popup_timeout_s
         )
         # 取词服务：pynput 鼠标监听 -> FIFO 队列 -> 单消费线程取词 ->
         # on_result（消费线程）在本层分支后 queued 到主线程。
-        self._selection = SelectionService(on_result=self._on_selection_result)
+        # on_press_activity：任意左键按下时（pynput 监听线程）emit press_activity，
+        # queued 到主线程立即收起旧弹窗，缩短弹窗拦截后续划选起点按压的时间窗。
+        self._selection = SelectionService(
+            on_result=self._on_selection_result,
+            on_press_activity=self._bridge.press_activity.emit,
+        )
         self._selection.set_auto_trigger(self.settings.selection_translate.auto_trigger)
         # 服务运行状态（start/stop 由 _apply_selection_settings 统一管理）。
         self._selection_started = False
@@ -211,9 +224,12 @@ class DictaShiftApplication:
         self._bridge.model_download_done.connect(
             self._on_model_download_done, Qt.QueuedConnection
         )
-        # 划词翻译：取词/翻译线程 -> 主线程悬浮卡片。
-        self._bridge.selection_loading.connect(
-            self._on_selection_loading, Qt.QueuedConnection
+        # 划词翻译：取词/翻译线程 -> 主线程悬浮卡片（只在有最终结果时出现）。
+        self._bridge.selection_toggle.connect(
+            self._on_selection_toggle, Qt.QueuedConnection
+        )
+        self._bridge.press_activity.connect(
+            self._on_press_activity, Qt.QueuedConnection
         )
         self._bridge.selection_result.connect(
             self._on_selection_result_ready, Qt.QueuedConnection
@@ -485,11 +501,12 @@ class DictaShiftApplication:
         controller 调用（含 recorder.start 的 PortAudio 阻塞）由消费线程
         按序执行，避免阻塞 pynput 监听线程导致按键不跟手。
 
-        selection_translate 是单次触发语义：直接路由到 SelectionService
-        （trigger_manual 仅入队，非阻塞），不进入 controller 听写流水线。
+        selection_translate 是「划词翻译开关」（单次触发语义）：emit
+        selection_toggle 经 queued 到主线程翻转功能启停（翻转设置/启停服务/
+        落盘/托盘反馈都不是 pynput 线程安全操作），不进入 controller 听写流水线。
         """
         if action == "selection_translate":
-            self._trigger_selection_translate()
+            self._bridge.selection_toggle.emit()
             return
         with self._action_lock:
             if action in ("dictate_zh", "dictate_en"):
@@ -581,21 +598,30 @@ class DictaShiftApplication:
 
     # ==================== 划词翻译 ====================
 
-    def _trigger_selection_translate(self) -> None:
-        """热键「划词翻译」入口（pynput 监听线程）：服务运行中才触发手动取词。
+    def _on_selection_toggle(self) -> None:
+        """热键「划词翻译开关」（主线程槽）：翻转 enabled -> 应用 -> 落盘 -> 托盘反馈。
 
-        trigger_manual 只是入队操作（非阻塞），符合 pynput 回调约束；
-        功能未启用（服务未运行）时静默忽略。
+        与 _on_settings_applied 同路径生效（_apply_selection_settings 启停服务），
+        落盘方式与设置应用一致（repo.save 失败仅记日志，不影响本次切换）。
+        设置窗口若已打开不做实时联动（下次 load_from_settings 时刷新）。
         """
-        if self._selection_started:
-            self._selection.trigger_manual()
+        cfg = self.settings.selection_translate
+        cfg.enabled = not cfg.enabled
+        self._apply_selection_settings()
+        try:
+            self._repo.save(self.settings)
+        except Exception:  # noqa: BLE001
+            logger.exception("[DictaShiftApplication] 保存设置失败")
+        self._tray.show_message(
+            "DictaShift", "划词翻译已开启" if cfg.enabled else "划词翻译已关闭"
+        )
 
     def _on_selection_result(self, result: CaptureResult) -> None:
         """SelectionService 消费线程回调：按 CaptureStatus 分支。
 
-        - success：queued 通知主线程 show_loading，随后一次性后台线程执行翻译
-          （网络阻塞：绝不在 UI 线程——AGENTS.md 11；也不占用取词消费线程，
-          避免一次慢翻译（最长 profile.timeout）阻塞后续取词）。
+        - success：一次性后台线程执行翻译（网络阻塞：绝不在 UI 线程——AGENTS.md 11；
+          也不占用取词消费线程，避免一次慢翻译（最长 profile.timeout）阻塞后续取词），
+          完成后 queued 通知主线程 show_result（弹窗只在有最终结果时出现）。
         - too_long：queued show_error 提示用户缩短选区。
         - no_text / skipped_self：静默（仅日志），不打扰用户。
         - error：queued show_error。取词已尽力还原剪贴板，但用户触发了功能却
@@ -603,7 +629,6 @@ class DictaShiftApplication:
           只是展示位置换成划词悬浮卡片（比托盘气泡更贴近触发点）。
         """
         if result.status is CaptureStatus.SUCCESS and result.text:
-            self._bridge.selection_loading.emit()
             with self._selection_seq_lock:
                 self._selection_seq += 1
                 seq = self._selection_seq
@@ -625,6 +650,8 @@ class DictaShiftApplication:
     def _start_selection_translate(self, text: str, seq: int) -> None:
         """一次性后台线程执行划词翻译：detect_direction -> 方向化 profile -> translate。
 
+        网络错误（如 RemoteProtocolError 瞬断）自动重试一次（间隔
+        _SELECTION_RETRY_DELAY_S），再失败才弹错误卡片；两次失败都记日志。
         完成/失败后按 seq 校验是否仍是最新请求（用户可能已触发新取词），
         过期结果直接丢弃，避免旧译文覆盖新弹窗内容。
         """
@@ -640,7 +667,15 @@ class DictaShiftApplication:
                 else:
                     direction = detect_direction(text)
                     directed = dataclasses.replace(profile, direction=direction)
-                    translated = backend.translate(text, directed)
+                    try:
+                        translated = backend.translate(text, directed)
+                    except Exception:  # noqa: BLE001 - 首次失败记日志并重试一次
+                        logger.warning(
+                            "[DictaShiftApplication] 划词翻译首次失败，%.1fs 后重试一次",
+                            _SELECTION_RETRY_DELAY_S, exc_info=True,
+                        )
+                        time.sleep(_SELECTION_RETRY_DELAY_S)
+                        translated = backend.translate(text, directed)
                     if not translated or not translated.strip():
                         translated = None
                         msg = "翻译失败：空响应"
@@ -663,8 +698,13 @@ class DictaShiftApplication:
 
     # ---- 划词悬浮卡片槽（主线程，经 queued signal 触发）----
 
-    def _on_selection_loading(self) -> None:
-        self._selection_popup.show_loading()
+    def _on_press_activity(self) -> None:
+        """任意左键按下（queued 主线程）：立即收起旧弹窗。
+
+        缩短弹窗拦截后续划选起点按压的时间窗；不能消除「按压正好落在弹窗上
+        被吃掉」的场景（按压事件先于 queued hide 到达弹窗）。
+        """
+        self._selection_popup.hide()
 
     def _on_selection_result_ready(self, text: str) -> None:
         self._selection_popup.show_result(text)
@@ -684,9 +724,9 @@ class DictaShiftApplication:
         """按当前 settings 应用划词翻译配置（startup 与 _on_settings_applied 共用）。
 
         - enabled：开 -> start（已由 _selection_started 保证不重复 start），
-          关 -> stop；手动触发随服务停止而不可用。
+          关 -> stop（F7 开关与设置页勾选同源，均走本方法生效）。
         - auto_trigger：False 时鼠标划选不触发（service 内部丢弃事件，
-          listener 与消费线程保持运行），手动快捷键触发不受影响。
+          listener 与消费线程保持运行）。
         - popup_timeout_s：更新 SelectionPopup 自动关闭秒数。
         """
         cfg = self.settings.selection_translate

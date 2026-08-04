@@ -1,14 +1,16 @@
-"""SelectionPopup（划词翻译悬浮卡片）的 offscreen UI 测试。
+"""SelectionPopup（划词翻译极简悬浮卡片）的 offscreen UI 测试。
 
 测试目标：
-- 三态切换：show_loading（「翻译中…」+ 复制禁用）/ show_result（译文可复制）/
-  show_error（标题「出错了」，可复制错误文本）。
+- 两态切换：show_result（译文可复制）/ show_error（简短错误文本，可复制）。
+  无 loading 态——弹窗只在有最终结果时出现。
+- 极简自适应：短译文是一小条（宽度收缩、文本区一行高）；长译文宽度封顶
+  _MAX_WIDTH 自动换行、文本区高度封顶 _MAX_TEXT_HEIGHT 内部滚动。
 - 不抢焦点：WA_ShowWithoutActivating 属性设置；Frameless|StaysOnTop|Tool flags。
 - 自动关闭：QTimer 单发、interval 由构造参数/set_auto_close_seconds 决定、
   timeout 触发 hide；用户交互（鼠标按下）重置计时。
 - 重复触发：替换内容与状态、重置计时、按新光标位置重新定位。
 - 定位：_place_near_cursor 夹取在屏幕 availableGeometry 内（防出屏）。
-- 复制按钮写剪贴板。
+- 复制按钮写剪贴板；关闭×按钮隐藏弹窗。
 """
 
 from __future__ import annotations
@@ -27,7 +29,9 @@ from dictashift.output.clipboard import get_clipboard_text
 from dictashift.ui.selection_popup import (
     _CURSOR_OFFSET_X,
     _CURSOR_OFFSET_Y,
-    _LOADING_TEXT,
+    _MAX_TEXT_HEIGHT,
+    _MAX_WIDTH,
+    _MIN_WIDTH,
     SelectionPopup,
 )
 
@@ -58,26 +62,20 @@ class TestWindowAttributes:
         assert popup.testAttribute(Qt.WA_TranslucentBackground) is True
 
 
-# ==================== 三态切换 ====================
+# ==================== 两态切换（无 loading 态） ====================
 
 
 class TestStates:
-    def test_show_loading(self, qapp) -> None:
+    def test_no_loading_api(self, qapp) -> None:
+        """对外 API 收敛为 show_result/show_error：不存在 show_loading。"""
         popup = SelectionPopup()
-        popup.show_loading()
-        assert popup._state == "loading"
-        assert popup._text_edit.toPlainText() == _LOADING_TEXT
-        # loading 态复制按钮禁用（避免复制占位文案）。
-        assert popup._copy_btn.isEnabled() is False
-        assert popup.isVisible() is True
-        assert popup._auto_close_timer.isActive() is True
+        assert not hasattr(popup, "show_loading")
 
     def test_show_result(self, qapp) -> None:
         popup = SelectionPopup()
         popup.show_result("translated text")
         assert popup._state == "result"
         assert popup._text_edit.toPlainText() == "translated text"
-        assert popup._title.text() == "划词翻译"
         assert popup._copy_btn.isEnabled() is True
         assert popup.isVisible() is True
 
@@ -85,9 +83,8 @@ class TestStates:
         popup = SelectionPopup()
         popup.show_error("翻译失败：boom")
         assert popup._state == "error"
-        assert popup._title.text() == "出错了"
         assert popup._text_edit.toPlainText() == "翻译失败：boom"
-        # 错误文本可复制（与 ResultPopup.show_error 一致）。
+        # 错误文本可复制。
         assert popup._copy_btn.isEnabled() is True
 
     def test_retrigger_replaces_content_and_state(self, qapp) -> None:
@@ -95,16 +92,44 @@ class TestStates:
         popup = SelectionPopup()
         popup.show_result("first")
         assert popup._state == "result"
-        popup.show_loading()
-        assert popup._state == "loading"
-        assert popup._text_edit.toPlainText() == _LOADING_TEXT
-        assert popup._copy_btn.isEnabled() is False
+        popup.show_error("boom")
+        assert popup._state == "error"
+        assert popup._text_edit.toPlainText() == "boom"
         # 计时器仍在跑（被重置）。
         assert popup._auto_close_timer.isActive() is True
         popup.show_result("second")
         assert popup._state == "result"
         assert popup._text_edit.toPlainText() == "second"
         assert popup._copy_btn.isEnabled() is True
+
+
+# ==================== 极简自适应尺寸 ====================
+
+
+class TestCompactSizing:
+    def test_short_text_is_compact_strip(self, qapp) -> None:
+        """短译文：宽度收缩到下界附近，文本区只有一行高（无大面积空白）。"""
+        popup = SelectionPopup()
+        popup.show_result("你好")
+        qapp.processEvents()
+        assert _MIN_WIDTH <= popup.width() <= 200
+        # 单行文本区高度远小于长译文上限。
+        assert popup._text_edit.height() < 60
+
+    def test_long_single_line_wraps_at_max_width(self, qapp) -> None:
+        """超长单行：宽度封顶 _MAX_WIDTH 并自动换行，高度随换行增长但有上限。"""
+        popup = SelectionPopup()
+        popup.show_result("word " * 200)
+        qapp.processEvents()
+        assert popup.width() == _MAX_WIDTH
+        assert popup._text_edit.height() <= _MAX_TEXT_HEIGHT
+
+    def test_many_lines_capped_with_scroll(self, qapp) -> None:
+        """多行长译文：文本区高度封顶 _MAX_TEXT_HEIGHT（超出内部紧凑滚动）。"""
+        popup = SelectionPopup()
+        popup.show_result("\n".join(f"第{i}行译文" for i in range(50)))
+        qapp.processEvents()
+        assert popup._text_edit.height() == _MAX_TEXT_HEIGHT
 
 
 # ==================== 自动关闭计时 ====================

@@ -5,11 +5,13 @@
   (取词涉及 SendInput 与剪贴板等待，全部在消费线程执行)。
 - 单消费线程从 FIFO 队列取事件，调用注入的 capture_func，
   把结果交给注入的 on_result 回调。
-- 手动触发 trigger_manual() 与划选触发共用同一队列与处理路径，
-  供后续快捷键入口复用。
 - set_auto_trigger(False) 时鼠标划选事件在 _on_click 入口即被丢弃
-  （listener 与消费线程保持运行），手动触发不受影响；
-  供设置页「划选文字后自动弹出翻译」开关热更新。
+  （listener 与消费线程保持运行），供设置页「划选文字后自动弹出翻译」
+  开关热更新；on_press_activity 通知不受影响（任意左键按下都会触发）。
+- on_press_activity（可选）：任意左键按下时调用一次，供装配层立即收起
+  旧弹窗（缩短弹窗拦截后续划选起点按压的时间窗）。
+  线程约束：在 pynput 监听线程内同步调用，必须非阻塞；装配层传入的是
+  Qt signal emit（QueuedConnection 投递到主线程），满足约束。
 - 不 import PySide6：纯逻辑服务，Qt 桥接 (信号投递到主线程) 留给装配层。
 
 可测试性：
@@ -36,9 +38,8 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class SelectionEvent:
-    """一次取词触发。kind: "drag"=划选, "manual"=手动触发 (快捷键入口)。"""
+    """一次划选取词触发（左键按下 -> 拖拽超阈值 -> 松开）。"""
 
-    kind: str
     x: int | None = None  # 划选松开位置 (供后续弹窗定位)
     y: int | None = None
 
@@ -49,7 +50,6 @@ class SelectionService:
     使用方式：
         svc = SelectionService(on_result=handle_result)
         svc.start()            # 启动 mouse.Listener + 消费线程
-        svc.trigger_manual()   # 手动触发一次取词 (同一处理路径)
         svc.stop()
     """
 
@@ -59,11 +59,14 @@ class SelectionService:
         capture_func: Callable[[], CaptureResult] | None = None,
         drag_threshold_px: float = 10.0,
         cooldown_s: float = 0.8,
+        on_press_activity: Callable[[], None] | None = None,
     ) -> None:
         self._on_result_cb = on_result
         self._capture = capture_func or capture_selection
         self._drag_threshold = float(drag_threshold_px)
         self._cooldown = float(cooldown_s)
+        # 任意左键按下活动回调（在 pynput 监听线程调用，必须非阻塞）。
+        self._on_press_activity = on_press_activity
 
         self._lock = threading.Lock()
         # 左键按下位置与时间 (用于拖拽距离判定)。
@@ -122,8 +125,8 @@ class SelectionService:
     def set_auto_trigger(self, enabled: bool) -> None:
         """运行时开关划选自动触发（设置「应用/确定」后由装配层调用）。
 
-        False 时 _on_click 入口即丢弃鼠标事件（不记录按下位置、不入队）；
-        listener 与消费线程保持运行，trigger_manual() 手动触发不受影响。
+        False 时 _on_click 入口即丢弃鼠标划选事件（不记录按下位置、不入队）；
+        listener 与消费线程保持运行，on_press_activity 通知不受影响。
         关闭瞬间丢弃可能残留的按下位置，避免重新开启后误配对旧按下。
         """
         with self._lock:
@@ -131,15 +134,19 @@ class SelectionService:
             if not self._auto_trigger:
                 self._press_pos = None
 
-    def trigger_manual(self) -> None:
-        """手动触发一次取词 (供快捷键入口复用)；与划选走同一队列与处理路径。"""
-        self._queue.put(SelectionEvent(kind="manual"))
-
     def _on_click(self, x: int, y: int, button, pressed: bool) -> None:
         """pynput on_click 回调入口。只做判定与入队，严禁阻塞。"""
         try:
             if button != mouse.Button.left:
                 return
+            if pressed and self._on_press_activity is not None:
+                # 任意左键按下都通知（含 auto_trigger 关闭时）：供装配层立即
+                # 收起旧弹窗。本回调在 pynput 监听线程执行，on_press_activity
+                # 必须非阻塞（装配层传入 Qt signal emit，QueuedConnection 投递）。
+                try:
+                    self._on_press_activity()
+                except Exception:  # noqa: BLE001 - 活动通知失败不得影响划选判定
+                    logger.exception("[SelectionService] on_press_activity 回调异常")
             now = time.monotonic()
             with self._lock:
                 if not self._auto_trigger:
@@ -158,7 +165,7 @@ class SelectionService:
                 if now - self._last_trigger < self._cooldown:
                     return
                 self._last_trigger = now
-            self._queue.put(SelectionEvent(kind="drag", x=x, y=y))
+            self._queue.put(SelectionEvent(x=x, y=y))
         except Exception:  # noqa: BLE001 - 回调线程内不得抛未处理异常
             logger.exception("[SelectionService] on_click 处理异常")
 

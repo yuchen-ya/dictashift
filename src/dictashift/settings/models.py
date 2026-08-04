@@ -81,7 +81,7 @@ class HotkeySettings:
     """快捷键配置（归一化前的配置字符串）。
 
     默认值：dictate_zh=f8, dictate_en=f9, toggle_enabled=ctrl+alt+f12, cancel=esc,
-    selection_translate=f7（划词翻译手动触发；旧配置缺该键时回退 f7）。
+    selection_translate=f7（划词翻译开关；旧配置缺该键时回退 f7）。
     """
 
     dictate_zh: str = "f8"
@@ -298,8 +298,7 @@ class SelectionTranslateSettings:
     """划词翻译配置。
 
     enabled：总开关，默认 False（功能默认关闭，需用户显式开启）。
-    auto_trigger：划选文字后自动弹出翻译，默认 True；关闭时鼠标划选不触发，
-        仅手动快捷键（hotkeys.selection_translate，默认 F7）可用。
+    auto_trigger：划选文字后自动弹出翻译，默认 True；关闭时鼠标划选不触发。
     popup_timeout_s：悬浮卡片自动关闭秒数，默认 10（设置页可调 5~60）。
 
     迁移（from_dict）：旧 settings.json 无 selection_translate 键时整体取默认值；

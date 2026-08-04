@@ -4,7 +4,7 @@
 1. 常规：启用语音输入、开机启动(仅保存设置)、结果展示方式(右下角弹窗/常驻悬浮窗)、
    全局禁用快捷键、恢复默认设置按钮（重置常规/快捷键/语音识别/界面/个性化/划词翻译，
    不影响翻译配置）。
-2. 快捷键：中文输入(f8)、中文→英文(f9)、取消当前任务(esc)、划词翻译(f7)。
+2. 快捷键：中文输入(f8)、中文→英文(f9)、取消当前任务(esc)、划词翻译开关(f7)。
 3. 语音识别：模型(已安装/未安装 状态 + 下载按钮 + 进度条)、实际运行设备(只读)、
    麦克风、最长录音秒数、重新检测硬件、测试识别(禁用占位)。
    注：推理设备/GPU 设备控件已随 GPU 路线移除（设备固定为 AUTO/CPU，等价）。
@@ -239,7 +239,7 @@ class SettingsWindow(QWidget):
         form.addRow("取消当前任务：", self._cancel_edit)
 
         self._selection_translate_edit = HotkeyEdit(page)
-        form.addRow("划词翻译：", self._selection_translate_edit)
+        form.addRow("划词翻译开关：", self._selection_translate_edit)
 
         return page
 
@@ -364,7 +364,7 @@ class SettingsWindow(QWidget):
 
         # ---- 划词翻译组：总开关 + 自动弹出 + 弹窗显示时长 ----
         # 值绑定到 settings.selection_translate（随「应用/确定」生效）；
-        # 手动触发快捷键在「快捷键」页录入（默认 F7）。
+        # 开关快捷键在「快捷键」页录入（默认 F7，与总开关联动）。
         selection_divider = QFrame(page)
         selection_divider.setObjectName("headerDivider")
         selection_divider.setFrameShape(QFrame.HLine)
@@ -374,7 +374,7 @@ class SettingsWindow(QWidget):
         self._selection_enabled_check = QCheckBox("启用划词翻译", page)
         selection_form.addRow(self._selection_enabled_check)
         self._selection_auto_check = QCheckBox("划选文字后自动弹出翻译", page)
-        # 依赖总开关：未启用划词翻译时置灰（快捷键手动触发仍可用，不在此体现）。
+        # 依赖总开关：未启用划词翻译时置灰。
         self._selection_enabled_check.toggled.connect(self._selection_auto_check.setEnabled)
         self._selection_auto_check.setEnabled(self._selection_enabled_check.isChecked())
         selection_form.addRow(self._selection_auto_check)
