@@ -5,8 +5,11 @@
   空剪贴板、不可复制格式跳过计数、SetClipboardData 失败时句柄释放、GDI 格式路径。
 - capture：本进程守卫 skipped_self；序列号未变 no_text 且不还原；无文本/空白
   no_text 且还原；超长 too_long；正常 success；simulate_copy 抛错也完成还原。
+  按压锚定 (press_seq)：自动复制已发生/窗口内发生 -> 直读文本，不备份/不按键/
+  不还原；终端类窗口永不模拟 Ctrl+C；取不到类名按非终端处理 (乐观 fallback)。
 - SelectionService：拖拽阈值（含从右往左划选各向同性）/ 冷却期抑制；
-  on_press_activity 任意左键按下通知；start/stop 生命周期。
+  on_press_activity 任意左键按下通知；按压锚点序列号采样与事件携带；
+  start/stop 生命周期。
 
 Win32 / pynput 全部 monkeypatch 掉，不依赖真实剪贴板与全局监听。
 """
@@ -514,12 +517,19 @@ def _patch_capture_env(
     text: str | None,
     change_seq_on_copy: bool = True,
     copy_exc: Exception | None = None,
+    window_class: str | None = "Notepad",
 ) -> tuple[_SeqUser32, _FakeSnapshot]:
-    """布置 capture 的全部外部依赖，返回 (seq_fake, snapshot_fake)。"""
+    """布置 capture 的全部外部依赖，返回 (seq_fake, snapshot_fake)。
+
+    window_class 为前台窗口类名 (默认非终端的 "Notepad")；None 模拟
+    GetClassNameW 失败 (应按非终端乐观处理)。
+    """
     seq = _SeqUser32()
     snapshot = _FakeSnapshot()
     monkeypatch.setattr(capture, "_user32", seq)
     monkeypatch.setattr(capture, "_foreground_pid", lambda: foreground_pid)
+    monkeypatch.setattr(capture, "_foreground_hwnd", lambda: 12345)
+    monkeypatch.setattr(capture, "_window_class_name", lambda hwnd: window_class)
     monkeypatch.setattr(capture, "backup_clipboard", lambda: snapshot)
     monkeypatch.setattr(capture, "get_clipboard_text", lambda: text)
 
@@ -631,6 +641,8 @@ def test_capture_restore_failure_is_error(monkeypatch: pytest.MonkeyPatch) -> No
 def test_capture_backup_failure_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """备份失败 -> error 结果，不向外抛。"""
     monkeypatch.setattr(capture, "_foreground_pid", lambda: 999999)
+    monkeypatch.setattr(capture, "_foreground_hwnd", lambda: 12345)
+    monkeypatch.setattr(capture, "_window_class_name", lambda hwnd: "Notepad")
     monkeypatch.setattr(capture, "_user32", _SeqUser32())
 
     def backup_fail():
@@ -642,6 +654,166 @@ def test_capture_backup_failure_is_error(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "OpenClipboard" in result.reason
 
 
+# ==================== capture：按压锚定自动复制检测 ====================
+
+
+def test_capture_auto_copy_already_done_direct_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """按压锚定：press_seq 与当前序列号不同 (划选即复制已发生) ->
+    直接读文本成功；simulate_copy 与 backup/restore 均未被调用。"""
+    seq, snapshot = _patch_capture_env(
+        monkeypatch, foreground_pid=999999, text="终端里的文本"
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(capture, "simulate_copy", lambda: calls.append("simulate"))
+    monkeypatch.setattr(
+        capture, "backup_clipboard", lambda: calls.append("backup") or snapshot
+    )
+    seq.seq = 101  # press_seq=100 之后，自动复制已把序列号 +1
+
+    result = capture.capture_selection(press_seq=100)
+    assert result.status is CaptureStatus.SUCCESS
+    assert result.ok
+    assert result.text == "终端里的文本"  # 读到的剪贴板内容原样返回
+    assert calls == []  # 未模拟按键、未备份
+    assert snapshot.restore_calls == 0  # 未还原 (剪贴板是用户自己复制的内容)
+
+
+def test_capture_auto_copy_detected_within_wait_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """按压锚定：等待窗口内序列号才变化 (慢一点的自动复制) -> 同样走直读路径。"""
+    seq, snapshot = _patch_capture_env(monkeypatch, foreground_pid=999999, text="hello")
+    calls: list[str] = []
+    monkeypatch.setattr(capture, "simulate_copy", lambda: calls.append("simulate"))
+    monkeypatch.setattr(
+        capture, "backup_clipboard", lambda: calls.append("backup") or snapshot
+    )
+    # 加速：轮询间隔不真实等待。
+    monkeypatch.setattr(capture.time, "sleep", lambda _s: None)
+
+    polls = {"n": 0}
+
+    def change_on_third_poll() -> int:
+        polls["n"] += 1
+        if polls["n"] >= 3:
+            seq.seq = 101  # 第 3 次轮询时自动复制完成
+        return seq.seq
+
+    monkeypatch.setattr(seq, "GetClipboardSequenceNumber", change_on_third_poll)
+
+    result = capture.capture_selection(
+        press_seq=100, auto_copy_wait_s=0.5, poll_interval_s=0.01
+    )
+    assert result.status is CaptureStatus.SUCCESS
+    assert result.text == "hello"
+    assert calls == []
+    assert snapshot.restore_calls == 0
+
+
+def test_capture_auto_copy_blank_text_is_no_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """直读路径的分类：自动复制读到空白文本 -> no_text，且不还原。"""
+    seq, snapshot = _patch_capture_env(monkeypatch, foreground_pid=999999, text="  \n ")
+    seq.seq = 101
+
+    result = capture.capture_selection(press_seq=100)
+    assert result.status is CaptureStatus.NO_TEXT
+    assert snapshot.restore_calls == 0
+
+
+def test_capture_no_autocopy_falls_back_to_simulate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """非终端 + press_seq 窗口内无变化 -> 走原 fallback (备份/模拟/还原照旧)，
+    且 fallback 重新采样 seq_before (两阶段不混用 press_seq)。"""
+    seq, snapshot = _patch_capture_env(monkeypatch, foreground_pid=999999, text="fallback")
+
+    result = capture.capture_selection(press_seq=100, auto_copy_wait_s=0.05, poll_interval_s=0.01)
+    assert result.status is CaptureStatus.SUCCESS
+    assert result.text == "fallback"
+    assert snapshot.restore_calls == 1
+    assert seq.seq == 101  # simulate_copy 使序列号 +1 (fallback 阶段独立判定)
+
+
+# ==================== capture：终端类窗口永不模拟 Ctrl+C ====================
+
+
+def test_terminal_class_set_covers_known_terminals() -> None:
+    """已知终端类名常量集合覆盖常见终端；判定大小写不敏感；None 按非终端处理。"""
+    expected = {
+        "ConsoleWindowClass",  # conhost / cmd / 旧版 PowerShell
+        "CASCADIA_HOSTING_WINDOW_CLASS",  # Windows Terminal
+        "mintty",
+        "PuTTY",
+        "Alacritty",
+        "org.wezfurlong.wezterm",
+    }
+    assert expected <= set(capture._TERMINAL_WINDOW_CLASSES)
+    assert capture._is_terminal_class("consolewindowclass")  # 大小写不敏感
+    assert not capture._is_terminal_class(None)
+    assert not capture._is_terminal_class("Notepad")
+
+
+@pytest.mark.parametrize(
+    "window_class",
+    ["ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS", "mintty"],
+)
+def test_capture_terminal_never_simulates(
+    monkeypatch: pytest.MonkeyPatch, window_class: str
+) -> None:
+    """终端类窗口：序列号不变 (无自动复制) -> no_text 且 simulate_copy 未被调用
+    (终端无选区时 Ctrl+C = SIGINT，会杀前台进程)。"""
+    seq, snapshot = _patch_capture_env(
+        monkeypatch,
+        foreground_pid=999999,
+        text=None,
+        change_seq_on_copy=False,
+        window_class=window_class,
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(capture, "simulate_copy", lambda: calls.append("simulate"))
+    monkeypatch.setattr(
+        capture, "backup_clipboard", lambda: calls.append("backup") or snapshot
+    )
+
+    result = capture.capture_selection(press_seq=100, auto_copy_wait_s=0.05, poll_interval_s=0.01)
+    assert result.status is CaptureStatus.NO_TEXT
+    assert "终端" in result.reason
+    assert calls == []  # 未模拟按键、未备份
+    assert snapshot.restore_calls == 0
+
+
+def test_capture_terminal_without_press_seq_still_no_simulate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """无按压锚点 (press_seq=None) 时终端窗口同样绝不模拟 Ctrl+C。"""
+    _, snapshot = _patch_capture_env(
+        monkeypatch, foreground_pid=999999, text=None, window_class="PuTTY"
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(capture, "simulate_copy", lambda: calls.append("simulate"))
+    monkeypatch.setattr(
+        capture, "backup_clipboard", lambda: calls.append("backup") or snapshot
+    )
+
+    result = capture.capture_selection()
+    assert result.status is CaptureStatus.NO_TEXT
+    assert "终端" in result.reason
+    assert calls == []
+    assert snapshot.restore_calls == 0
+
+
+def test_capture_unknown_window_class_treated_as_non_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """取不到窗口类名 (API 失败 -> None) 按非终端处理 (乐观)：
+    走模拟按键 + 备份/还原的原有 fallback。"""
+    _, snapshot = _patch_capture_env(
+        monkeypatch, foreground_pid=999999, text="hello", window_class=None
+    )
+    result = capture.capture_selection(press_seq=100, auto_copy_wait_s=0.05, poll_interval_s=0.01)
+    assert result.status is CaptureStatus.SUCCESS
+    assert result.text == "hello"
+    assert snapshot.restore_calls == 1
+
+
 # ==================== SelectionService ====================
 
 
@@ -650,12 +822,14 @@ def _make_service(
     capture_func=None,
     drag_threshold_px: float = 10.0,
     cooldown_s: float = 0.8,
+    seq_provider=None,
 ) -> SelectionService:
     return SelectionService(
         on_result=on_result or (lambda r: None),
         capture_func=capture_func,
         drag_threshold_px=drag_threshold_px,
         cooldown_s=cooldown_s,
+        seq_provider=seq_provider,
     )
 
 
@@ -730,7 +904,7 @@ def test_two_drags_share_same_capture_path() -> None:
     results: list[CaptureResult] = []
     capture_calls: list[int] = []
 
-    def fake_capture() -> CaptureResult:
+    def fake_capture(press_seq: int | None = None) -> CaptureResult:
         capture_calls.append(len(capture_calls))
         return CaptureResult(CaptureStatus.SUCCESS, text=f"t{len(capture_calls)}")
 
@@ -796,7 +970,7 @@ def test_capture_exception_does_not_kill_consumer() -> None:
     results: list[CaptureResult] = []
     calls: list[int] = []
 
-    def flaky_capture() -> CaptureResult:
+    def flaky_capture(press_seq: int | None = None) -> CaptureResult:
         calls.append(len(calls))
         if len(calls) == 1:
             raise RuntimeError("模拟取词异常")
@@ -827,6 +1001,75 @@ def test_capture_exception_does_not_kill_consumer() -> None:
 
     assert len(calls) == 2
     assert [r.text for r in results] == ["ok"]
+
+
+# ==================== SelectionService 按压锚定 (press_seq) ====================
+
+
+def test_press_samples_seq_and_event_carries_it() -> None:
+    """左键按下时采样一次剪贴板序列号，松开判定为划选后事件携带 press_seq。"""
+    calls: list[int] = []
+
+    def fake_seq() -> int:
+        calls.append(len(calls))
+        return 4242
+
+    svc = _make_service(drag_threshold_px=10.0, cooldown_s=0.0, seq_provider=fake_seq)
+    _drag(svc, 100, 100, 140, 100)
+    event = svc._queue.get_nowait()
+    assert (event.x, event.y) == (140, 100)
+    assert event.press_seq == 4242
+    assert calls == [0]  # 只在按下时采样一次，松开不采样
+
+
+def test_press_seq_provider_failure_degrades_to_none() -> None:
+    """seq_provider 采样异常：press_seq 退化为 None，划选判定不受影响。"""
+    def boom() -> int:
+        raise RuntimeError("模拟序列号采样失败")
+
+    svc = _make_service(drag_threshold_px=10.0, cooldown_s=0.0, seq_provider=boom)
+    _drag(svc, 100, 100, 140, 100)
+    event = svc._queue.get_nowait()
+    assert event.press_seq is None
+
+
+def test_consumer_passes_press_seq_to_capture() -> None:
+    """消费线程把事件携带的 press_seq 以关键字传给 capture_func。"""
+    from dictashift.selection.capture import CaptureResult
+
+    seen: list[int | None] = []
+
+    def fake_capture(press_seq: int | None = None) -> CaptureResult:
+        seen.append(press_seq)
+        return CaptureResult(CaptureStatus.SUCCESS, text="ok")
+
+    svc = _make_service(
+        on_result=lambda r: None,
+        capture_func=fake_capture,
+        drag_threshold_px=10.0,
+        cooldown_s=0.0,
+        seq_provider=lambda: 777,
+    )
+
+    class _FakeListener:
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+        def join(self, timeout=None) -> None:
+            pass
+
+    svc._create_listener = lambda: _FakeListener()  # type: ignore[method-assign]
+    svc.start()
+    try:
+        _drag(svc, 100, 100, 140, 100)
+        svc._queue.join()
+    finally:
+        svc.stop()
+
+    assert seen == [777]
 
 
 # ==================== SelectionService.set_auto_trigger ====================

@@ -3,8 +3,12 @@
 骨架与 hotkeys/service.py 一致：
 - pynput mouse.Listener 回调线程内只做判定与入队，严禁阻塞
   (取词涉及 SendInput 与剪贴板等待，全部在消费线程执行)。
-- 单消费线程从 FIFO 队列取事件，调用注入的 capture_func，
-  把结果交给注入的 on_result 回调。
+- 单消费线程从 FIFO 队列取事件，调用注入的 capture_func
+  (以 press_seq= 关键字传按压锚点)，把结果交给注入的 on_result 回调。
+- 按压锚定：左键按下时经 seq_provider 采样一次剪贴板序列号
+  (默认 capture.get_clipboard_seq，微秒级 Win32 调用，可在回调线程同步执行)，
+  松开判定为划选后事件携带 press_seq 入队，供取词端检测「划选即复制」
+  自动复制——避免对终端模拟 Ctrl+C (无选区时等于 SIGINT，会杀前台进程)。
 - set_auto_trigger(False) 时鼠标划选事件在 _on_click 入口即被丢弃
   （listener 与消费线程保持运行），供设置页「划选文字后自动弹出翻译」
   开关热更新；on_press_activity 通知不受影响（任意左键按下都会触发）。
@@ -16,7 +20,8 @@
 
 可测试性：
 - Listener 通过 _create_listener 工厂创建，测试可注入假事件源；
-- _on_click 为纯逻辑入口，测试可直接驱动，无需真实全局监听。
+- _on_click 为纯逻辑入口，测试可直接驱动，无需真实全局监听；
+- seq_provider 构造可注入，测试用假序列号源验证按压锚定。
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from typing import Callable
 
 from pynput import mouse
 
-from .capture import CaptureResult, capture_selection
+from .capture import CaptureResult, capture_selection, get_clipboard_seq
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +47,7 @@ class SelectionEvent:
 
     x: int | None = None  # 划选松开位置 (供后续弹窗定位)
     y: int | None = None
+    press_seq: int | None = None  # 左键按下时的剪贴板序列号 (自动复制检测锚点)
 
 
 class SelectionService:
@@ -56,22 +62,28 @@ class SelectionService:
     def __init__(
         self,
         on_result: Callable[[CaptureResult], None],
-        capture_func: Callable[[], CaptureResult] | None = None,
+        capture_func: Callable[..., CaptureResult] | None = None,
         drag_threshold_px: float = 10.0,
         cooldown_s: float = 0.8,
         on_press_activity: Callable[[], None] | None = None,
+        seq_provider: Callable[[], int] | None = None,
     ) -> None:
         self._on_result_cb = on_result
+        # 消费线程以 press_seq= 关键字调用 (默认 capture_selection)。
         self._capture = capture_func or capture_selection
         self._drag_threshold = float(drag_threshold_px)
         self._cooldown = float(cooldown_s)
         # 任意左键按下活动回调（在 pynput 监听线程调用，必须非阻塞）。
         self._on_press_activity = on_press_activity
+        # 剪贴板序列号采样器：左键按下时在 pynput 回调线程同步取样
+        # (GetClipboardSequenceNumber 为微秒级调用)，作为自动复制检测锚点。
+        self._seq_provider = seq_provider or get_clipboard_seq
 
         self._lock = threading.Lock()
-        # 左键按下位置与时间 (用于拖拽距离判定)。
+        # 左键按下位置、时间与按下时的剪贴板序列号 (拖拽距离判定 + 按压锚定)。
         self._press_pos: tuple[int, int] | None = None
         self._press_time = 0.0
+        self._press_seq: int | None = None
         # 上次触发时间 (冷却期判定)。
         self._last_trigger = 0.0
         # 划选自动触发开关 (set_auto_trigger 热更新)；False 时 _on_click 直接丢弃。
@@ -113,6 +125,7 @@ class SelectionService:
             self._listener = None
             self._consumer = None
             self._press_pos = None
+            self._press_seq = None
         if listener is not None:
             listener.stop()
             listener.join(timeout=2.0)
@@ -127,12 +140,13 @@ class SelectionService:
 
         False 时 _on_click 入口即丢弃鼠标划选事件（不记录按下位置、不入队）；
         listener 与消费线程保持运行，on_press_activity 通知不受影响。
-        关闭瞬间丢弃可能残留的按下位置，避免重新开启后误配对旧按下。
+        关闭瞬间丢弃可能残留的按下位置与锚点序列号，避免重新开启后误配对旧按下。
         """
         with self._lock:
             self._auto_trigger = bool(enabled)
             if not self._auto_trigger:
                 self._press_pos = None
+                self._press_seq = None
 
     def _on_click(self, x: int, y: int, button, pressed: bool) -> None:
         """pynput on_click 回调入口。只做判定与入队，严禁阻塞。"""
@@ -154,18 +168,28 @@ class SelectionService:
                 if pressed:
                     self._press_pos = (x, y)
                     self._press_time = now
+                    try:
+                        # 按压锚定：记录此刻剪贴板序列号 (微秒级 Win32 调用)，
+                        # 供取词端检测「划选即复制」。采样失败退化为 None，
+                        # 取词端按无锚点处理。
+                        self._press_seq = self._seq_provider()
+                    except Exception:  # noqa: BLE001 - 锚点采样失败不得影响划选判定
+                        logger.exception("[SelectionService] 剪贴板序列号采样失败")
+                        self._press_seq = None
                     return
                 if self._press_pos is None:
                     return
                 press_x, press_y = self._press_pos
+                press_seq = self._press_seq
                 self._press_pos = None
+                self._press_seq = None
                 distance = math.hypot(x - press_x, y - press_y)
                 if distance <= self._drag_threshold:
                     return
                 if now - self._last_trigger < self._cooldown:
                     return
                 self._last_trigger = now
-            self._queue.put(SelectionEvent(x=x, y=y))
+            self._queue.put(SelectionEvent(x=x, y=y, press_seq=press_seq))
         except Exception:  # noqa: BLE001 - 回调线程内不得抛未处理异常
             logger.exception("[SelectionService] on_click 处理异常")
 
@@ -179,7 +203,7 @@ class SelectionService:
                 if event is self._sentinel:
                     return
                 try:
-                    result = self._capture()
+                    result = self._capture(press_seq=event.press_seq)
                 except Exception:  # noqa: BLE001 - 取词异常不得打死消费线程
                     logger.exception("[SelectionService] capture_func 抛出异常")
                     continue
