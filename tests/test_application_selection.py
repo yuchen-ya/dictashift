@@ -182,8 +182,6 @@ def _make_app(
     app._selection_started = started
     app._selection_seq = 0
     app._selection_seq_lock = threading.Lock()
-    app._action_lock = threading.Lock()
-    app._current_action = None
     app._hotkey_queue = queue.Queue()
     app.settings = AppSettings()
     return app

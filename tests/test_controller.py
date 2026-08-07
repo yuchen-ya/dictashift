@@ -13,6 +13,8 @@
 - 粘贴失败：paste_func 返回 False -> on_text_ready(text, False)。
 - worker 异常：asr.transcribe raise -> ERROR + on_error。
 - dictate_en 无活动 profile 时不录音。
+- handle_hotkey_release 状态失步恢复：任务匹配但状态被并发路径打飞时强制
+  discard 关流 + 清任务（回归「麦克风永久锁死」bug）。
 
 worker 是后台线程，测试用 threading.Event 等待回调（超时 5s）。
 本文件不依赖任何外部资源。
@@ -1139,3 +1141,267 @@ def test_wait_first_frame_shutdown_cancels_timer() -> None:
     assert ctrl._first_frame_timer is None
     assert recorder.discard_calls == 1
     assert ctrl.state == AppState.IDLE
+
+
+# ==================== handle_hotkey_release 状态失步恢复 ====================
+#
+# 回归「麦克风永久锁死」bug：旧 worker 流水线收尾的状态迁移把新录音任务的
+# 状态踩成 IDLE -> handle_hotkey_release 发现状态不在 RECORDING/PREPARING ->
+# 静默 return -> recorder._stream 残留 -> 之后所有 start 抛 RuntimeError -> 永久
+# 「麦克风不可用」。修复后：任务匹配但状态失步时，强制 discard 关流 + 清任务，
+# 让下一次 start 能正常打开。
+
+
+def test_handle_hotkey_release_state_desync_forces_discard_and_clears_task() -> None:
+    """任务匹配但状态被外部 force 到 IDLE 后调用 handle_hotkey_release：
+
+    - recorder.discard 被调用（强制关流，避免 _stream 残留）
+    - _current_task 被清空
+    - 不抛异常（hotkey 回调不得打死）
+    - 不改状态机状态（保持 IDLE）
+    - 之后可以重新 start（FakeRecorder 复用现有 fake 风格）
+    """
+    recorder = FakeRecorder()
+    ctrl, cb, _, _, _ = _make_controller(recorder=recorder)
+
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl.state == AppState.RECORDING
+    assert ctrl._current_task is not None
+
+    # 模拟 bug：状态被并发路径（旧 worker 收尾）打飞到 IDLE，但 _current_task
+    # 和 recorder._stream 都还在（真实场景里 recorder._stream 也未关闭）。
+    ctrl._force_state(AppState.IDLE)
+    assert ctrl._current_task is not None  # 任务仍在
+
+    # 此时 release：旧行为会静默 return 留下残留流；新行为应强制 discard + 清任务。
+    ctrl.handle_hotkey_release("dictate_zh")
+
+    assert recorder.discard_calls == 1
+    assert ctrl._current_task is None
+    assert ctrl.state == AppState.IDLE  # 状态保持 IDLE 未被改动
+    # hotkey 回调不抛异常（走到这里即说明没抛）
+
+    # 关键回归断言：之后可以重新 start（不被残留流卡死）。
+    # FakeRecorder.start 不检查内部流状态，直接计数；这里验证可重入。
+    starts_before = recorder.start_calls
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert recorder.start_calls == starts_before + 1
+    assert ctrl.state == AppState.RECORDING
+    # 清理
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    _wait_for_state(cb, AppState.IDLE)
+
+
+def test_handle_hotkey_release_no_task_returns_without_discard() -> None:
+    """对照测试：无任务（_current_task is None）时 release 静默 return，不 discard。"""
+    ctrl, cb, _, recorder, _ = _make_controller()
+    assert ctrl._current_task is None
+
+    ctrl.handle_hotkey_release("dictate_zh")
+
+    assert recorder.discard_calls == 0
+    assert ctrl.state == AppState.IDLE
+
+
+def test_handle_hotkey_release_action_mismatch_returns_without_discard() -> None:
+    """对照测试：任务存在但 action 不匹配时静默 return，不 discard。"""
+    ctrl, cb, _, recorder, _ = _make_controller()
+    ctrl.handle_hotkey_press("dictate_zh")
+    assert ctrl._current_task is not None
+
+    # 释放时按下的是 dictate_en（与当前 zh 任务不匹配）
+    ctrl.handle_hotkey_release("dictate_en")
+
+    assert recorder.discard_calls == 0
+    assert ctrl._current_task is not None  # 任务未被取走
+
+    # 清理
+    cb.text_event.clear()
+    ctrl.handle_hotkey_release("dictate_zh")
+    _wait_for_state(cb, AppState.IDLE)
+
+
+# ==================== 任务代次守卫（修复 A：旧 worker 不踩新任务状态机）====================
+#
+# 回归场景：dictate_en 任务A翻译慢，用户 Esc 取消（_handle_cancel 置
+# _cancel_requested=True 并 force IDLE）-> 用户立即按听写键，创建任务B
+# （_handle_dictate_press bump seq + 清 _cancel_requested=False）-> 任务A的
+# worker 从 translate 返回后 _should_suppress_output() 变 False -> 旧行为会继续
+# _goto_safe(INSERTING)/粘贴/_goto_safe(IDLE)，把任务B的 RECORDING 踩成
+# INSERTING/IDLE 并粘贴已取消的旧结果。修复后：旧 worker 发现 stale 安静消失，
+# 不做任何状态迁移、不粘贴。
+
+
+class _BlockingTranslationBackend(FakeTranslationBackend):
+    """translate 阻塞直到放行，用于模拟慢翻译。"""
+
+    def __init__(self, result: str = "hello world") -> None:
+        super().__init__(result=result)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def translate(self, text: str, profile: TranslationProfile) -> str:
+        self.entered.set()
+        self.release.wait(timeout=5.0)
+        return super().translate(text, profile)
+
+
+class TestTaskGenerationGuard:
+    """代次守卫：旧 worker 流水线不得踩新任务状态机、不得粘贴已取消结果。"""
+
+    def test_stale_worker_does_not_clobber_new_task_or_paste(self) -> None:
+        """任务A翻译慢 -> Esc 取消 -> 立即新任务B -> 任务A worker 从 translate
+        返回后安静消失：不粘贴、不做任何状态迁移（任务B 的 RECORDING 不被踩）。
+        """
+        backend = _BlockingTranslationBackend(result="old cancelled translation")
+        paste_calls: list[str] = []
+        ctrl, cb, asr, recorder, _ = _make_controller(
+            backend=backend,
+            paste_func=lambda t: paste_calls.append(t) or True,
+        )
+        ctrl.set_translation_profiles([_PROFILE_OLD], active_name="old")
+
+        # 任务A：dictate_en，进入流水线，transcribe 快速返回后进入 TRANSLATING。
+        ctrl.handle_hotkey_press("dictate_en")
+        assert ctrl.state == AppState.RECORDING
+        ctrl.handle_hotkey_release("dictate_en")
+        # 等 worker 进入翻译阶段（translate 阻塞中）。
+        assert backend.entered.wait(timeout=5.0)
+        assert ctrl.state == AppState.TRANSLATING
+
+        # 用户 Esc 取消任务A：_handle_cancel 置 _cancel_requested=True + force IDLE。
+        ctrl.handle_hotkey_press("cancel")
+        assert ctrl.state == AppState.IDLE
+
+        # 立即新建任务B（dictate_en）：bump seq + 清抑制标记。
+        # 注意：任务A被取消 force 到 IDLE 后，_handle_dictate_press 检测到 IDLE
+        # 即可正常创建新任务（与真实场景一致）。
+        ctrl.handle_hotkey_press("dictate_en")
+        assert ctrl.state == AppState.RECORDING
+        assert ctrl._current_task is not None
+        task_b_seq = ctrl._current_task.seq
+
+        # 放行任务A的慢翻译返回：旧 worker 现在从 translate 返回，
+        # 旧行为会把任务B的 RECORDING 踩成 INSERTING/IDLE 并粘贴旧结果。
+        backend.release.set()
+
+        # 等待旧 worker 收尾（给充足时间，stale 路径应快速 return）。
+        time.sleep(0.5)
+
+        # 关键断言1：旧 worker 没有粘贴已取消的旧结果。
+        assert paste_calls == []
+        assert cb.texts == []
+
+        # 关键断言2：任务B 的状态 RECORDING 没有被旧 worker 踩掉。
+        assert ctrl.state == AppState.RECORDING
+        # 当前任务仍是任务B（seq 未变）。
+        assert ctrl._current_task is not None
+        assert ctrl._current_task.seq == task_b_seq
+
+        # 清理：正常结束任务B。
+        cb.text_event.clear()
+        ctrl.handle_hotkey_release("dictate_en")
+        assert _wait(cb.text_event)
+        _wait_for_state(cb, AppState.IDLE)
+        # 任务B 正常粘贴（译文）。
+        assert len(paste_calls) == 1
+        assert ctrl.state == AppState.IDLE
+
+    def test_non_stale_pipeline_unchanged(self) -> None:
+        """对照：没有取消+新建任务时，正常流水线行为完全不变（粘贴、回 IDLE）。"""
+        paste_calls: list[str] = []
+        ctrl, cb, asr, recorder, _ = _make_controller(
+            paste_func=lambda t: paste_calls.append(t) or True
+        )
+
+        ctrl.handle_hotkey_press("dictate_zh")
+        ctrl.handle_hotkey_release("dictate_zh")
+        assert _wait(cb.text_event)
+        _wait_for_state(cb, AppState.IDLE)
+
+        assert paste_calls == ["你好世界"]
+        assert cb.texts == [("你好世界", True)]
+        assert ctrl.state == AppState.IDLE
+
+    def test_stale_worker_exception_does_not_force_error(self) -> None:
+        """过期 worker 抛异常时安静消失：不上报、不 force ERROR，不踩新任务。
+
+        场景：任务A transcribe 抛异常（但任务A已被取消+新建任务B），过期 worker
+        在 except 路径发现 stale -> 只记日志，不 _report_error / 不 _force_state(ERROR)。
+        任务B 用正常 ASR 路径（首次抛异常、之后成功），确保清理可完成。
+        """
+        block_asr = threading.Event()
+
+        class _RaiseOnceAsr(FakeAsrService):
+            """第一次 transcribe 抛异常（任务A），之后正常返回（任务B）。"""
+
+            def __init__(self) -> None:
+                super().__init__(text="你好世界", block_event=block_asr)
+
+            def transcribe(self, audio, lid="auto", itn=True):
+                if not self.transcribe_calls:
+                    # 第一次（任务A）：阻塞后抛异常。
+                    if self._block is not None:
+                        self._block.wait(timeout=5.0)
+                    self.transcribe_calls.append(
+                        {"audio_len": len(audio) if audio is not None else 0, "lid": lid, "itn": itn}
+                    )
+                    raise RuntimeError("boom")
+                return super().transcribe(audio, lid=lid, itn=itn)
+
+        asr = _RaiseOnceAsr()
+        ctrl, cb, _, recorder, _ = _make_controller(asr=asr)
+
+        # 任务A：dictate_zh，transcribe 阻塞中。
+        ctrl.handle_hotkey_press("dictate_zh")
+        ctrl.handle_hotkey_release("dictate_zh")
+        _wait_for_state(cb, AppState.TRANSCRIBING)
+
+        # 取消任务A并立即新建任务B。
+        ctrl.handle_hotkey_press("cancel")
+        assert ctrl.state == AppState.IDLE
+        ctrl.handle_hotkey_press("dictate_zh")
+        assert ctrl.state == AppState.RECORDING
+        task_b_seq = ctrl._current_task.seq
+
+        # 放行 transcribe -> 旧 worker 的 transcribe 抛 RuntimeError -> except 路径。
+        cb.error_event.clear()
+        block_asr.set()
+
+        time.sleep(0.5)
+        # 过期异常路径安静消失：无 on_error、状态不被 force 到 ERROR。
+        assert cb.errors == []
+        assert not cb.error_event.is_set()
+        assert ctrl.state == AppState.RECORDING  # 任务B 未被踩
+        assert ctrl._current_task is not None
+        assert ctrl._current_task.seq == task_b_seq
+
+        # 清理任务B（正常路径粘贴）。
+        cb.text_event.clear()
+        ctrl.handle_hotkey_release("dictate_zh")
+        assert _wait(cb.text_event)
+        _wait_for_state(cb, AppState.IDLE)
+        assert ctrl.state == AppState.IDLE
+
+    def test_cancel_suppression_still_works_without_new_task(self) -> None:
+        """cancel 抑制语义不变：只 cancel 不新建任务时，worker 走 _finish_suppressed
+        （不 bump seq，靠 flag 抑制），最终回 IDLE、不粘贴。"""
+        block = threading.Event()
+        paste_calls: list[str] = []
+        asr = FakeAsrService(text="some text", block_event=block)
+        ctrl, cb, _asr, recorder, _ = _make_controller(
+            asr=asr, paste_func=lambda t: paste_calls.append(t) or True
+        )
+
+        ctrl.handle_hotkey_press("dictate_zh")
+        ctrl.handle_hotkey_release("dictate_zh")
+        _wait_for_state(cb, AppState.TRANSCRIBING)
+
+        ctrl.handle_hotkey_press("cancel")
+        block.set()
+
+        _wait_for_state(cb, AppState.IDLE, timeout=5.0)
+        time.sleep(0.2)
+        assert paste_calls == []
+        assert cb.texts == []

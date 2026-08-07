@@ -23,7 +23,12 @@ class VoiceTask:
             - dictate_zh: 恒为 None（中文直接输出，不翻译）。
             - dictate_en: 为任务创建时的 active profile 副本；
               用户后续切换只影响之后新建的任务。
+        seq: 任务代次序号，由 controller._task_seq 在任务创建时分配。
+            worker 流水线用它判定自身是否已是"过期任务"（用户取消旧任务并立即
+            新建任务后，旧 worker 不应再做任何状态迁移或粘贴）。默认 0；每次
+            新建听写任务时 bump 并赋给新任务。
     """
 
     action: str
     profile_snapshot: TranslationProfile | None
+    seq: int = 0

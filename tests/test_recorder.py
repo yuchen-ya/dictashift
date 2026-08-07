@@ -1,7 +1,7 @@
 """AudioRecorder 与 list_input_devices 测试（不依赖真实麦克风）。
 
 测试目标 (AGENTS.md 5.1 / 13.1)：
-- AudioRecorder：未 start 时 stop 安全；重复 start 抛 RuntimeError。
+- AudioRecorder：未 start 时 stop 安全；start 发现残留流时自愈强制关闭后继续（不抛错）。
 - monkeypatch sounddevice.InputStream 为 fake（记录参数、start/stop/close 空操作、可手动喂回调数据）。
 - callback 只 append；喂 indata 后 stop 返回拼接的 float32 一维数组；空录音返回空数组。
 - list_input_devices：monkeypatch sd.query_devices 返回混合输入/输出设备 -> 只返回输入设备。
@@ -48,6 +48,36 @@ class FakeInputStream:
         self.callback(samples, frames, 0, 0)
 
 
+# 用于自愈 finally 测试的可控 fake：可在 start/stop/close 上抛指定异常。
+class FakeStream:
+    """可控异常的 fake InputStream（类变量配置是否在各方法抛错）。"""
+
+    # 类级开关：测试用例临时置 True 触发对应方法抛错。
+    start_raises: bool = False
+    stop_raises: bool = False
+    close_raises: bool = False
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+        self.callback = kwargs.get("callback")
+        self.stop_calls = 0
+        self.close_calls = 0
+
+    def start(self) -> None:
+        if FakeStream.start_raises:
+            raise RuntimeError("start boom")
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+        if FakeStream.stop_raises:
+            raise RuntimeError("stop boom")
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if FakeStream.close_raises:
+            raise RuntimeError("close boom")
+
+
 @pytest.fixture
 def fake_sd(monkeypatch):
     """monkeypatch recorder.sd.InputStream 为 FakeInputStream，并默认把
@@ -91,14 +121,56 @@ def test_stop_without_start_returns_empty(fake_sd) -> None:
     assert out.shape == (0,)
 
 
-def test_duplicate_start_raises(fake_sd) -> None:
+def test_start_self_heals_residual_stream(fake_sd) -> None:
+    """start 发现上次流未释放（上层状态失步）时：不抛错，强制关闭旧流后继续。
+
+    回归「麦克风永久锁死」bug：旧 worker 收尾把新任务状态踩成 IDLE ->
+    handle_hotkey_release 静默 return 不关流 -> AudioRecorder._stream 残留 ->
+    之后所有 start 抛 RuntimeError("正在录音，不能重复 start")。修复后 start
+    自愈：取走残留引用并置 None，锁外强制 stop+close 旧流，再正常打开新流。
+    """
     rec = recorder_mod.AudioRecorder()
     rec.start()
+    stale_stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    assert stale_stream.stop_calls == 0
+    assert stale_stream.close_calls == 0
+
+    # 制造残留：不 stop，直接再次 start。不再抛 RuntimeError。
+    rec.start()
+
+    # 旧流被强制 stop + close
+    assert stale_stream.stop_calls == 1
+    assert stale_stream.close_calls == 1
+    # 新流生效（is_recording=True 且是一个新的 FakeInputStream 实例）
+    assert rec.is_recording
+    new_stream: FakeInputStream = rec._stream  # type: ignore[assignment]
+    assert new_stream is not stale_stream
+    rec.stop()
+
+
+def test_start_self_heal_closes_old_stream_even_if_new_start_raises(monkeypatch) -> None:
+    """自愈路径：即便新流 start() 抛异常，残留旧流也必须被关闭（finally 语义）。"""
+    monkeypatch.setattr(recorder_mod.sd, "InputStream", FakeStream)
+
+    def _q(*a, **kw):
+        return {"name": "fake-mic", "default_samplerate": 16000.0, "max_input_channels": 1}
+    monkeypatch.setattr(recorder_mod.sd, "query_devices", _q)
+
+    rec = recorder_mod.AudioRecorder()
+    rec.start()
+    stale_stream: FakeStream = rec._stream  # type: ignore[assignment]
+    assert stale_stream.close_calls == 0
+
+    # 新构造的流 start() 会抛
+    FakeStream.start_raises = True
     try:
         with pytest.raises(RuntimeError):
             rec.start()
     finally:
-        rec.stop()
+        FakeStream.start_raises = False
+
+    # 旧流仍被关闭（自愈 finally 保证）
+    assert stale_stream.close_calls == 1
 
 
 def test_callback_appends_and_stop_concatenates(fake_sd) -> None:
@@ -502,6 +574,54 @@ def test_first_frame_callback_exception_does_not_kill_audio(fake_sd) -> None:
     assert out.shape == (10,)
     np.testing.assert_allclose(out[:4], 0.5)
     np.testing.assert_allclose(out[4:], 0.6)
+
+
+# ==================== stop()/discard() 关流拆分 try ====================
+
+
+def test_stop_calls_close_even_if_stream_stop_raises(monkeypatch) -> None:
+    """stop() 中底层 stream.stop() 抛异常时 close 仍被调用（拆分 try 回归）。"""
+    monkeypatch.setattr(recorder_mod.sd, "InputStream", FakeStream)
+
+    def _q(*a, **kw):
+        return {"name": "fake-mic", "default_samplerate": 16000.0, "max_input_channels": 1}
+    monkeypatch.setattr(recorder_mod.sd, "query_devices", _q)
+
+    rec = recorder_mod.AudioRecorder()
+    rec.start()
+    stream: FakeStream = rec._stream  # type: ignore[assignment]
+    # 喂一帧保证 stop 走非空分支
+    stream.callback(np.zeros((4, 1), dtype=np.float32), 4, 0, 0)
+
+    FakeStream.stop_raises = True
+    try:
+        out = rec.stop()  # 不应抛错
+    finally:
+        FakeStream.stop_raises = False
+    # stop 抛错仍尝试 close
+    assert stream.close_calls == 1
+    # stop 异常不影响已录制数据返回
+    assert out.shape == (4,)
+
+
+def test_discard_calls_close_even_if_stream_stop_raises(monkeypatch) -> None:
+    """discard() 中底层 stream.stop() 抛异常时 close 仍被调用（拆分 try 回归）。"""
+    monkeypatch.setattr(recorder_mod.sd, "InputStream", FakeStream)
+
+    def _q(*a, **kw):
+        return {"name": "fake-mic", "default_samplerate": 16000.0, "max_input_channels": 1}
+    monkeypatch.setattr(recorder_mod.sd, "query_devices", _q)
+
+    rec = recorder_mod.AudioRecorder()
+    rec.start()
+    stream: FakeStream = rec._stream  # type: ignore[assignment]
+
+    FakeStream.stop_raises = True
+    try:
+        rec.discard()  # 不应抛错
+    finally:
+        FakeStream.stop_raises = False
+    assert stream.close_calls == 1
 
 
 # ==================== list_input_devices ====================

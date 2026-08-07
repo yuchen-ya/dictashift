@@ -45,15 +45,28 @@ def _normalize_from_pynput(key) -> str | None:
     - keyboard.Key 有 .name 属性 (如 'f8'、'ctrl_l'、'space')；
     - keyboard.KeyCode 有 .char 属性 (普通字符，可能为大写)；
     - 个别(KeyCode 没有对应字符的特殊键) .char 可能为 None，此时返回 None。
+
+    空名称哨兵：某些按键（如多媒体键）经 pynput 给出的 .name/.char 为空字符串或
+    纯空白。matcher.normalize_key_name 对空串会抛 ValueError（用于配置校验），
+    但这里来自运行时按键事件，空名称应静默跳过而非走 ValueError -> ERROR 日志
+    路径刷屏。因此在调用 normalize_key_name 前对空/纯空白名称提前返回 None，
+    让事件被正常忽略（_on_key_down / _on_key_up 对 None 直接 return）。
     """
     if isinstance(key, keyboard.Key):
-        return normalize_key_name(key.name)
+        name = key.name
+        if name is None or not str(name).strip():
+            logger.debug("[HotkeyService] 忽略空名称按键事件 (Key)")
+            return None
+        return normalize_key_name(name)
     if isinstance(key, keyboard.KeyCode):
-        if key.char is not None:
+        if key.char is not None and str(key.char).strip():
             return normalize_key_name(key.char)
         return None
     # 极少数情况 (例如 pynput 给出裸字符串)，兜底处理。
     if isinstance(key, str):
+        if not key.strip():
+            logger.debug("[HotkeyService] 忽略空名称按键事件 (str)")
+            return None
         return normalize_key_name(key)
     return None
 

@@ -24,7 +24,9 @@ AudioRecorder 用 sounddevice.InputStream 录制 float32 单声道音频，最�
   避免 PortAudio 回调内关闭流带来的重入风险)。
 - stop() 返回 16000 Hz float32 单声道 np.ndarray (shape=(n,))；
   一帧都没录到返回空数组。
-- start/stop/discard 需线程安全 (threading.Lock)；重复 start 抛 RuntimeError。
+- start/stop/discard 需线程安全 (threading.Lock)。
+- 重复 start 自愈：若上次流因上层状态失步未被释放，start 强制关闭残留流
+  后继续（不抛错），从「麦克风永久锁死」状态恢复。
 """
 
 from __future__ import annotations
@@ -96,7 +98,7 @@ class AudioRecorder:
         rec = AudioRecorder(sample_rate=16000, max_seconds=60,
                             on_auto_stop=lambda: controller.on_auto_stop(),
                             on_stream_error=lambda msg: ...)
-        rec.start()                 # 按下快捷键
+        rec.start()                 # 按下快捷键（若上次流残留会自愈强制关闭）
         samples = rec.stop()        # 松开快捷键 -> 拿到 float32 (16kHz) 数组
 
     参数：
@@ -203,39 +205,67 @@ class AudioRecorder:
             return _TARGET_SR
 
     def start(self) -> None:
-        """打开 InputStream 开始录音。重复 start 抛 RuntimeError。"""
-        with self._lock:
-            if self._stream is not None:
-                raise RuntimeError("AudioRecorder 正在录音，不能重复 start")
-            self._frames = []
-            self._samples_recorded = 0
-            self._auto_stopped = False
-            self._stream_error_notified = False
-            # 标记本轮等待首个回调帧（_callback 中据此触发一次性 on_first_frame）。
-            self._first_frame_pending = self._on_first_frame is not None
-            # 查询设备原生采样率：流以原生采样率打开，stop 时重采样到 16k。
-            native_sr = self._query_native_samplerate()
-            self._native_sr = native_sr
-            # InputStream 在 __init__ 时即打开流；这里用 try 包住以在失败时
-            # 不留下半初始化状态。samplerate 用设备原生采样率，避免 sounddevice
-            # 内部做隐式重采样（部分驱动会因此报错或返回异常采样）。
-            stream = sd.InputStream(
-                samplerate=native_sr,
-                device=self._device_index,
-                channels=1,
-                dtype="float32",
-                callback=self._callback,
-            )
-            try:
-                stream.start()
-            except Exception:
-                # 启动失败时关闭并清理，向上抛出原始异常。
+        """打开 InputStream 开始录音。
+
+        自愈语义：若发现上一次的流未被正常释放（self._stream 残留，说明上层
+        状态机失步，例如旧 worker 收尾把新任务状态踩成 IDLE 导致
+        handle_hotkey_release 静默 return 未关流），不抛错——先取走残留引用并
+        置 None，在锁外强制关闭旧流后继续正常 start 流程。这样可从「麦克风
+        永久锁死」状态自愈，避免每次 start 都抛 RuntimeError。
+        """
+        # 残留旧流引用（若上层失步导致上次流未关闭）。锁内只取引用并置 None，
+        # 真正的 stop/close 放到锁外执行（与 stop() 一致：关流可能阻塞）。
+        stale_stream: sd.InputStream | None = None
+        try:
+            with self._lock:
+                if self._stream is not None:
+                    logger.warning(
+                        "[AudioRecorder] start 时发现上次流未释放（上层状态失步），强制关闭后自愈"
+                    )
+                    stale_stream = self._stream
+                    self._stream = None
+                self._frames = []
+                self._samples_recorded = 0
+                self._auto_stopped = False
+                self._stream_error_notified = False
+                # 标记本轮等待首个回调帧（_callback 中据此触发一次性 on_first_frame）。
+                self._first_frame_pending = self._on_first_frame is not None
+                # 查询设备原生采样率：流以原生采样率打开，stop 时重采样到 16k。
+                native_sr = self._query_native_samplerate()
+                self._native_sr = native_sr
+                # InputStream 在 __init__ 时即打开流；这里用 try 包住以在失败时
+                # 不留下半初始化状态。samplerate 用设备原生采样率，避免 sounddevice
+                # 内部做隐式重采样（部分驱动会因此报错或返回异常采样）。
+                stream = sd.InputStream(
+                    samplerate=native_sr,
+                    device=self._device_index,
+                    channels=1,
+                    dtype="float32",
+                    callback=self._callback,
+                )
                 try:
-                    stream.close()
+                    stream.start()
+                except Exception:
+                    # 启动失败时关闭并清理，向上抛出原始异常。
+                    try:
+                        stream.close()
+                    except Exception:  # noqa: BLE001
+                        logger.exception("[AudioRecorder] 启动失败后关闭流再次异常")
+                    raise
+                self._stream = stream
+        finally:
+            # finally 保证：即使新流构造/start 抛异常，旧流也一定被关闭
+            # （异常向上传播前先收尾旧流，避免句柄泄漏）。拆分 try：stop 失败
+            # 仍要尝试 close。
+            if stale_stream is not None:
+                try:
+                    stale_stream.stop()
+                except Exception:  # noqa: BLE001 - 关闭异常不影响新流
+                    logger.exception("[AudioRecorder] 自愈关闭残留旧流 stop 异常")
+                try:
+                    stale_stream.close()
                 except Exception:  # noqa: BLE001
-                    logger.exception("[AudioRecorder] 启动失败后关闭流再次异常")
-                raise
-            self._stream = stream
+                    logger.exception("[AudioRecorder] 自愈关闭残留旧流 close 异常")
 
     def stop(self) -> np.ndarray:
         """停止录音并返回拼接后的 float32 单声道数组（**始终 16 kHz**）。
@@ -259,11 +289,15 @@ class AudioRecorder:
             self._native_sr = _TARGET_SR
 
         if stream is not None:
+            # 拆分 try：stop 失败仍要尝试 close（否则句柄泄漏）。
             try:
                 stream.stop()
-                stream.close()
             except Exception:  # noqa: BLE001 - 关闭异常不影响已录制数据
-                logger.exception("[AudioRecorder] stop/close 流时异常")
+                logger.exception("[AudioRecorder] stop 流时异常")
+            try:
+                stream.close()
+            except Exception:  # noqa: BLE001
+                logger.exception("[AudioRecorder] close 流时异常")
 
         if not frames:
             return np.empty(0, dtype=np.float32)
@@ -295,11 +329,15 @@ class AudioRecorder:
             self._native_sr = _TARGET_SR
 
         if stream is not None:
+            # 拆分 try：stop 失败仍要尝试 close（否则句柄泄漏）。
             try:
                 stream.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("[AudioRecorder] discard stop 流时异常")
+            try:
                 stream.close()
             except Exception:  # noqa: BLE001
-                logger.exception("[AudioRecorder] discard 关闭流时异常")
+                logger.exception("[AudioRecorder] discard close 流时异常")
 
     # ==================== 音频回调 (PortAudio 线程内执行) ====================
 

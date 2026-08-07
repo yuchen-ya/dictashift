@@ -132,6 +132,10 @@ class ApplicationController:
         self._cancel_requested = False
         # 推理中禁用标记：toggle 在推理阶段触发时置位，任务结束后不得粘贴。
         self._disabled_mid_task = False
+        # 任务代次序号：每次新建听写任务（_handle_dictate_press 临界区）bump。
+        # 用于判定 worker 流水线是否已过期（用户取消旧任务并立即新建任务后，
+        # 旧 worker 的 task.seq 不再等于 _task_seq -> 视为 stale 安静消失）。
+        self._task_seq: int = 0
 
         # 运行时翻译配置（可由 set_translation_profiles 切换）。
         self._translation_profiles: list[TranslationProfile] = []
@@ -174,6 +178,29 @@ class ApplicationController:
         """
         with self._lock:
             self._personalize = processor
+
+    def current_dictation_action(self) -> str | None:
+        """只读查询：当前进行中的听写任务 action；无任务返回 None。
+
+        供 application 层的 recorder on_auto_stop 回调获取当前 action（替代
+        application 层自行并行跟踪 _current_action 的竞态方案）。锁内读取
+        _current_task.action，与 controller 的任务生命周期一致，避免：
+        - press 被拒绝时仍覆盖（导致真正在录的 action 被抢走）；
+        - release 后被清空导致 auto-stop 漏触发。
+        """
+        with self._lock:
+            if self._current_task is not None:
+                return self._current_task.action
+            return None
+
+    def _is_task_stale(self, task: VoiceTask) -> bool:
+        """判断 task 是否已过期（代次不匹配当前 _task_seq）。
+
+        过期 worker 的唯一职责是安静消失：调用方据此跳过所有 _goto_safe /
+        _finish_suppressed / _report_error / 粘贴。
+        """
+        with self._lock:
+            return task.seq != self._task_seq
 
     # ==================== 生命周期 ====================
 
@@ -256,6 +283,11 @@ class ApplicationController:
 
         仅 dictate_zh / dictate_en 且当前 RECORDING 或 PREPARING（wait_first_frame
         模式下首帧未到的秒按秒松）且 action 匹配当前任务时结束录音并启动 worker。
+
+        失步恢复：若任务匹配但状态已被并发路径（如旧 worker 流水线收尾）打飞到
+        非 RECORDING/PREPARING（说明录音可能仍在进行却无法走正常 stop），不静默
+        return——取走任务、强制 discard 关流后返回，避免 _stream 残留导致下次
+        start 永久失败（麦克风锁死 bug 的根因）。状态机状态保持不变。
         """
         try:
             if action not in ("dictate_zh", "dictate_en"):
@@ -267,11 +299,37 @@ class ApplicationController:
                     return
                 cur_state = self._sm.state
                 if cur_state not in (AppState.RECORDING, AppState.PREPARING):
-                    return
-                # 取出任务，清空当前指针；stop 在锁外执行（recorder.stop 可能阻塞）。
-                task = self._current_task
-                self._current_task = None
-                was_preparing = cur_state == AppState.PREPARING
+                    # 失步恢复：任务匹配但状态机已被并发路径（如旧 worker 流水线
+                    # 收尾）打飞到非 RECORDING/PREPARING，说明录音可能仍在进行却
+                    # 无法走正常 stop 路径——这正是「麦克风永久锁死」bug 的根因。
+                    # 不得静默 return：取走任务并清 _current_task，锁外强制 discard
+                    # 关闭可能残留的流，让下一次 start 能正常打开。状态机状态保持
+                    # 不变（它反映当前真实流程）。
+                    logger.warning(
+                        "[ApplicationController] handle_hotkey_release 状态失步: "
+                        "action=%s cur_state=%s（应为 RECORDING/PREPARING），"
+                        "强制 discard 关流后返回",
+                        action, cur_state,
+                    )
+                    self._current_task = None
+                    need_desync_cleanup = True
+                else:
+                    need_desync_cleanup = False
+                    # 取出任务，清空当前指针；stop 在锁外执行（recorder.stop 可能阻塞）。
+                    task = self._current_task
+                    self._current_task = None
+                    was_preparing = cur_state == AppState.PREPARING
+
+            if need_desync_cleanup:
+                # 锁外取消首帧兜底 timer + discard 关流（discard 异常 try 包住记日志）。
+                self._cancel_first_frame_timer()
+                try:
+                    self._recorder.discard()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "[ApplicationController] 失步恢复 discard 异常"
+                    )
+                return
             # PREPARING 下 release：首帧没来但用户已松手。取消首帧兜底 timer
             # （若 wait_first_frame 模式下还在等待）。
             if was_preparing:
@@ -415,7 +473,14 @@ class ApplicationController:
                     )
                     no_profile_msg = "未配置翻译服务：请先在设置中选择翻译配置"
             if no_profile_msg is None:
-                self._current_task = VoiceTask(action=action, profile_snapshot=snapshot)
+                # bump 代次：新任务创建即令所有旧 worker 过期。旧 worker 在
+                # _run_pipeline 的每个检查点发现 seq 不匹配后安静消失（不做任何
+                # 状态迁移、不粘贴、不上报），避免把新任务的 RECORDING 踩成
+                # INSERTING/IDLE 或粘贴已取消的旧结果。
+                self._task_seq += 1
+                self._current_task = VoiceTask(
+                    action=action, profile_snapshot=snapshot, seq=self._task_seq
+                )
                 # 清除上一轮的中断标记。
                 self._cancel_requested = False
                 self._disabled_mid_task = False
@@ -546,6 +611,14 @@ class ApplicationController:
         """后台流水线：transcribe -> (translate) -> paste -> IDLE。
 
         任何异常 -> ERROR + on_error。取消/禁用标记在关键检查点生效。
+
+        代次守卫（任务代次 / generation）：每次新建听写任务（_handle_dictate_press）
+        会 bump self._task_seq，新任务携带新 seq。worker 流水线在每个状态迁移检查点
+        先判 _is_task_stale(task)：若过期（task.seq != _task_seq，说明用户已取消旧
+        任务并立即新建了新任务），worker 唯一职责是安静消失——不做任何状态迁移、
+        不调 _finish_suppressed、不 _report_error、不粘贴、不 force ERROR。
+        这避免旧 worker 从 translate 返回后把新任务的 RECORDING 踩成 INSERTING/IDLE
+        或粘贴已取消的旧结果。
         """
         # 流水线耗时统计（成功路径末尾汇总记录，便于排查"等半天出结果"的瓶颈）。
         audio_seconds = len(audio) / 16000.0
@@ -560,6 +633,11 @@ class ApplicationController:
             t_transcribe = time.perf_counter() - t0
             text = getattr(result, "text", "") or ""
 
+            # 代次守卫：过期 worker 安静消失（不做状态迁移/收尾/粘贴）。
+            if self._is_task_stale(task):
+                logger.info("[ApplicationController] 过期 worker 安静消失 (seq=%s)", task.seq)
+                return
+
             if self._should_suppress_output():
                 self._finish_suppressed()
                 return
@@ -573,7 +651,10 @@ class ApplicationController:
 
             # ---- 翻译（仅 dictate_en）----
             if task.action == "dictate_en" and task.profile_snapshot is not None:
-                self._goto_safe(AppState.TRANSLATING)
+                if not self._is_task_stale(task):
+                    self._goto_safe(AppState.TRANSLATING)
+                if self._is_task_stale(task):
+                    return
                 if self._should_suppress_output():
                     self._finish_suppressed()
                     return
@@ -582,6 +663,8 @@ class ApplicationController:
                 t_translate = time.perf_counter() - t1
                 text = translated
 
+            if self._is_task_stale(task):
+                return
             if self._should_suppress_output():
                 self._finish_suppressed()
                 return
@@ -593,7 +676,10 @@ class ApplicationController:
                 # 仅当实际执行 LLM 改写时才进入 REWRITING 状态；
                 # 仅后缀/全关时不出现在状态显示中。
                 if personalize.rewrite_active():
-                    self._goto_safe(AppState.REWRITING)
+                    if not self._is_task_stale(task):
+                        self._goto_safe(AppState.REWRITING)
+                    if self._is_task_stale(task):
+                        return
                     if self._should_suppress_output():
                         self._finish_suppressed()
                         return
@@ -601,12 +687,17 @@ class ApplicationController:
                 text = personalize.apply(text)
 
             # ---- INSERTING ----
-            self._goto_safe(AppState.INSERTING)
+            if not self._is_task_stale(task):
+                self._goto_safe(AppState.INSERTING)
+            if self._is_task_stale(task):
+                return
             if self._should_suppress_output():
                 self._finish_suppressed()
                 return
 
             # 粘贴前最后检查：覆盖进入 INSERTING 到执行粘贴之间的禁用窗口。
+            if self._is_task_stale(task):
+                return
             if self._should_suppress_output():
                 self._finish_suppressed()
                 return
@@ -616,12 +707,22 @@ class ApplicationController:
             t_paste = time.perf_counter() - t2
             # 粘贴成功与否都通过 on_text_ready 通知；pasted=False 表示直输失败，由上层弹窗展示文本。
             self._fire_text_ready(text, bool(pasted))
-            self._goto_safe(AppState.IDLE)
+            if not self._is_task_stale(task):
+                self._goto_safe(AppState.IDLE)
             logger.info(
                 "[ApplicationController] 流水线完成: 音频 %.1fs, 转写 %.2fs, 翻译 %.2fs, 粘贴 %.2fs",
                 audio_seconds, t_transcribe, t_translate, t_paste,
             )
         except Exception as e:  # noqa: BLE001
+            # 代次守卫：过期 worker 的异常也安静消失——不上报、不 force ERROR，
+            # 避免把已新建任务的状态踩成 ERROR。
+            if self._is_task_stale(task):
+                logger.info(
+                    "[ApplicationController] 过期 worker 异常安静消失 (seq=%s)",
+                    task.seq,
+                    exc_info=True,
+                )
+                return
             logger.exception("[ApplicationController] 流水线异常")
             self._report_error(self._safe_error_message(e))
             self._force_state(AppState.ERROR)

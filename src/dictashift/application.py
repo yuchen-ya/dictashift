@@ -8,10 +8,10 @@
   主线程；本层用内部 _Bridge QObject 定义 signals，回调 emit 这些 signal，
   并以 Qt.QueuedConnection 连接到主线程槽。
 - 模型加载/网络请求/阻塞等待一律放后台线程；完成后 queued 通知 UI。
-- 不修改 controller；当前任务 action 在本层自行跟踪（on_press 记录，
-  recorder on_auto_stop 时据此调 handle_hotkey_release）。
+- 不修改 controller；当前任务 action 由 controller.current_dictation_action()
+  查询提供（recorder on_auto_stop 时据此调 handle_hotkey_release）。
 - pynput 回调（_on_hotkey_press / _on_hotkey_release / _on_tray_toggle）只做
-  最小工作：更新 _current_action + 把事件入 FIFO 队列后立即返回。controller 调用
+  最小工作：把事件入 FIFO 队列后立即返回。controller 调用
   （含 recorder.start/stop 的 PortAudio 阻塞）由单线程消费线程按序执行，
   避免 pynput 监听线程被阻塞导致按键不跟手、松开事件延迟处理。
 - 划词翻译：热键 action selection_translate 是「划词翻译开关」（单次触发语义），
@@ -144,10 +144,6 @@ class DictaShiftApplication:
             callbacks=callbacks,
             wait_first_frame=True,
         )
-
-        # ---- 当前任务 action 跟踪（application 层负责，不修改 controller）----
-        self._current_action: str | None = None
-        self._action_lock = threading.Lock()
 
         # ---- pynput 回调异步串行化：回调只入队，消费线程按 FIFO 调 controller ----
         # 解决根因：pynput 监听线程串行处理键事件，若在回调里同步调用
@@ -496,10 +492,13 @@ class DictaShiftApplication:
     # ==================== hotkey -> controller ====================
 
     def _on_hotkey_press(self, action: str) -> None:
-        """pynput 监听线程调用。只做最小工作：记录 action + 入队，立即返回。
+        """pynput 监听线程调用。只做最小工作：入队，立即返回。
 
         controller 调用（含 recorder.start 的 PortAudio 阻塞）由消费线程
         按序执行，避免阻塞 pynput 监听线程导致按键不跟手。
+
+        当前任务 action 不在本层跟踪——由 controller.current_dictation_action()
+        统一查询，避免 press 被拒绝时仍覆盖导致真正在录的 action 被抢走。
 
         selection_translate 是「划词翻译开关」（单次触发语义）：emit
         selection_toggle 经 queued 到主线程翻转功能启停（翻转设置/启停服务/
@@ -508,13 +507,10 @@ class DictaShiftApplication:
         if action == "selection_translate":
             self._bridge.selection_toggle.emit()
             return
-        with self._action_lock:
-            if action in ("dictate_zh", "dictate_en"):
-                self._current_action = action
         self._hotkey_queue.put(("press", action))
 
     def _on_hotkey_release(self, action: str) -> None:
-        """pynput 监听线程调用。只做最小工作：清除 action + 入队，立即返回。
+        """pynput 监听线程调用。只做最小工作：入队，立即返回。
 
         松开事件及时入队（不阻塞），消费线程随后按序调 controller.handle_hotkey_release
         结束录音，避免松手后仍在录音。
@@ -524,9 +520,6 @@ class DictaShiftApplication:
         """
         if action == "selection_translate":
             return
-        with self._action_lock:
-            if self._current_action == action:
-                self._current_action = None
         self._hotkey_queue.put(("release", action))
 
     def _on_auto_stop(self) -> None:
@@ -537,14 +530,18 @@ class DictaShiftApplication:
         recorder.stop()（PortAudio 关流是阻塞调用），主线程执行会违反
         AGENTS.md 11「UI 主线程不做阻塞等待」。controller 的回调经
         _bridge 的 QueuedConnection 回主线程，因此后台线程调用是安全的。
+
+        action 由 controller.current_dictation_action() 查询（锁内读
+        _current_task.action），保证与 controller 任务生命周期一致，
+        避免本层并行跟踪 _current_action 的竞态（press 被拒绝时仍覆盖、
+        release 后被清空导致 auto-stop 漏触发）。handle_hotkey_release 内部
+        已幂等：任务已被取走（release 先到）则直接 return。
         """
-        action = self._current_action
+        action = self._controller.current_dictation_action()
         if action is None:
             return
 
         def _release_in_worker() -> None:
-            with self._action_lock:
-                self._current_action = None
             self._controller.handle_hotkey_release(action)
 
         threading.Thread(
