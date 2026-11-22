@@ -1,20 +1,9 @@
-"""模型下载器：从 GitHub Releases 流式下载 zip 并解压到用户模型目录。
-
-不变量 (AGENTS.md 11 / 12)：
-- 只用 httpx（已是项目依赖），无新第三方依赖。
-- httpx stream 下载：follow_redirects=True（GitHub releases 会 302），
-  connect 超时 15s / read 超时 60s，桌面 UA。
-- 解压：只提取 EXPECTED_SIZES 里的三个文件名，忽略 zip 内其它条目；
-  拒绝含 `..` 或绝对路径的条目（防路径穿越）。
-- 下载后校验：三个文件都存在且大小匹配 EXPECTED_SIZES；任一不满足 -> 抛
-  ModelDownloadError，并清理已解压的半成品。
-- progress_cb(downloaded, total)：total 未知时传 -1。
-- 错误消息可读、不含响应头、不含敏感信息。
-"""
+"""下载并校验 SenseVoice 模型，再安装到用户模型目录。"""
 
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 import tempfile
 import zipfile
@@ -50,6 +39,7 @@ EXPECTED_HASHES = {
 # 防止异常响应耗尽磁盘（开源安全审查 M1）。
 _MAX_DOWNLOAD_BYTES = int(sum(EXPECTED_SIZES.values()) * 1.5)
 
+# SHA256 分块读取大小（1MB）：不把 220MB+ 的 encoder 整读进内存。
 # 桌面 UA，避免某些 CDN 的默认拦截。
 _DESKTOP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -60,7 +50,7 @@ ProgressCb = Callable[[int, int], None]
 
 
 class ModelDownloadError(RuntimeError):
-    """模型下载/解压/校验失败的可读错误。"""
+    """模型下载/解压/校验/安装失败的可读错误。"""
 
 
 def _is_unsafe_name(name: str) -> bool:
@@ -76,27 +66,57 @@ def _is_unsafe_name(name: str) -> bool:
     return False
 
 
+class _ModelRestoreError(ModelDownloadError):
+    """安装失败，且有旧文件需从备份目录恢复。"""
+
+
+def _install_models(staging_dir: Path, dest_dir: Path) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    backups = staging_dir / "previous"
+    backups.mkdir()
+    saved = []
+    installed = []
+    try:
+        for name in REQUIRED_MODEL_FILES:
+            target = dest_dir / name
+            if target.exists() or target.is_symlink():
+                if not target.is_file() and not target.is_symlink():
+                    raise OSError(f"模型目标不是文件：{name}")
+                os.replace(target, backups / name)
+                saved.append(name)
+            os.replace(staging_dir / name, target)
+            installed.append(name)
+    except OSError as exc:
+        restore_failed = False
+        for name in reversed(saved):
+            try:
+                os.replace(backups / name, dest_dir / name)
+            except OSError:
+                restore_failed = True
+        for name in installed:
+            if name not in saved:
+                try:
+                    (dest_dir / name).unlink(missing_ok=True)
+                except OSError:
+                    restore_failed = True
+        if restore_failed:
+            raise _ModelRestoreError(f"模型安装失败，旧文件备份保留在 {backups}") from exc
+        raise ModelDownloadError("模型安装失败，请检查文件是否被占用并重试") from exc
+
+
 def download_models(
     dest_dir: Path,
     progress_cb: ProgressCb | None = None,
     expected_hashes: dict[str, str] | None = None,
 ) -> None:
-    """从 MODEL_DOWNLOAD_URL 流式下载 zip 到临时文件 -> 解压到 dest_dir ->
-    校验三个文件存在且大小、SHA256 匹配 -> 清理临时文件。
+    """下载、校验并安装模型，失败时保留已安装的模型。
 
-    progress_cb(downloaded_bytes, total_bytes)；total 未知（响应无
-    Content-Length）时传 -1。
-    expected_hashes：默认使用模块常量 EXPECTED_HASHES（测试可注入）。
-
-    任何失败抛 ModelDownloadError，并清理半成品：
-    - 已解压但校验失败/拒绝条目的文件会被删除。
-    - 临时下载文件始终清理。
+    progress_cb(downloaded_bytes, total_bytes) 的总大小在未知时为 -1。
     """
     if expected_hashes is None:
         expected_hashes = EXPECTED_HASHES
     dest_dir = Path(dest_dir)
-    tmp_zip: Path | None = None
-    extracted: list[Path] = []
+    staging_dir: Path | None = None
 
     def _emit(downloaded: int, total: int) -> None:
         if progress_cb is not None:
@@ -107,10 +127,9 @@ def download_models(
                 pass
 
     try:
-        # 1. 流式下载到临时文件。
-        tmp_zip = Path(
-            tempfile.mktemp(prefix="dictashift-model-", suffix=".zip")
-        )
+        dest_dir.parent.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(tempfile.mkdtemp(prefix=f".{dest_dir.name}.tmp-", dir=dest_dir.parent))
+        tmp_zip = staging_dir / "download.zip"
         timeout = httpx.Timeout(connect=15.0, read=60.0, write=15.0, pool=15.0)
         total = -1
         downloaded = 0
@@ -132,7 +151,7 @@ def download_models(
                             f"下载中止：声明大小 {total} 字节超出安全上限"
                         )
                 _emit(0, total)
-                with open(tmp_zip, "wb") as f:
+                with tmp_zip.open("xb") as f:
                     for chunk in resp.iter_bytes(chunk_size=64 * 1024):
                         if not chunk:
                             continue
@@ -144,18 +163,17 @@ def download_models(
                         f.write(chunk)
                         _emit(downloaded, total)
 
-        # 2. 解压目标文件（仅 EXPECTED_SIZES 里的三个文件名）。
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        # 2. 解压目标文件到临时目录（仅 EXPECTED_SIZES 里的三个文件名）。
         wanted = set(REQUIRED_MODEL_FILES)
         with zipfile.ZipFile(tmp_zip) as zf:
             # 建立期望文件名 -> zip 内条目名 的映射（取 basename 匹配）。
-            member_for: dict[str, str] = {}
+            member_for: dict[str, zipfile.ZipInfo] = {}
             for info in zf.infolist():
                 if info.is_dir():
                     continue
                 base = Path(info.filename).name
                 if base in wanted:
-                    member_for[base] = info.filename
+                    member_for[base] = info
             missing = wanted - set(member_for.keys())
             if missing:
                 raise ModelDownloadError(
@@ -163,19 +181,23 @@ def download_models(
                 )
             # 提取，逐条做安全检查。
             for base, member in member_for.items():
-                if _is_unsafe_name(member):
+                if _is_unsafe_name(member.filename):
                     raise ModelDownloadError(
-                        f"压缩包含可疑路径条目，已拒绝：{member}"
+                        f"压缩包含可疑路径条目，已拒绝：{member.filename}"
                     )
-                target = dest_dir / base
-                with zf.open(member) as src, open(target, "wb") as dst:
+                expected = EXPECTED_SIZES[base]
+                if member.file_size != expected:
+                    raise ModelDownloadError(
+                        f"文件大小校验失败：{base} 实际 {member.file_size}，期望 {expected}"
+                    )
+                target = staging_dir / base
+                with zf.open(member) as src, target.open("xb") as dst:
                     shutil.copyfileobj(src, dst)
-                extracted.append(target)
 
-        # 3. 校验：三个文件存在且大小、SHA256 匹配。
+        # 3. 校验（仍在临时目录）：三个文件存在、大小匹配、SHA256 匹配。
         for name in REQUIRED_MODEL_FILES:
-            target = dest_dir / name
-            if not target.exists():
+            target = staging_dir / name
+            if not target.is_file():
                 raise ModelDownloadError(f"解压后缺失文件：{name}")
             actual = target.stat().st_size
             expected = EXPECTED_SIZES[name]
@@ -185,38 +207,24 @@ def download_models(
                 )
             expected_hash = expected_hashes.get(name)
             if expected_hash:
-                digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                with target.open("rb") as file:
+                    digest = hashlib.file_digest(file, "sha256").hexdigest()
                 if digest != expected_hash:
                     raise ModelDownloadError(
                         f"文件完整性校验失败（SHA256 不匹配）：{name}"
                     )
 
-    except ModelDownloadError:
-        # 清理半成品。
-        for p in extracted:
-            try:
-                p.unlink()
-            except OSError:
-                pass
+        _install_models(staging_dir, dest_dir)
+
+    except _ModelRestoreError:
+        staging_dir = None  # 保留需要手动恢复的旧文件。
         raise
     except httpx.HTTPError as e:
-        # 清理半成品后包装为可读错误。
-        for p in extracted:
-            try:
-                p.unlink()
-            except OSError:
-                pass
         raise ModelDownloadError(f"网络下载失败：{type(e).__name__}") from e
     except zipfile.BadZipFile as e:
-        for p in extracted:
-            try:
-                p.unlink()
-            except OSError:
-                pass
         raise ModelDownloadError("下载的文件不是有效的 zip 压缩包") from e
+    except OSError as e:
+        raise ModelDownloadError("写入模型失败，请检查磁盘空间和目录权限") from e
     finally:
-        if tmp_zip is not None:
-            try:
-                tmp_zip.unlink()
-            except OSError:
-                pass
+        if staging_dir is not None:
+            shutil.rmtree(staging_dir, ignore_errors=True)

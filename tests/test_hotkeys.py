@@ -220,6 +220,44 @@ def test_update_bindings_removes_old_binding() -> None:
     assert presses == ["dictate_zh"]
 
 
+def test_update_bindings_preserves_unchanged_hold_until_release() -> None:
+    presses: list[str] = []
+    releases: list[str] = []
+    binding = HotkeyBinding(action="dictate_zh", keys=frozenset({"f8"}))
+    svc = _make_service([binding], on_press=presses.append, on_release=releases.append)
+
+    _press(svc, "f8")
+    svc.update_bindings([binding])
+    _press(svc, "f8")  # 按住期间的系统自动重复。
+    _release(svc, "f8")
+
+    assert presses == ["dictate_zh"]
+    assert releases == ["dictate_zh"]
+
+
+def test_rebinding_hold_waits_for_original_keys_to_release() -> None:
+    presses: list[str] = []
+    releases: list[str] = []
+    old = HotkeyBinding(action="dictate_zh", keys=frozenset({"ctrl", "f8"}))
+    new = HotkeyBinding(action="dictate_zh", keys=frozenset({"ctrl", "f9"}))
+    svc = _make_service([old], on_press=presses.append, on_release=releases.append)
+
+    _press(svc, "ctrl")
+    _press(svc, "f8")
+    svc.update_bindings([new])
+    _press(svc, "f9")
+    _release(svc, "f9")
+    assert presses == ["dictate_zh"]
+    assert releases == []
+
+    _release(svc, "f8")
+    _press(svc, "f9")
+    _release(svc, "f9")
+    _release(svc, "ctrl")
+    assert presses == ["dictate_zh", "dictate_zh"]
+    assert releases == ["dictate_zh", "dictate_zh"]
+
+
 def test_partial_release_of_combo_fires_release() -> None:
     """组合键中任意构成键松开即不再满配 -> 触发一次 on_release（非 press-only）。"""
     releases: list[str] = []

@@ -274,6 +274,12 @@ class SettingsWindow(QWidget):
             )
         form.addRow("麦克风：", self._mic_combo)
 
+        self._instant_recording_check = QCheckBox("即按即录（保持麦克风开启）", page)
+        form.addRow("", self._instant_recording_check)
+        instant_hint = QLabel("语音输入启用期间保持麦克风开启。仅在按住听写热键时保留音频，暂停或退出会关闭麦克风。", page)
+        instant_hint.setWordWrap(True)
+        form.addRow("", instant_hint)
+
         self._max_record_spin = QSpinBox(page)
         self._max_record_spin.setRange(5, 120)
         self._max_record_spin.setSuffix(" 秒")
@@ -516,6 +522,7 @@ class SettingsWindow(QWidget):
         self._selection_translate_edit.set_config_text(settings.hotkeys.selection_translate)
         # ASR
         self._max_record_spin.setValue(int(settings.asr.max_record_seconds))
+        self._instant_recording_check.setChecked(settings.asr.instant_recording)
         self._select_mic(settings.asr.mic_device_index)
         # 模型状态刷新一次。
         self.refresh_model_status()
@@ -589,6 +596,7 @@ class SettingsWindow(QWidget):
         asr = dataclasses.replace(
             settings.asr,
             max_record_seconds=int(self._max_record_spin.value()),
+            instant_recording=self._instant_recording_check.isChecked(),
             mic_device_index=self._current_mic_index(),
         )
         settings.asr = asr
@@ -651,6 +659,7 @@ class SettingsWindow(QWidget):
         self._selection_translate_edit.set_config_text(default_hk.selection_translate)
         # ASR
         self._max_record_spin.setValue(int(default_asr.max_record_seconds))
+        self._instant_recording_check.setChecked(default_asr.instant_recording)
         self._select_mic(default_asr.mic_device_index)
         # 个性化
         self._suffix_check.setChecked(default_personalize.suffix_enabled)
@@ -719,11 +728,21 @@ class SettingsWindow(QWidget):
 
     # ==================== 模型状态 / 下载 ====================
 
-    def refresh_model_status(self) -> None:
-        """刷新模型状态标签与下载按钮可见性。
+    def _sync_download_btn_for_ready(self, ready: bool) -> None:
+        """按就绪态同步下载按钮文案与可见性。
 
-        已安装：显示「已安装（<路径>）」并隐藏下载按钮；
-        未安装：显示「未安装」并显示下载按钮（除非下载进行中）。
+        已安装也保留按钮（文案「重新下载模型」）：存在但加载失败/损坏
+        的模型用户可重新下载修复，而不是被隐藏的按钮卡死。
+        """
+        self._download_model_btn.setText("重新下载模型" if ready else "下载模型")
+        self._download_model_btn.show()
+
+    def refresh_model_status(self) -> None:
+        """刷新模型状态标签与下载按钮。
+
+        已安装：显示「已安装」，按钮改为「重新下载模型」仍可见；
+        未安装：显示「未安装」，按钮为「下载模型」。
+        （下载进行中不刷新，避免覆盖进度文案。）
         """
         from ..asr.providers import default_model_dir, models_ready
 
@@ -731,12 +750,14 @@ class SettingsWindow(QWidget):
         if self._model_progress.isVisible():
             return
         model_dir = default_model_dir()
-        if models_ready(model_dir):
-            self._model_status_label.setText(f"已安装（{model_dir}）")
-            self._download_model_btn.hide()
+        ready = models_ready(model_dir)
+        if ready:
+            self._model_status_label.setText("已安装")
+            self._model_status_label.setToolTip(str(model_dir))
         else:
             self._model_status_label.setText("未安装")
-            self._download_model_btn.show()
+            self._model_status_label.setToolTip("")
+        self._sync_download_btn_for_ready(ready)
 
     def set_model_download_progress(self, percent: int) -> None:
         """由 application 层在下载进度回调（queued 主线程）中调用。
@@ -759,24 +780,31 @@ class SettingsWindow(QWidget):
         self._model_progress.setRange(0, 100)
         self._model_progress.setValue(0)
         self._download_model_btn.setEnabled(True)
-        self._download_model_btn.setText("下载模型")
         self.refresh_model_status()
 
     def on_model_download_failed(self, message: str) -> None:
         """下载失败（queued 主线程）：恢复按钮、隐藏进度条、显示错误文案。"""
+        from ..asr.providers import default_model_dir, models_ready
+
         self._model_progress.hide()
         self._model_progress.setRange(0, 100)
         self._model_progress.setValue(0)
         self._download_model_btn.setEnabled(True)
-        self._download_model_btn.setText("下载模型")
         self._model_status_label.setText("下载失败：" + message)
-        # 失败后仍按实际就绪态决定按钮可见性。
-        from ..asr.providers import default_model_dir, models_ready
+        # 无论就绪与否都保留下载按钮（失败可重试；已装但损坏可重新下载）。
+        self._sync_download_btn_for_ready(models_ready(default_model_dir()))
 
-        if models_ready(default_model_dir()):
-            self._download_model_btn.hide()
-        else:
-            self._download_model_btn.show()
+    def mark_model_load_failed(self, message: str) -> None:
+        """模型存在但加载失败（queued 主线程）：提示用户可重新下载修复。
+
+        由 application 层在 ASR 初始化失败且 models_ready 为真时调用
+        （接线建议：_start_asr_init_thread 的失败分支 else 路径）。
+        """
+        self._model_status_label.setText(
+            f"模型加载失败：{message}，可点击「重新下载模型」修复"
+        )
+        self._download_model_btn.setEnabled(True)
+        self._sync_download_btn_for_ready(True)
 
     # ==================== 按钮事件 ====================
 

@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -28,6 +29,7 @@ class FakeInputStream:
         self.kwargs = kwargs
         self.callback = kwargs.get("callback")
         self._started = False
+        self.time = 100.0
         self.start_calls = 0
         self.stop_calls = 0
         self.close_calls = 0
@@ -36,6 +38,10 @@ class FakeInputStream:
         self._started = True
         self.start_calls += 1
 
+    @property
+    def active(self) -> bool:
+        return self._started
+
     def stop(self) -> None:
         self._started = False
         self.stop_calls += 1
@@ -43,9 +49,13 @@ class FakeInputStream:
     def close(self) -> None:
         self.close_calls += 1
 
-    def feed(self, samples: np.ndarray, frames: int) -> None:
-        """模拟 PortAudio 回调：用 captured=True, time=0, status=0 调用 callback。"""
-        self.callback(samples, frames, 0, 0)
+    def feed(self, samples, frames: int, *, adc_time: float | None = None, status=0) -> None:
+        """模拟 PortAudio 回调及其中止行为。"""
+        timing = SimpleNamespace(inputBufferAdcTime=self.time if adc_time is None else adc_time)
+        try:
+            self.callback(samples, frames, timing, status)
+        except recorder_mod.sd.CallbackAbort:
+            self._started = False
 
 
 # 用于自愈 finally 测试的可控 fake：可在 start/stop/close 上抛指定异常。
@@ -76,6 +86,11 @@ class FakeStream:
         self.close_calls += 1
         if FakeStream.close_raises:
             raise RuntimeError("close boom")
+
+
+@pytest.fixture(autouse=True)
+def no_wasapi_by_default(monkeypatch):
+    monkeypatch.setattr(recorder_mod.sd, "query_hostapis", lambda: ())
 
 
 @pytest.fixture
@@ -111,6 +126,151 @@ def fake_query(monkeypatch):
 
 
 # ==================== AudioRecorder ====================
+
+
+@pytest.mark.parametrize("wasapi_available", [True, False])
+def test_default_input_prefers_wasapi_with_compatible_fallback(monkeypatch, fake_sd, wasapi_available):
+    monkeypatch.setattr(recorder_mod.sd, "query_hostapis", lambda: (
+        {"name": "Windows WASAPI", "default_input_device": 12},
+    ))
+    opened = []
+
+    def open_stream(**kwargs):
+        device = kwargs["device"]
+        opened.append(device)
+        if device == 12 and not wasapi_available:
+            raise recorder_mod.sd.PortAudioError("unavailable")
+        return FakeInputStream(**kwargs)
+
+    monkeypatch.setattr(recorder_mod.sd, "InputStream", open_stream)
+    rec = recorder_mod.AudioRecorder()
+    rec.start()
+    rec.discard()
+
+    assert opened == ([12] if wasapi_available else [12, None])
+
+
+def test_stale_input_callback_does_not_pollute_next_recording(fake_sd):
+    heard = []
+    rec = recorder_mod.AudioRecorder(on_first_frame=lambda: heard.append(True))
+    rec.start()
+    old = rec._stream
+    rec.discard()
+    rec.start()
+    current = rec._stream
+
+    old.feed(np.full((4, 1), 0.25, dtype=np.float32), 4)
+    assert not heard
+    current.feed(np.full((4, 1), 0.5, dtype=np.float32), 4)
+    np.testing.assert_array_equal(rec.stop(), np.full(4, 0.5, dtype=np.float32))
+    assert heard == [True]
+
+
+def test_warm_stream_only_copies_audio_after_recording_begins(fake_sd) -> None:
+    copied_idle: list[bool] = []
+    events: list[str] = []
+
+    class IdleAudio:
+        def copy(self):
+            copied_idle.append(True)
+            return np.zeros((1, 1), dtype=np.float32)
+
+    rec = recorder_mod.AudioRecorder(
+        max_seconds=1,
+        on_first_frame=lambda: events.append("first"),
+        on_auto_stop=lambda: events.append("limit"),
+    )
+    assert rec.set_warm_enabled(True)
+    stream = rec._stream
+    assert stream is not None and stream.active
+    assert not rec.is_recording
+    stream.feed(IdleAudio(), 16000)
+    assert rec.stop().size == 0
+    assert events == copied_idle == []
+
+    rec.start()
+    assert rec.is_recording
+    assert rec._stream is stream and stream.start_calls == 1
+    stream.feed(IdleAudio(), 16000, adc_time=stream.time - 2)
+    assert events == copied_idle == []
+    data = np.array([[1], [2], [3], [4]], dtype=np.float32)
+    stream.feed(data, 4, adc_time=stream.time - 1.75 / 16000)
+    np.testing.assert_array_equal(rec.stop(), data[2:, 0])
+    assert events == ["first"]
+    assert stream.active and not rec.is_recording
+
+    stream.feed(IdleAudio(), 16000)
+    assert copied_idle == []
+    rec.start()
+    stream.feed(data, 4)
+    rec.discard()
+    assert rec.stop().size == 0
+    assert events == ["first", "first"]
+    assert stream.active
+    rec.close()
+    assert not stream.active and stream.close_calls == 1
+
+
+def test_disabling_warm_stream_while_recording_closes_on_release(fake_sd) -> None:
+    rec = recorder_mod.AudioRecorder()
+    assert rec.set_warm_enabled(True)
+    stream = rec._stream
+    rec.start()
+    assert not rec.set_warm_enabled(False)
+    assert rec.is_recording and stream.active
+    stream.feed(np.ones((4, 1), dtype=np.float32), 4)
+    np.testing.assert_array_equal(rec.stop(), np.ones(4, dtype=np.float32))
+    assert stream.close_calls == 1
+
+
+def test_switching_device_closes_idle_warm_stream(fake_sd) -> None:
+    rec = recorder_mod.AudioRecorder(device_index=1)
+    assert rec.set_warm_enabled(True)
+    old_stream = rec._stream
+
+    rec.device_index = 2
+    new_stream = rec._stream
+    assert old_stream.close_calls == 1
+    assert new_stream.kwargs["device"] == 2
+    assert new_stream.active and not rec.is_recording
+    rec.set_warm_enabled(False)
+    assert new_stream.close_calls == 1
+
+
+@pytest.mark.parametrize("failure", ["open", "idle_error"])
+def test_unavailable_warm_input_recovers_on_next_recording(monkeypatch, fake_sd, failure) -> None:
+    attempts = 0
+
+    def open_stream(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if failure == "open" and attempts == 1:
+            raise recorder_mod.sd.PortAudioError("unavailable")
+        return FakeInputStream(**kwargs)
+
+    monkeypatch.setattr(recorder_mod.sd, "InputStream", open_stream)
+    errors: list[str] = []
+    rec = recorder_mod.AudioRecorder(on_stream_error=errors.append)
+    samples = np.ones((4, 1), dtype=np.float32)
+    if failure == "idle_error":
+        assert rec.set_warm_enabled(True)
+        old_stream = rec._stream
+        old_stream.feed(samples, 4, status=_make_fatal_status())
+        assert not old_stream.active
+        assert errors == []
+    else:
+        assert not rec.set_warm_enabled(True)
+        assert rec._stream is None
+
+    rec.start()
+    assert attempts == 2
+    current_stream = rec._stream
+    if failure == "idle_error":
+        assert current_stream is not old_stream
+        assert old_stream.close_calls == 1
+    current_stream.feed(samples, 4)
+    np.testing.assert_array_equal(rec.stop(), samples[:, 0])
+    rec.close()
 
 
 def test_stop_without_start_returns_empty(fake_sd) -> None:
@@ -229,6 +389,7 @@ def test_input_stream_records_kwargs(fake_sd) -> None:
     assert stream.kwargs["samplerate"] == 16000
     assert stream.kwargs["channels"] == 1
     assert stream.kwargs["dtype"] == "float32"
+    assert stream.kwargs["latency"] == "low"
     # device_index 透传
     assert stream.kwargs["device"] == 7
     rec.stop()

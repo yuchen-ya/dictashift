@@ -182,6 +182,7 @@ def test_asr_settings_ignores_legacy_device_keys() -> None:
     """旧配置文件中的 device/device_id 键被忽略（from_dict 不读取）。"""
     a = AsrSettings.from_dict({"device": "cuda", "device_id": 3, "max_record_seconds": 20})
     assert a.max_record_seconds == 20
+    assert not a.instant_recording
     assert not hasattr(a, "device")
     # round-trip 不再写出 device/device_id
     assert "device" not in a.to_dict()
@@ -189,7 +190,7 @@ def test_asr_settings_ignores_legacy_device_keys() -> None:
 
 def test_asr_settings_round_trip_no_device() -> None:
     """AsrSettings 序列化往返不含 device。"""
-    a = AsrSettings(max_record_seconds=45, mic_device_index=1)
+    a = AsrSettings(max_record_seconds=45, mic_device_index=1, instant_recording=True)
     a2 = AsrSettings.from_dict(a.to_dict())
     assert a2 == a
     assert "device" not in a2.to_dict()

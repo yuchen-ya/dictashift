@@ -29,6 +29,7 @@ from typing import Callable
 import httpx
 import pytest
 
+from dictashift import main
 from dictashift.translation import (
     BingEdgeBackend,
     DispatcherBackend,
@@ -648,3 +649,40 @@ class TestSettingsMigration:
             restored = profile_from_dict(d)
             assert restored.backend_type == bt
             assert restored == original
+
+
+@pytest.mark.parametrize("status_code", [200, 418])
+def test_application_logs_omit_google_source_and_response_text(
+    monkeypatch, caplog, tmp_path, status_code,
+):
+    source = "private-source-marker"
+    response_marker = "private-response-marker"
+    client_type = httpx.Client
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(status_code, json=[[[response_marker, source]]])
+    )
+
+    def client(**kwargs):
+        return client_type(transport=transport, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", client)
+    monkeypatch.setattr(main, "_default_log_dir", lambda: tmp_path)
+
+    def configure_without_files(handlers, **kwargs):
+        for handler in handlers:
+            handler.close()
+
+    monkeypatch.setattr(main.logging, "basicConfig", configure_without_files)
+    with caplog.at_level(logging.DEBUG), caplog.at_level(logging.DEBUG, logger="httpx"), caplog.at_level(
+        logging.DEBUG, logger="httpcore",
+    ):
+        main._setup_logging()
+        backend = GoogleFreeBackend()
+        if status_code == 200:
+            assert backend.translate(source, _profile()) == response_marker
+        else:
+            with pytest.raises(TranslationError, match="HTTP 418"):
+                backend.translate(source, _profile())
+
+    assert source not in caplog.text
+    assert response_marker not in caplog.text

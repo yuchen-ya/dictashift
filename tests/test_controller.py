@@ -31,6 +31,7 @@ import numpy as np
 import pytest
 
 from dictashift.core.controller import ApplicationController, ControllerCallbacks
+from dictashift.core.jobs import VoiceTask
 from dictashift.core.state import AppState
 from dictashift.translation import TranslationProfile
 
@@ -489,16 +490,15 @@ def test_disable_while_inserting_no_paste() -> None:
         asr=asr, paste_func=lambda t: paste_calls.append(t) or True
     )
 
-    # 在进入 INSERTING 的瞬间（worker 线程内）触发禁用，
-    # 精确命中「进入 INSERTING -> 执行粘贴」之间的窗口。
-    original_goto_safe = ctrl._goto_safe
+    original_transition = ctrl._transition_task
 
-    def goto_safe_with_toggle(target: AppState) -> None:
-        original_goto_safe(target)
+    def transition_with_toggle(task: VoiceTask, target: AppState) -> bool:
+        transitioned = original_transition(task, target)
         if target == AppState.INSERTING:
             ctrl.handle_hotkey_press("toggle_enabled")
+        return transitioned
 
-    ctrl._goto_safe = goto_safe_with_toggle
+    ctrl._transition_task = transition_with_toggle
 
     ctrl.handle_hotkey_press("dictate_zh")
     ctrl.handle_hotkey_release("dictate_zh")
@@ -638,12 +638,7 @@ def test_empty_asr_text_reports_error_and_returns_idle() -> None:
 
 
 def test_empty_asr_text_suppressed_does_not_report_error() -> None:
-    """对照：ASR 返回空文本，但任务在 _should_suppress_output 检查点已被取消
-    抑制时，走 _finish_suppressed 分支，不走空文本的 on_error。
-
-    实现要点：让 transcribe 阻塞到取消信号发出后才放行，确保 worker 走到
-    _should_suppress_output 检查点时 _cancel_requested 已为 True。
-    """
+    """取消后，空识别结果也不会触发错误通知。"""
     block = threading.Event()
     asr = FakeAsrService(text="", block_event=block)
     ctrl, cb, _asr, recorder, _ = _make_controller(asr=asr)
@@ -654,7 +649,7 @@ def test_empty_asr_text_suppressed_does_not_report_error() -> None:
 
     # 推理中取消（worker 仍阻塞在 transcribe）
     ctrl.handle_hotkey_press("cancel")
-    # 放行 transcribe，使 worker 走到 _should_suppress_output 检查点（已被取消）
+    # 放行已经取消的识别任务。
     block.set()
 
     _wait_for_state(cb, AppState.IDLE, timeout=5.0)
@@ -1170,7 +1165,7 @@ def test_handle_hotkey_release_state_desync_forces_discard_and_clears_task() -> 
 
     # 模拟 bug：状态被并发路径（旧 worker 收尾）打飞到 IDLE，但 _current_task
     # 和 recorder._stream 都还在（真实场景里 recorder._stream 也未关闭）。
-    ctrl._force_state(AppState.IDLE)
+    ctrl._sm.force(AppState.IDLE)
     assert ctrl._current_task is not None  # 任务仍在
 
     # 此时 release：旧行为会静默 return 留下残留流；新行为应强制 discard + 清任务。
@@ -1222,15 +1217,7 @@ def test_handle_hotkey_release_action_mismatch_returns_without_discard() -> None
     _wait_for_state(cb, AppState.IDLE)
 
 
-# ==================== 任务代次守卫（修复 A：旧 worker 不踩新任务状态机）====================
-#
-# 回归场景：dictate_en 任务A翻译慢，用户 Esc 取消（_handle_cancel 置
-# _cancel_requested=True 并 force IDLE）-> 用户立即按听写键，创建任务B
-# （_handle_dictate_press bump seq + 清 _cancel_requested=False）-> 任务A的
-# worker 从 translate 返回后 _should_suppress_output() 变 False -> 旧行为会继续
-# _goto_safe(INSERTING)/粘贴/_goto_safe(IDLE)，把任务B的 RECORDING 踩成
-# INSERTING/IDLE 并粘贴已取消的旧结果。修复后：旧 worker 发现 stale 安静消失，
-# 不做任何状态迁移、不粘贴。
+# ==================== 听写任务取消与代次隔离 ====================
 
 
 class _BlockingTranslationBackend(FakeTranslationBackend):
@@ -1270,11 +1257,11 @@ class TestTaskGenerationGuard:
         assert backend.entered.wait(timeout=5.0)
         assert ctrl.state == AppState.TRANSLATING
 
-        # 用户 Esc 取消任务A：_handle_cancel 置 _cancel_requested=True + force IDLE。
+        # 用户 Esc 取消任务 A 并立即回到 IDLE。
         ctrl.handle_hotkey_press("cancel")
         assert ctrl.state == AppState.IDLE
 
-        # 立即新建任务B（dictate_en）：bump seq + 清抑制标记。
+        # 立即新建任务 B（dictate_en）。
         # 注意：任务A被取消 force 到 IDLE 后，_handle_dictate_press 检测到 IDLE
         # 即可正常创建新任务（与真实场景一致）。
         ctrl.handle_hotkey_press("dictate_en")
@@ -1327,8 +1314,7 @@ class TestTaskGenerationGuard:
     def test_stale_worker_exception_does_not_force_error(self) -> None:
         """过期 worker 抛异常时安静消失：不上报、不 force ERROR，不踩新任务。
 
-        场景：任务A transcribe 抛异常（但任务A已被取消+新建任务B），过期 worker
-        在 except 路径发现 stale -> 只记日志，不 _report_error / 不 _force_state(ERROR)。
+        场景：任务 A 已被取消且任务 B 已新建，任务 A 抛异常时保持任务 B 的状态。
         任务B 用正常 ASR 路径（首次抛异常、之后成功），确保清理可完成。
         """
         block_asr = threading.Event()
@@ -1385,8 +1371,7 @@ class TestTaskGenerationGuard:
         assert ctrl.state == AppState.IDLE
 
     def test_cancel_suppression_still_works_without_new_task(self) -> None:
-        """cancel 抑制语义不变：只 cancel 不新建任务时，worker 走 _finish_suppressed
-        （不 bump seq，靠 flag 抑制），最终回 IDLE、不粘贴。"""
+        """只取消而不新建任务时，旧识别结果也会被丢弃。"""
         block = threading.Event()
         paste_calls: list[str] = []
         asr = FakeAsrService(text="some text", block_event=block)
@@ -1405,3 +1390,118 @@ class TestTaskGenerationGuard:
         time.sleep(0.2)
         assert paste_calls == []
         assert cb.texts == []
+
+
+def _pipeline_finished(ctrl: ApplicationController) -> threading.Event:
+    finished = threading.Event()
+    run_pipeline = ctrl._run_pipeline
+
+    def tracking_pipeline(task: VoiceTask, audio: np.ndarray) -> None:
+        try:
+            run_pipeline(task, audio)
+        finally:
+            finished.set()
+
+    ctrl._run_pipeline = tracking_pipeline
+    return finished
+
+
+@pytest.mark.parametrize("interrupt", ["disable_reenable", "cancel_failure", "shutdown"])
+def test_interrupted_asr_never_publishes_result_or_error(interrupt: str) -> None:
+    resume_asr = threading.Event()
+    asr_started = threading.Event()
+    paste_calls: list[str] = []
+
+    class BlockingASR(FakeAsrService):
+        def transcribe(self, audio, lid="auto", itn=True):
+            asr_started.set()
+            assert resume_asr.wait(timeout=5)
+            if interrupt == "cancel_failure":
+                raise RuntimeError("cancelled ASR failed")
+            return super().transcribe(audio, lid=lid, itn=itn)
+
+    ctrl, cb, *_ = _make_controller(
+        asr=BlockingASR(), paste_func=lambda text: paste_calls.append(text) or True
+    )
+    finished = _pipeline_finished(ctrl)
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert asr_started.wait(timeout=5)
+
+    try:
+        if interrupt == "disable_reenable":
+            ctrl.handle_hotkey_press("toggle_enabled")
+            ctrl.handle_hotkey_press("toggle_enabled")
+        elif interrupt == "cancel_failure":
+            ctrl.handle_hotkey_press("cancel")
+        else:
+            ctrl.shutdown()
+    finally:
+        resume_asr.set()
+
+    assert finished.wait(timeout=5)
+    assert ctrl.state is AppState.IDLE
+    assert paste_calls == []
+    assert cb.texts == []
+    assert cb.errors == []
+
+
+def test_cancel_between_pipeline_stages_keeps_new_recording() -> None:
+    before_inserting = threading.Event()
+    resume_pipeline = threading.Event()
+    paste_calls: list[str] = []
+    ctrl, cb, _, recorder, _ = _make_controller(
+        paste_func=lambda text: paste_calls.append(text) or True
+    )
+    finished = _pipeline_finished(ctrl)
+    transition = ctrl._transition_task
+
+    def gate_inserting(task: VoiceTask, state: AppState) -> bool:
+        if state is AppState.INSERTING and not before_inserting.is_set():
+            before_inserting.set()
+            assert resume_pipeline.wait(timeout=5)
+        return transition(task, state)
+
+    ctrl._transition_task = gate_inserting
+    ctrl.handle_hotkey_press("dictate_zh")
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert before_inserting.wait(timeout=5)
+    try:
+        ctrl.handle_hotkey_press("cancel")
+        ctrl.handle_hotkey_press("dictate_zh")
+        assert ctrl.state is AppState.RECORDING
+    finally:
+        resume_pipeline.set()
+
+    assert finished.wait(timeout=5)
+    assert ctrl.state is AppState.RECORDING
+    assert paste_calls == []
+    ctrl.handle_hotkey_release("dictate_zh")
+    assert cb.text_event.wait(timeout=5)
+    assert recorder.discard_calls == 0
+    assert paste_calls == ["你好世界"]
+
+
+def test_delayed_recorder_events_keep_new_recording() -> None:
+    ctrl, cb, _, recorder, _ = _make_controller(wait_first_frame=True)
+    ctrl.handle_hotkey_press("dictate_zh")
+    old_task = ctrl.current_dictation_task()
+    assert old_task is not None
+    ctrl.handle_hotkey_press("cancel")
+    ctrl.handle_hotkey_press("dictate_zh")
+    new_task = ctrl.current_dictation_task()
+    assert new_task is not None
+
+    ctrl._on_first_frame(old_task.seq)
+    ctrl._on_stream_error("old stream error", old_task.seq)
+    ctrl.handle_hotkey_release(old_task.action, expected_seq=old_task.seq)
+    assert ctrl.state is AppState.PREPARING
+    assert recorder.stop_calls == 0
+    assert recorder.discard_calls == 1
+    assert cb.errors == []
+
+    ctrl._on_first_frame(new_task.seq)
+    assert ctrl.state is AppState.RECORDING
+    ctrl.handle_hotkey_release(new_task.action, expected_seq=new_task.seq)
+    assert cb.text_event.wait(timeout=5)
+    assert recorder.stop_calls == 1

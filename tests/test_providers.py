@@ -114,6 +114,20 @@ def test_initialize_auto_cpu_success(patched_engine) -> None:
     assert len(FakeEngine._instances) == 1
 
 
+def test_initialize_finds_model_downloaded_after_service_creation(patched_engine, monkeypatch, tmp_path):
+    fallback = tmp_path / "fallback"
+    installed = tmp_path / "installed"
+    monkeypatch.setattr(service_mod, "default_model_dir", lambda: fallback)
+    svc = service_mod.ASRService()
+    monkeypatch.setattr(service_mod, "default_model_dir", lambda: installed)
+
+    svc.initialize()
+
+    assert patched_engine._instances[-1].config.encoder_path == str(
+        installed / providers_mod.REQUIRED_MODEL_FILES[0]
+    )
+
+
 def test_initialize_auto_warmup_failure_releases_engine_and_raises(
     patched_engine, monkeypatch
 ) -> None:

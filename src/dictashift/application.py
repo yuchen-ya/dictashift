@@ -45,7 +45,7 @@ from .personalize import build_personalize_processor
 from .selection import CaptureResult, CaptureStatus, SelectionService
 from .settings import AppSettings, SettingsRepository
 from .settings.repository import app_data_dir
-from .translation import DispatcherBackend, TranslationProfile, builtin_free_profiles
+from .translation import DispatcherBackend, TranslationError, TranslationProfile, builtin_free_profiles
 from .translation.langdetect import detect_direction
 from .ui.overlay import StateOverlay
 from .ui.result_popup import ResultPopup
@@ -58,6 +58,7 @@ logger = logging.getLogger(__name__)
 # 划词翻译网络错误自动重试间隔（秒）：瞬断（如 RemoteProtocolError）常见，
 # 首次失败后间隔重试一次，再失败才弹错误卡片。
 _SELECTION_RETRY_DELAY_S = 0.8
+_MAX_SELECTION_WORKERS = 2
 
 
 # ==================== 回调 -> 主线程桥接 ====================
@@ -74,14 +75,15 @@ class _Bridge(QObject):
     text_ready = Signal(str, bool)     # text, pasted
     error = Signal(str)                # 脱敏错误消息
     enabled_changed = Signal(bool)
-    asr_ready = Signal()               # ASR 后台 initialize 完成（无论成败）
+    mic_warmup_failed = Signal()
+    asr_ready = Signal(bool)               # ASR 后台 initialize 完成（无论成败）
     test_conn_result = Signal(bool, str)  # 翻译测试连接结果（ok, message）
     model_progress = Signal(int)       # 模型下载进度百分比（<0 表示总大小未知）
     model_download_done = Signal(bool, str)  # 模型下载完成（ok, message）
     selection_toggle = Signal()      # 划词翻译开关热键按下（pynput 线程 emit）
     press_activity = Signal()        # 任意左键按下（用于立即收起划词弹窗）
-    selection_result = Signal(str)     # 划词翻译译文
-    selection_error = Signal(str)      # 划词翻译错误提示（简短脱敏）
+    selection_result = Signal(int, str)     # 划词翻译译文
+    selection_error = Signal(int, str)      # 划词翻译错误提示（简短脱敏）
 
 
 # ==================== action 名称 <-> settings hotkeys 字段 ====================
@@ -119,8 +121,7 @@ class DictaShiftApplication:
         # ---- 服务（ASR 先不初始化，后台 initialize）----
         self._asr = ASRService()
         self._backend = DispatcherBackend()
-        # recorder 的 on_auto_stop 在 PortAudio 线程触发；只做最小工作：
-        # 触发 _on_auto_stop（通过 queued signal 转主线程，避免在音频线程回调 controller）。
+        # 音频事件与热键事件共用后台消费线程。
         self._recorder = AudioRecorder(
             sample_rate=16000,
             max_seconds=self.settings.asr.max_record_seconds,
@@ -151,6 +152,7 @@ class DictaShiftApplication:
         # PortAudio 阻塞），会导致后续键事件排队 -> 按键不跟手、松开事件延迟
         # 处理 -> 松手后仍在录音 -> 录音尾巴长 -> ASR 更慢。
         self._hotkey_queue: queue.Queue = queue.Queue()
+        self._audio_settings_pending = False
         self._hotkey_exec_thread = threading.Thread(
             target=self._hotkey_consumer_loop,
             name="dictashift-hotkey-exec",
@@ -192,9 +194,12 @@ class DictaShiftApplication:
         # 划词翻译请求序号：新触发递增，过期翻译结果丢弃（防止旧译文覆盖新弹窗）。
         self._selection_seq = 0
         self._selection_seq_lock = threading.Lock()
+        self._selection_workers = 0
+        self._selection_pending: tuple[str, int] | None = None
 
         # ---- ASR 初始化/重检测/翻译测试 的线程引用（daemon，不 join）----
         self._asr_init_thread: threading.Thread | None = None
+        self._model_install_lock = threading.Lock()
 
         # 「清除全部数据并退出」流程标记：True 时 shutdown 跳过 repo.save（避免重建
         # settings.json）。
@@ -210,6 +215,7 @@ class DictaShiftApplication:
         self._bridge.text_ready.connect(self._on_text_ready, Qt.QueuedConnection)
         self._bridge.error.connect(self._on_error, Qt.QueuedConnection)
         self._bridge.enabled_changed.connect(self._on_enabled_changed, Qt.QueuedConnection)
+        self._bridge.mic_warmup_failed.connect(self._on_mic_warmup_failed, Qt.QueuedConnection)
         self._bridge.asr_ready.connect(self._on_asr_ready, Qt.QueuedConnection)
         self._bridge.test_conn_result.connect(
             self._settings_window.set_test_connection_result, Qt.QueuedConnection
@@ -264,6 +270,8 @@ class DictaShiftApplication:
         self._controller.start(enabled=self.settings.enabled)
         self._tray.show()
         self._tray.set_enabled(self.settings.enabled)
+        if self.settings.enabled and self.settings.asr.instant_recording:
+            self._hotkey_queue.put(("audio_settings", True))
         # overlay 显隐由设置控制：仅 result_ui=="overlay" 时常驻显示。
         self._overlay.set_visible_enabled(self.settings.ui.result_ui == "overlay")
         self._overlay.set_state(self._controller.state)
@@ -307,6 +315,7 @@ class DictaShiftApplication:
             self._controller.shutdown()
         except Exception:  # noqa: BLE001
             logger.exception("[DictaShiftApplication] controller shutdown 异常")
+        self._recorder.close()
         try:
             self._asr.release()
         except Exception:  # noqa: BLE001
@@ -362,6 +371,7 @@ class DictaShiftApplication:
             self._controller.shutdown()
         except Exception:  # noqa: BLE001
             logger.exception("[DictaShiftApplication] clear_data: controller shutdown 异常")
+        self._recorder.close()
         try:
             self._asr.release()
         except Exception:  # noqa: BLE001
@@ -387,8 +397,10 @@ class DictaShiftApplication:
         """
 
         def _worker() -> None:
+            model_load_failed = False
             try:
-                self._asr.initialize(device, device_id=device_id)
+                with self._model_install_lock:
+                    self._asr.initialize(device, device_id=device_id)
             except Exception:  # noqa: BLE001
                 logger.exception("[DictaShiftApplication] ASR initialize 失败")
                 # 模型文件缺失 -> 专门提示去设置页下载。
@@ -397,11 +409,12 @@ class DictaShiftApplication:
                 if not models_ready(default_model_dir()):
                     msg = "语音识别模型未安装，请在设置-语音识别页下载模型"
                 else:
-                    msg = "语音识别引擎初始化失败，请检查硬件或重试"
+                    model_load_failed = True
+                    msg = "语音识别引擎初始化失败，请在设置中重新检测或重新下载模型"
                 # 失败通过 on_error 提示，但不阻止应用运行。
                 self._bridge.error.emit(msg)
             finally:
-                self._bridge.asr_ready.emit()
+                self._bridge.asr_ready.emit(model_load_failed)
 
         self._asr_init_thread = threading.Thread(
             target=_worker, name="dictashift-asr-init", daemon=True
@@ -453,12 +466,19 @@ class DictaShiftApplication:
         # 同步到内存 settings（保存时落盘）。
         self.settings.enabled = enabled
 
-    def _on_asr_ready(self) -> None:
+    def _on_mic_warmup_failed(self) -> None:
+        self._tray.show_message("DictaShift", "即按即录暂不可用，按住热键时会尝试打开麦克风")
+
+    def _on_asr_ready(self, model_load_failed: bool) -> None:
         """ASR 后台初始化/重检测完成：更新 UI 实际设备标签。"""
         self._settings_window.set_actual_device(
             self._asr.actual_device, self._asr.actual_providers
         )
         self._settings_window.set_recheck_loading(False)
+        if model_load_failed:
+            self._settings_window.mark_model_load_failed("识别引擎初始化失败")
+        else:
+            self._settings_window.refresh_model_status()
 
     # ==================== pynput 回调异步串行化 ====================
 
@@ -466,7 +486,7 @@ class DictaShiftApplication:
         """单线程 FIFO 消费 (kind, action) 事件，串行调用 controller。
 
         kind == "press"  -> controller.handle_hotkey_press(action)
-        kind == "release"-> controller.handle_hotkey_release(action)
+        音频事件携带录音任务代次，避免迟到的回调影响下一轮。
         哨兵 None 退出循环（shutdown 时投递）。
 
         controller 内部已捕获异常，这里再加一层 try/except 防止消费线程
@@ -481,13 +501,45 @@ class DictaShiftApplication:
             try:
                 if kind == "press":
                     self._controller.handle_hotkey_press(action)
+                    if action == "toggle_enabled":
+                        self._apply_recorder_settings()
+                elif kind == "audio_settings":
+                    if self._controller.enabled != action:
+                        self._controller.handle_hotkey_press("toggle_enabled")
+                    self._apply_recorder_settings()
                 elif kind == "release":
                     self._controller.handle_hotkey_release(action)
+                elif kind == "auto_stop":
+                    self._controller.handle_hotkey_release(action.action, expected_seq=action.seq)
+                elif kind == "first_frame":
+                    self._controller._on_first_frame(expected_seq=action)
+                elif kind == "stream_error":
+                    seq, message = action
+                    self._controller._on_stream_error(message, expected_seq=seq)
+                if self._audio_settings_pending and not self._recorder.is_recording:
+                    self._apply_recorder_settings()
             except Exception:  # noqa: BLE001 - 消费线程不得被打死
                 logger.exception(
                     "[DictaShiftApplication] hotkey consumer 处理事件异常 kind=%s action=%s",
                     kind, action,
                 )
+
+    def _apply_recorder_settings(self) -> None:
+        audio = self.settings.asr
+        warm = audio.instant_recording and self._controller.enabled
+        if self._recorder.is_recording:
+            if not warm:
+                self._recorder.set_warm_enabled(False)
+            self._audio_settings_pending = True
+            return
+
+        self._audio_settings_pending = False
+        if self._recorder.device_index != audio.mic_device_index:
+            self._recorder.set_warm_enabled(False)
+            self._recorder.device_index = audio.mic_device_index
+        self._recorder.max_seconds = audio.max_record_seconds
+        if not self._recorder.set_warm_enabled(warm) and warm:
+            self._bridge.mic_warmup_failed.emit()
 
     # ==================== hotkey -> controller ====================
 
@@ -523,65 +575,19 @@ class DictaShiftApplication:
         self._hotkey_queue.put(("release", action))
 
     def _on_auto_stop(self) -> None:
-        """recorder 达到最长录音时回调（PortAudio 线程）。
-
-        只做最小工作：把结束事件转交一个一次性后台线程执行。
-        注意不能投递到 UI 主线程——handle_hotkey_release 会同步调用
-        recorder.stop()（PortAudio 关流是阻塞调用），主线程执行会违反
-        AGENTS.md 11「UI 主线程不做阻塞等待」。controller 的回调经
-        _bridge 的 QueuedConnection 回主线程，因此后台线程调用是安全的。
-
-        action 由 controller.current_dictation_action() 查询（锁内读
-        _current_task.action），保证与 controller 任务生命周期一致，
-        避免本层并行跟踪 _current_action 的竞态（press 被拒绝时仍覆盖、
-        release 后被清空导致 auto-stop 漏触发）。handle_hotkey_release 内部
-        已幂等：任务已被取走（release 先到）则直接 return。
-        """
-        action = self._controller.current_dictation_action()
-        if action is None:
-            return
-
-        def _release_in_worker() -> None:
-            self._controller.handle_hotkey_release(action)
-
-        threading.Thread(
-            target=_release_in_worker, name="dictashift-auto-stop", daemon=True
-        ).start()
+        task = self._controller.current_dictation_task()
+        if task is not None:
+            self._hotkey_queue.put(("auto_stop", task))
 
     def _on_stream_error(self, msg: str) -> None:
-        """recorder 录音中途严重 status 回调（PortAudio 线程）。
-
-        与 _on_auto_stop 同模式：PortAudio 线程只做最小工作——把事件转交一次性
-        后台线程执行 controller._on_stream_error。后者会 discard（关流阻塞）+
-        on_error + 回 IDLE，不能在音频回调线程内阻塞执行。
-        """
-        def _handle_in_worker() -> None:
-            try:
-                self._controller._on_stream_error(msg)
-            except Exception:  # noqa: BLE001
-                logger.exception("[DictaShiftApplication] on_stream_error 异常")
-
-        threading.Thread(
-            target=_handle_in_worker, name="dictashift-stream-error", daemon=True
-        ).start()
+        task = self._controller.current_dictation_task()
+        if task is not None:
+            self._hotkey_queue.put(("stream_error", (task.seq, msg)))
 
     def _on_recorder_first_frame(self) -> None:
-        """recorder 首个音频回调帧到达通知（PortAudio 线程）。
-
-        与 _on_auto_stop / _on_stream_error 同模式：PortAudio 线程只做最小工作——
-        起一次性后台线程调 controller._on_first_frame。不能在音频回调线程直接调
-        controller（后者会取状态机锁、可能触发 _goto 的状态回调，且 _on_first_frame
-        在 wait_first_frame=False 时根本不该被订阅；统一转后台线程保持回调线程轻量）。
-        """
-        def _handle_in_worker() -> None:
-            try:
-                self._controller._on_first_frame()
-            except Exception:  # noqa: BLE001
-                logger.exception("[DictaShiftApplication] on_first_frame 异常")
-
-        threading.Thread(
-            target=_handle_in_worker, name="dictashift-first-frame", daemon=True
-        ).start()
+        task = self._controller.current_dictation_task()
+        if task is not None:
+            self._hotkey_queue.put(("first_frame", task.seq))
 
     # ==================== 托盘槽 ====================
 
@@ -603,7 +609,8 @@ class DictaShiftApplication:
         设置窗口若已打开不做实时联动（下次 load_from_settings 时刷新）。
         """
         cfg = self.settings.selection_translate
-        cfg.enabled = not cfg.enabled
+        with self._selection_seq_lock:
+            cfg.enabled = not cfg.enabled
         self._apply_selection_settings()
         try:
             self._repo.save(self.settings)
@@ -614,84 +621,82 @@ class DictaShiftApplication:
         )
 
     def _on_selection_result(self, result: CaptureResult) -> None:
-        """SelectionService 消费线程回调：按 CaptureStatus 分支。
-
-        - success：一次性后台线程执行翻译（网络阻塞：绝不在 UI 线程——AGENTS.md 11；
-          也不占用取词消费线程，避免一次慢翻译（最长 profile.timeout）阻塞后续取词），
-          完成后 queued 通知主线程 show_result（弹窗只在有最终结果时出现）。
-        - too_long：queued show_error 提示用户缩短选区。
-        - no_text / skipped_self：静默（仅日志），不打扰用户。
-        - error：queued show_error。取词已尽力还原剪贴板，但用户触发了功能却
-          无任何反馈会像是「坏了」；与 _Bridge error 信号的可见提示风格一致，
-          只是展示位置换成划词悬浮卡片（比托盘气泡更贴近触发点）。
-        """
-        if result.status is CaptureStatus.SUCCESS and result.text:
+        """取词消费线程提交最新划选，翻译由有并发上限的后台线程执行。"""
+        if result.status in (CaptureStatus.SUCCESS, CaptureStatus.TOO_LONG, CaptureStatus.ERROR):
             with self._selection_seq_lock:
+                cfg = self.settings.selection_translate
+                if not cfg.enabled or not cfg.auto_trigger:
+                    return
                 self._selection_seq += 1
                 seq = self._selection_seq
-            self._start_selection_translate(result.text, seq)
-            return
-        if result.status is CaptureStatus.TOO_LONG:
-            self._bridge.selection_error.emit(result.reason or "选中文本过长，无法翻译")
-            return
-        if result.status is CaptureStatus.ERROR:
-            reason = result.reason or "未知错误"
-            self._bridge.selection_error.emit(f"取词失败：{reason}"[:120])
-            return
-        # no_text / skipped_self：静默，仅日志。
-        logger.info(
-            "[DictaShiftApplication] 划词取词未翻译: status=%s reason=%s",
-            result.status.value, result.reason,
-        )
-
-    def _start_selection_translate(self, text: str, seq: int) -> None:
-        """一次性后台线程执行划词翻译：detect_direction -> 方向化 profile -> translate。
-
-        网络错误（如 RemoteProtocolError 瞬断）自动重试一次（间隔
-        _SELECTION_RETRY_DELAY_S），再失败才弹错误卡片；两次失败都记日志。
-        完成/失败后按 seq 校验是否仍是最新请求（用户可能已触发新取词），
-        过期结果直接丢弃，避免旧译文覆盖新弹窗内容。
-        """
-        backend = self._backend
-
-        def _worker() -> None:
-            translated: str | None = None
-            msg: str | None = None
-            try:
-                profile = self._controller.get_active_profile()
-                if profile is None:
-                    msg = "未配置翻译服务：请先在设置中选择翻译配置"
+                self._selection_pending = None
+                if result.status is CaptureStatus.SUCCESS and result.text:
+                    request = (result.text, seq)
+                    if self._selection_workers >= _MAX_SELECTION_WORKERS:
+                        self._selection_pending = request
+                        return
+                    self._selection_workers += 1
                 else:
-                    direction = detect_direction(text)
-                    directed = dataclasses.replace(profile, direction=direction)
-                    try:
-                        translated = backend.translate(text, directed)
-                    except Exception:  # noqa: BLE001 - 首次失败记日志并重试一次
-                        logger.warning(
-                            "[DictaShiftApplication] 划词翻译首次失败，%.1fs 后重试一次",
-                            _SELECTION_RETRY_DELAY_S, exc_info=True,
-                        )
-                        time.sleep(_SELECTION_RETRY_DELAY_S)
-                        translated = backend.translate(text, directed)
-                    if not translated or not translated.strip():
-                        translated = None
-                        msg = "翻译失败：空响应"
-            except Exception as e:  # noqa: BLE001 - 统一归入错误提示，不向外抛
-                logger.exception("[DictaShiftApplication] 划词翻译失败")
-                # 不泄露 api_key；e 可能含 url，截断（与 _on_test_connection 同策略）。
-                msg = f"翻译失败：{type(e).__name__}: {str(e)[:120]}"
-            with self._selection_seq_lock:
-                stale = seq != self._selection_seq
-            if stale:
-                return
-            if translated is not None:
-                self._bridge.selection_result.emit(translated)
-            elif msg is not None:
-                self._bridge.selection_error.emit(msg)
+                    request = None
+            if request is not None:
+                threading.Thread(
+                    target=self._run_selection_worker,
+                    args=request,
+                    name="dictashift-selection-translate",
+                    daemon=True,
+                ).start()
+            elif result.status is CaptureStatus.TOO_LONG:
+                self._bridge.selection_error.emit(seq, result.reason or "选中文本过长，无法翻译")
+            elif result.status is CaptureStatus.ERROR:
+                self._bridge.selection_error.emit(seq, "取词失败，请重新划选")
+        else:
+            logger.info("[DictaShiftApplication] 划词取词未翻译: status=%s", result.status.value)
 
-        threading.Thread(
-            target=_worker, name="dictashift-selection-translate", daemon=True
-        ).start()
+    def _selection_is_current(self, seq: int) -> bool:
+        with self._selection_seq_lock:
+            cfg = self.settings.selection_translate
+            return seq == self._selection_seq and cfg.enabled and cfg.auto_trigger
+
+    def _run_selection_worker(self, text: str, seq: int) -> None:
+        while True:
+            if self._selection_is_current(seq):
+                translated, message = self._translate_selection(text, seq)
+                if self._selection_is_current(seq):
+                    if translated is not None:
+                        self._bridge.selection_result.emit(seq, translated)
+                    elif message is not None:
+                        self._bridge.selection_error.emit(seq, message)
+            with self._selection_seq_lock:
+                pending = self._selection_pending
+                self._selection_pending = None
+                if pending is None:
+                    self._selection_workers -= 1
+                    return
+            text, seq = pending
+
+    def _translate_selection(self, text: str, seq: int) -> tuple[str | None, str | None]:
+        try:
+            profile = self._controller.get_active_profile()
+            if profile is None:
+                return None, "未配置翻译服务：请先在设置中选择翻译配置"
+            directed = dataclasses.replace(profile, direction=detect_direction(text))
+            try:
+                translated = self._backend.translate(text, directed)
+            except Exception as exc:
+                logger.warning("[DictaShiftApplication] 划词翻译首次失败: %s", type(exc).__name__)
+                if not self._selection_is_current(seq):
+                    return None, None
+                time.sleep(_SELECTION_RETRY_DELAY_S)
+                if not self._selection_is_current(seq):
+                    return None, None
+                translated = self._backend.translate(text, directed)
+        except Exception as exc:
+            logger.warning("[DictaShiftApplication] 划词翻译失败: %s", type(exc).__name__)
+            message = str(exc) if isinstance(exc, TranslationError) else "请检查翻译服务配置或网络连接"
+            return None, f"翻译失败：{message}"
+        if not translated or not translated.strip():
+            return None, "翻译失败：空响应"
+        return translated, None
 
     # ---- 划词悬浮卡片槽（主线程，经 queued signal 触发）----
 
@@ -703,19 +708,28 @@ class DictaShiftApplication:
         """
         self._selection_popup.hide()
 
-    def _on_selection_result_ready(self, text: str) -> None:
-        self._selection_popup.show_result(text)
+    def _on_selection_result_ready(self, seq: int, text: str) -> None:
+        if self._selection_is_current(seq):
+            self._selection_popup.show_result(text)
 
-    def _on_selection_error_ready(self, message: str) -> None:
-        self._selection_popup.show_error(message)
+    def _on_selection_error_ready(self, seq: int, message: str) -> None:
+        if self._selection_is_current(seq):
+            self._selection_popup.show_error(message)
 
     # ---- 划词服务生命周期（随设置启停）----
 
     def _stop_selection_service(self) -> None:
         """停止取词服务（幂等）；shutdown/clear_data/设置关闭时调用。"""
+        self._invalidate_selection()
         if self._selection_started:
             self._selection.stop()
             self._selection_started = False
+
+    def _invalidate_selection(self) -> None:
+        with self._selection_seq_lock:
+            self._selection_seq += 1
+            self._selection_pending = None
+        self._selection_popup.hide()
 
     def _apply_selection_settings(self) -> None:
         """按当前 settings 应用划词翻译配置（startup 与 _on_settings_applied 共用）。
@@ -738,6 +752,8 @@ class DictaShiftApplication:
                 self._tray.show_message("DictaShift", "划词翻译监听启动失败")
         elif not cfg.enabled:
             self._stop_selection_service()
+        if cfg.enabled and not cfg.auto_trigger:
+            self._invalidate_selection()
 
     # ==================== 设置窗口槽 ====================
 
@@ -748,21 +764,19 @@ class DictaShiftApplication:
 
     def _on_settings_applied(self, new_settings: AppSettings) -> None:
         """用户在设置窗口点击「应用」/「确定」。"""
+        audio_changed = (
+            self.settings.asr != new_settings.asr
+            or self.settings.enabled != new_settings.enabled
+        )
         self.settings = new_settings
+        if audio_changed:
+            self._hotkey_queue.put(("audio_settings", new_settings.enabled))
 
         # 保存
         try:
             self._repo.save(self.settings)
         except Exception:  # noqa: BLE001
             logger.exception("[DictaShiftApplication] 保存设置失败")
-
-        # 麦克风/最长录音变更应用到 recorder（录音中更换会抛 RuntimeError，
-        # 此时设置窗口不可能在录音中打开应用，保守 try 包住）。
-        try:
-            self._recorder.device_index = self.settings.asr.mic_device_index
-            self._recorder.max_seconds = self.settings.asr.max_record_seconds
-        except RuntimeError:
-            logger.warning("[DictaShiftApplication] 录音中，录音设备/时长变更将在下次生效")
 
         # 更新热键绑定（无需重启 listener）
         self._hotkeys.update_bindings(self._bindings_from_settings(self.settings))
@@ -819,10 +833,9 @@ class DictaShiftApplication:
                 ok = True
                 msg = result.strip()[:80] if result else "(空响应)"
             except Exception as e:  # noqa: BLE001
-                logger.exception("[DictaShiftApplication] 翻译测试连接失败")
+                logger.warning("[DictaShiftApplication] 翻译测试连接失败: %s", type(e).__name__)
                 ok = False
-                # 不泄露 api_key；e 可能含 url，截断。
-                msg = f"{type(e).__name__}: {str(e)[:120]}"
+                msg = str(e) if isinstance(e, TranslationError) else "请检查翻译服务配置或网络连接"
             # queued 回主线程更新结果
             self._bridge.test_conn_result.emit(ok, msg)
 
@@ -849,7 +862,8 @@ class DictaShiftApplication:
 
         def _worker() -> None:
             try:
-                download_models(dest, progress_cb=_progress)
+                with self._model_install_lock:
+                    download_models(dest, progress_cb=_progress)
                 self._bridge.model_download_done.emit(True, "")
             except Exception as e:  # noqa: BLE001
                 logger.exception("[DictaShiftApplication] 模型下载失败")

@@ -1,14 +1,19 @@
 """model_download 测试：用伪 httpx.Client 构造内存 zip，不真实下载。
 
-测试目标 (AGENTS.md 13.1)：
+测试目标：
 - 正常路径：内存 zip 含三个文件（大小匹配）+ 一个额外文件（被忽略）+ 一个
   路径穿越恶意条目（被忽略）-> 解压出三个文件、大小匹配、progress_cb 被调用。
 - total 未知（无 Content-Length）-> progress_cb 收到 total=-1。
-- 大小校验失败 -> ModelDownloadError，并清理半成品（已解压文件被删）。
+- 大小/SHA256 校验失败 -> ModelDownloadError，临时目录清理。
 - HTTP 非 200 -> ModelDownloadError。
 - 缺少模型文件的 zip -> ModelDownloadError。
-- 路径穿越条目（base 名匹配必需文件名）-> 拒绝 + 清理。
-- 临时 zip 文件下载后清理。
+- 路径穿越条目（base 名匹配必需文件名）-> 拒绝。
+- 临时文件/临时目录下载后清理。
+- 两阶段安装（本次修复）：
+  * 损坏下载（哈希/尺寸不符）保留正式目录里的既有模型，可恢复（坏包后好包能装上）；
+  * 成功安装只替换三个模型文件，目录里其它文件不动；
+  * 临时目录建在 dest 的兄弟目录（同盘，os.replace 原子）；
+  * SHA256 分块计算（不整读大文件）。
 """
 
 from __future__ import annotations
@@ -240,24 +245,26 @@ def test_download_rejects_traversal_when_matches_required_name(
 
 
 def test_download_cleans_temp_zip_on_success(tmp_path, patch_httpx, monkeypatch) -> None:
+    """临时 zip 与整个临时目录在成功后都不留痕迹。"""
     body = _good_zip_bytes()
     patch_httpx(200, body, content_length=len(body))
 
+    dest = tmp_path / "models" / "sensevoice_onnx"
     created = []
-    orig_mktemp = md.tempfile.mktemp
+    orig_mkstemp = md.tempfile.mkstemp
 
     def _spy(*a, **kw):
-        p = orig_mktemp(*a, **kw)
+        fd, p = orig_mkstemp(*a, **kw)
         created.append(p)
-        return p
+        return fd, p
 
-    monkeypatch.setattr(md.tempfile, "mktemp", _spy)
-    md.download_models(tmp_path, expected_hashes=_good_hashes())
-
-    import os
+    monkeypatch.setattr(md.tempfile, "mkstemp", _spy)
+    md.download_models(dest, expected_hashes=_good_hashes())
 
     for p in created:
-        assert not os.path.exists(p)
+        assert not Path(p).exists()
+    # 临时目录（dest 的兄弟目录）已清理：父目录里只剩 dest 自身。
+    assert list(dest.parent.iterdir()) == [dest]
 
 
 # ==================== 错误消息不含响应头/不含敏感信息 ====================
@@ -274,3 +281,113 @@ def test_error_message_does_not_leak_response_headers(tmp_path, patch_httpx) -> 
     assert "500" in msg
     # 不应包含响应头键名。
     assert "Content-Type" not in msg
+
+
+# ==================== 两阶段安装：失败保留既有模型 ====================
+
+
+def _install_fake_models(dest: Path) -> dict[str, bytes]:
+    """在 dest 预置「旧模型」：与期望尺寸同长但内容不同的假文件。"""
+    old: dict[str, bytes] = {}
+    dest.mkdir(parents=True, exist_ok=True)
+    for name in REQUIRED_MODEL_FILES:
+        data = b"b" * md.EXPECTED_SIZES[name]
+        (dest / name).write_bytes(data)
+        old[name] = data
+    return old
+
+
+def _corrupt_zip_bytes() -> bytes:
+    """尺寸匹配但内容被篡改的 zip（触发 SHA256 失败）。"""
+    entries = {name: b"b" * md.EXPECTED_SIZES[name] for name in REQUIRED_MODEL_FILES}
+    return _make_zip(entries)
+
+
+def test_corrupt_download_preserves_existing_models(tmp_path, patch_httpx) -> None:
+    """损坏下载（哈希不匹配）不得破坏正式目录里的既有模型。"""
+    dest = tmp_path / "models" / "sensevoice_onnx"
+    old = _install_fake_models(dest)
+    body = _corrupt_zip_bytes()
+    patch_httpx(200, body, content_length=len(body))
+
+    with pytest.raises(md.ModelDownloadError, match="SHA256"):
+        md.download_models(dest)
+
+    # 旧模型逐字节未变。
+    for name, data in old.items():
+        assert (dest / name).read_bytes() == data
+    # 临时目录已清理，父目录不留残留。
+    assert list(dest.parent.iterdir()) == [dest]
+
+
+def test_failed_download_is_recoverable(tmp_path, patch_httpx) -> None:
+    """失败后可直接重试：同一次会话内坏包 -> 好包能正常装上。"""
+    dest = tmp_path / "models" / "sensevoice_onnx"
+    old = _install_fake_models(dest)
+
+    # 第一次：坏包失败，旧模型保留。
+    patch_httpx(200, _corrupt_zip_bytes(), content_length=None)
+    with pytest.raises(md.ModelDownloadError):
+        md.download_models(dest)
+    for name, data in old.items():
+        assert (dest / name).read_bytes() == data
+
+    # 第二次：好包成功，新内容替换旧内容。
+    good = _good_zip_bytes()
+    patch_httpx(200, good, content_length=len(good))
+    md.download_models(dest, expected_hashes=_good_hashes())
+    for name in REQUIRED_MODEL_FILES:
+        assert (dest / name).read_bytes() == b"a" * md.EXPECTED_SIZES[name]
+
+
+def test_success_replaces_models_and_keeps_other_files(tmp_path, patch_httpx) -> None:
+    """成功安装只替换三个模型文件，目录里其它文件保持不动。"""
+    dest = tmp_path / "models" / "sensevoice_onnx"
+    _install_fake_models(dest)
+    (dest / "notes.txt").write_bytes(b"keep me")
+
+    body = _good_zip_bytes()
+    patch_httpx(200, body, content_length=len(body))
+    md.download_models(dest, expected_hashes=_good_hashes())
+
+    assert (dest / "notes.txt").read_bytes() == b"keep me"
+    for name in REQUIRED_MODEL_FILES:
+        assert (dest / name).stat().st_size == md.EXPECTED_SIZES[name]
+
+
+def test_failed_replacement_restores_previous_model_set(tmp_path, patch_httpx, monkeypatch):
+    dest = tmp_path / "models" / "sensevoice_onnx"
+    old = _install_fake_models(dest)
+    good = _good_zip_bytes()
+    patch_httpx(200, good, content_length=len(good))
+    replace = md.os.replace
+
+    def fail_second_new_model(source, target):
+        if source.parent.name.startswith(".sensevoice_onnx.tmp-") and source.name == REQUIRED_MODEL_FILES[1]:
+            raise PermissionError("model file locked")
+        replace(source, target)
+
+    monkeypatch.setattr(md.os, "replace", fail_second_new_model)
+    with pytest.raises(md.ModelDownloadError, match="模型安装失败"):
+        md.download_models(dest, expected_hashes=_good_hashes())
+
+    assert {name: (dest / name).read_bytes() for name in old} == old
+    assert list(dest.parent.iterdir()) == [dest]
+
+
+def test_size_mismatch_failure_preserves_existing_models(tmp_path, patch_httpx) -> None:
+    """尺寸不匹配失败同样不碰既有模型（另一条失败路径）。"""
+    dest = tmp_path / "m" / "sensevoice_onnx"
+    old = _install_fake_models(dest)
+
+    entries = {name: b"a" * md.EXPECTED_SIZES[name] for name in REQUIRED_MODEL_FILES}
+    entries[REQUIRED_MODEL_FILES[2]] = b"a" * (md.EXPECTED_SIZES[REQUIRED_MODEL_FILES[2]] - 1)
+    body = _make_zip(entries)
+    patch_httpx(200, body, content_length=len(body))
+
+    with pytest.raises(md.ModelDownloadError, match="大小"):
+        md.download_models(dest)
+
+    for name, data in old.items():
+        assert (dest / name).read_bytes() == data
+    assert list(dest.parent.iterdir()) == [dest]

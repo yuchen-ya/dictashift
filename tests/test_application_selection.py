@@ -182,8 +182,11 @@ def _make_app(
     app._selection_started = started
     app._selection_seq = 0
     app._selection_seq_lock = threading.Lock()
+    app._selection_workers = 0
+    app._selection_pending = None
     app._hotkey_queue = queue.Queue()
     app.settings = AppSettings()
+    app.settings.selection_translate.enabled = started
     return app
 
 
@@ -302,7 +305,7 @@ class TestOnSelectionResult:
         app = _make_app(backend=backend)
         app._on_selection_result(_success("你好世界"))
         assert app._bridge.selection_result.event.wait(timeout=5.0)
-        assert app._bridge.selection_result.emitted == [("你好-translated",)]
+        assert app._bridge.selection_result.emitted == [(1, "你好-translated")]
         # 方向经 detect_direction 注入（dataclasses.replace 生成副本，原 profile 不动）。
         assert backend.calls[0][0] == "你好世界"
         assert backend.calls[0][1].direction == "zh2en"
@@ -323,7 +326,7 @@ class TestOnSelectionResult:
         app = _make_app(profile=None, backend=backend)
         app._on_selection_result(_success("你好"))
         assert app._bridge.selection_error.event.wait(timeout=5.0)
-        (msg,) = app._bridge.selection_error.emitted[0]
+        _, msg = app._bridge.selection_error.emitted[0]
         assert "未配置翻译服务" in msg
         assert app._bridge.selection_result.emitted == []
         assert backend.calls == []
@@ -333,7 +336,7 @@ class TestOnSelectionResult:
         app = _make_app(backend=_FakeBackend("   "))
         app._on_selection_result(_success("你好"))
         assert app._bridge.selection_error.event.wait(timeout=5.0)
-        (msg,) = app._bridge.selection_error.emitted[0]
+        _, msg = app._bridge.selection_error.emitted[0]
         assert "空响应" in msg
         assert app._bridge.selection_result.emitted == []
 
@@ -343,7 +346,7 @@ class TestOnSelectionResult:
         app._on_selection_result(
             CaptureResult(CaptureStatus.TOO_LONG, reason="选中文本过长 (3000 > 2000 字符)", length=3000)
         )
-        assert app._bridge.selection_error.emitted == [("选中文本过长 (3000 > 2000 字符)",)]
+        assert app._bridge.selection_error.emitted == [(1, "选中文本过长 (3000 > 2000 字符)")]
         # 不进入翻译流程。
         assert backend.calls == []
 
@@ -361,9 +364,9 @@ class TestOnSelectionResult:
         """取词 error：可见提示（用户触发了功能，静默会像「坏了」）。"""
         app = _make_app()
         app._on_selection_result(CaptureResult(CaptureStatus.ERROR, reason="SendInput boom"))
-        (msg,) = app._bridge.selection_error.emitted[0]
+        _, msg = app._bridge.selection_error.emitted[0]
         assert "取词失败" in msg
-        assert "SendInput boom" in msg
+        assert "SendInput boom" not in msg
 
 
 # ==================== 网络错误自动重试一次 ====================
@@ -390,7 +393,7 @@ class TestTranslateRetry:
         app._on_selection_result(_success("你好"))
         assert app._bridge.selection_result.event.wait(timeout=5.0)
         assert backend.calls == 2
-        assert app._bridge.selection_result.emitted == [("retried-ok",)]
+        assert app._bridge.selection_result.emitted == [(1, "retried-ok")]
         assert app._bridge.selection_error.emitted == []
 
     def test_both_attempts_fail_shows_error(self, monkeypatch) -> None:
@@ -410,8 +413,8 @@ class TestTranslateRetry:
         app._on_selection_result(_success("你好"))
         assert app._bridge.selection_error.event.wait(timeout=5.0)
         assert backend.calls == 2
-        (msg,) = app._bridge.selection_error.emitted[0]
-        assert "TranslationError" in msg
+        _, msg = app._bridge.selection_error.emitted[0]
+        assert "rate limited" in msg
         assert app._bridge.selection_result.emitted == []
 
 
@@ -433,8 +436,48 @@ class TestStaleResultDropped:
         assert backend.first_returned.wait(timeout=5.0)
         assert app._bridge.selection_result.event.wait(timeout=5.0)
 
-        assert app._bridge.selection_result.emitted == [("r2-fresh",)]
+        assert app._bridge.selection_result.emitted == [(2, "r2-fresh")]
         assert app._bridge.selection_error.emitted == []
+
+
+    def test_disable_drops_queued_result_even_after_reenable(self) -> None:
+        app = _make_app()
+        app._on_selection_result(_success("原文"))
+        assert app._bridge.selection_result.event.wait(timeout=5)
+        args = app._bridge.selection_result.emitted[0]
+
+        app._on_selection_toggle()
+        app._on_selection_toggle()
+        app._on_selection_result_ready(*args)
+
+        assert app._selection_popup.results == []
+        assert app._selection_popup.hide_calls == 1
+
+    def test_latest_pending_replaces_older_request(self) -> None:
+        started = {text: threading.Event() for text in ("first", "second")}
+        gate = threading.Event()
+        calls = []
+
+        class Backend:
+            def translate(self, text, profile):
+                calls.append(text)
+                if text in started:
+                    started[text].set()
+                    gate.wait(timeout=5)
+                return text
+
+        app = _make_app(backend=Backend())
+        try:
+            for text, event in started.items():
+                app._on_selection_result(_success(text))
+                assert event.wait(timeout=5)
+            app._on_selection_result(_success("superseded"))
+            app._on_selection_result(_success("latest"))
+        finally:
+            gate.set()
+        assert app._bridge.selection_result.event.wait(timeout=5)
+        assert app._bridge.selection_result.emitted == [(4, "latest")]
+        assert calls == ["first", "second", "latest"]
 
 
 # ==================== 主线程槽（queued signal 的接收端） ====================
@@ -443,8 +486,8 @@ class TestStaleResultDropped:
 class TestUiSlots:
     def test_slots_drive_popup(self) -> None:
         app = _make_app()
-        app._on_selection_result_ready("译文")
-        app._on_selection_error_ready("出错了")
+        app._on_selection_result_ready(0, "译文")
+        app._on_selection_error_ready(0, "出错了")
         assert app._selection_popup.results == ["译文"]
         assert app._selection_popup.errors == ["出错了"]
 

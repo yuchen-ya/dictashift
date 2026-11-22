@@ -51,6 +51,23 @@ def test_models_ready_false_when_missing(tmp_path) -> None:
     assert prov.models_ready(tmp_path) is False
 
 
+def test_models_ready_false_when_name_is_directory(tmp_path) -> None:
+    """同名目录不算就绪（旧版只看 exists 会误判为 True）。"""
+    for i, name in enumerate(prov.REQUIRED_MODEL_FILES):
+        if i == 0:
+            (tmp_path / name).mkdir()  # 目录占位
+        else:
+            (tmp_path / name).write_bytes(b"x")
+    assert prov.models_ready(tmp_path) is False
+
+
+def test_models_ready_false_when_any_file_empty(tmp_path) -> None:
+    """0 字节空文件不算就绪（下载中断的半成品）。"""
+    for i, name in enumerate(prov.REQUIRED_MODEL_FILES):
+        (tmp_path / name).write_bytes(b"x" if i else b"")
+    assert prov.models_ready(tmp_path) is False
+
+
 def test_models_ready_false_when_empty(tmp_path) -> None:
     assert prov.models_ready(tmp_path) is False
 

@@ -71,22 +71,18 @@ class GoogleFreeBackend(TranslationBackend):
             raise TranslationError(
                 f"Google 翻译请求超时：{type(e).__name__}",
                 status_code=None,
-            ) from e
+            ) from None
         except httpx.TransportError as e:
             logger.warning(f"[Translation/Google] 网络错误：{type(e).__name__}")
             raise TranslationError(
                 f"Google 翻译网络错误：{type(e).__name__}",
                 status_code=None,
-            ) from e
+            ) from None
 
         if response.status_code != 200:
             # 限流/服务故障：抛出实际状态码（429/503 等），供 failover 判定。
             # 安全（开源审查 H1）：错误消息不回显响应体——服务端错误页可能
             # 回显请求参数 q=用户转写文本，避免语音内容进入异常消息/日志。
-            logger.debug(
-                "[Translation/Google] HTTP %s 响应体（截断）：%s",
-                response.status_code, response.text[:200],
-            )
             raise TranslationError(
                 f"Google 翻译请求失败：HTTP {response.status_code}",
                 status_code=response.status_code,
@@ -99,7 +95,7 @@ class GoogleFreeBackend(TranslationBackend):
             raise TranslationError(
                 f"Google 翻译响应解析失败（非 JSON）：{type(e).__name__}",
                 status_code=None,
-            ) from e
+            ) from None
 
         # 期望结构：data[0] 为译文段数组，每段 [译文, 原文, ...]
         if (

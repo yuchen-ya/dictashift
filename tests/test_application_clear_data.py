@@ -19,6 +19,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import logging
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -71,6 +73,7 @@ def _make_app() -> tuple[DictaShiftApplication, _FakeHotkeys, _FakeController, _
     da = DictaShiftApplication.__new__(DictaShiftApplication)
     da._hotkeys = _FakeHotkeys()
     da._controller = _FakeController()
+    da._recorder = SimpleNamespace(close=Mock())
     da._asr = _FakeAsr()
     da._app = _FakeApp()
     da._repo = _FakeRepo()
@@ -108,6 +111,7 @@ def test_on_clear_data_stops_services_then_removes_dir_then_quits(
 
     assert hotkeys.stop_called
     assert controller.shutdown_called
+    da._recorder.close.assert_called_once_with()
     assert asr.released
     # 服务停止被调用（无法严格断言顺序但都调用过）
     assert not paths["base"].exists()
@@ -156,6 +160,7 @@ def test_shutdown_skips_save_after_clear(monkeypatch, tmp_path) -> None:
     da._hotkey_exec_thread = None  # type: ignore[assignment]
 
     da.shutdown()
+    da._recorder.close.assert_called_once_with()
     assert repo.save_calls == []
 
 

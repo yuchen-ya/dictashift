@@ -9,7 +9,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6.svg)](https://github.com/yuchen-ya/dictashift)
 [![Python](https://img.shields.io/badge/Python-3.11-3776AB.svg)](https://www.python.org/)
-[![Release](https://img.shields.io/badge/Release-v0.4.0-green.svg)](https://github.com/yuchen-ya/dictashift/releases)
+[![Release](https://img.shields.io/github/v/release/yuchen-ya/dictashift?label=Release)](https://github.com/yuchen-ya/dictashift/releases)
 
 [English](#english) · [功能特性](#-功能特性) · [安装](#-安装) · [快捷键](#-快捷键) · [隐私](#-隐私说明) · [开发](#-开发)
 
@@ -73,6 +73,8 @@
 | 启用/暂停 | `Ctrl+Alt+F12` | 切换全局启用状态 |
 | 取消 | `Esc` | 录音/识别中取消当前任务 |
 
+在「设置 → 语音识别」开启「即按即录」，可省去每次按键时启动麦克风的等待。该选项默认关闭。开启后，语音输入启用期间麦克风保持打开，仅保留按住听写键期间的音频。暂停语音输入或退出会关闭麦克风。
+
 ## 🚀 安装
 
 ### 方式一：发布包（推荐）
@@ -104,7 +106,7 @@ uv run python -m dictashift
 
 ## 🔒 隐私说明
 
-- 音频**仅在本地处理**：录音、SenseVoice 推理全部在本地完成，不上传音频；
+- 音频**仅在本地处理**：录音、SenseVoice 推理全部在本地完成，不上传音频。即按即录模式会丢弃空闲音频帧；
 - 翻译文本会发送到你所选择的翻译服务；如需完全离线，请使用本地 llama-server；
 - 配置文件与模型存放在 `%APPDATA%\DictaShift\`，**不收集任何遥测**；
 - **API Key**：以明文保存在 `settings.json`（此类桌面客户端的普遍做法），请勿在共享机器上存放高权限 Key；
@@ -141,8 +143,8 @@ src/dictashift/
 ### 发布维护（维护者）
 
 1. `uv run python scripts/build.py` 构建，将 `dist/DictaShift` 压缩为 `DictaShift-<version>-windows.zip`；
-2. 将三个 int8 模型文件打包为 `sensevoice_onnx-int8.zip`（zip 根目录直接放文件）；
-3. 创建对应 tag 的 Release，上传上述两个 zip（模型包的文件名与哈希需与 `src/dictashift/asr/model_download.py` 中一致）。
+2. 创建对应 tag 的 Release，上传 Windows 压缩包；
+3. 只有模型变更时才需要上传新的模型包。将三个模型文件放在 zip 根目录，并同步更新下载地址、文件大小和 SHA256（见 [模型下载代码](src/dictashift/asr/model_download.py)）。现有模型沿用 v0.2.0 的发布资产。
 
 ## 🗺️ Roadmap
 

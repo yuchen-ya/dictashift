@@ -41,6 +41,9 @@ def _setup_logging() -> None:
     except OSError:
         # 日志目录创建失败不应阻止启动；仅用 stderr。
         pass
+    # httpx logs complete URLs at INFO, including Google Translate's source text.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

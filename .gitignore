@@ -21,3 +21,10 @@ logs/
 
 # 工作区协作规则（本地文件，不进版本控制）
 AGENTS.md
+
+# 用户配置及其备份可能含 API Key
+settings.json
+settings.json.*
+.env
+.env.*
+!.env.example

@@ -125,11 +125,13 @@ class AsrSettings:
 
     max_record_seconds: int = 60
     mic_device_index: int | None = None
+    instant_recording: bool = False
 
     def to_dict(self) -> dict:
         return {
             "max_record_seconds": self.max_record_seconds,
             "mic_device_index": self.mic_device_index,
+            "instant_recording": self.instant_recording,
         }
 
     @classmethod
@@ -139,6 +141,7 @@ class AsrSettings:
         return cls(
             max_record_seconds=d.get("max_record_seconds", 60),
             mic_device_index=d.get("mic_device_index", None),
+            instant_recording=d.get("instant_recording") is True,
         )
 
 

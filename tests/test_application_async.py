@@ -20,12 +20,15 @@ import os
 import queue
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import Mock, call
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 
 from dictashift.application import DictaShiftApplication
+from dictashift.settings import AppSettings
 
 
 class _FakeController:
@@ -39,6 +42,7 @@ class _FakeController:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []  # (kind, action)
         self.shutdown_called = threading.Event()
+        self.enabled = True
         self._lock = threading.Lock()
         # 模拟 controller 内部 _current_task.action；由 press/release 钩子维护，
         # 供 current_dictation_action() 查询（模拟真实 controller 行为）。
@@ -49,6 +53,8 @@ class _FakeController:
             self.calls.append(("press", action))
             if action in ("dictate_zh", "dictate_en"):
                 self._current_action = action
+            elif action == "toggle_enabled":
+                self.enabled = not self.enabled
 
     def handle_hotkey_release(self, action: str) -> None:
         with self._lock:
@@ -69,6 +75,11 @@ def _make_app(controller: _FakeController | None = None) -> tuple[DictaShiftAppl
     app = DictaShiftApplication.__new__(DictaShiftApplication)
     ctrl = controller or _FakeController()
     app._controller = ctrl
+    app.settings = AppSettings()
+    app._audio_settings_pending = False
+    app._recorder = SimpleNamespace(
+        device_index=None, max_seconds=60, is_recording=False, set_warm_enabled=Mock(return_value=True)
+    )
     app._hotkey_queue: queue.Queue = queue.Queue()
     app._hotkey_exec_thread = threading.Thread(
         target=app._hotkey_consumer_loop,
@@ -194,104 +205,51 @@ class TestShutdownDrainsQueue:
         assert ctrl.calls == []
 
 
-# ==================== _on_auto_stop 经 controller 查询驱动（修复 C）====================
-#
-# 旧行为：application 层并行跟踪 _current_action（on_press 记录、on_release 清除），
-# 存在竞态——press 被拒绝时仍覆盖、release 后被清空，导致 auto-stop 漏触发或抢错
-# action。修复后：_on_auto_stop 用 controller.current_dictation_action() 查询当前
-# action（锁内读 _current_task.action），与 controller 任务生命周期一致。
+# ==================== 音频事件走热键队列 ====================
 
 
-class _FakeControllerWithAction:
-    """可被 current_dictation_action() 查询、记录 release 调用的 controller 替身。
-
-    - current_dictation_action：返回 _current_action（模拟 controller 内
-      _current_task.action，由外部设定）。
-    - handle_hotkey_release：记录调用并清 _current_action（模拟任务被取走）。
-    """
-
-    def __init__(self, action: str | None = None) -> None:
-        self._current_action = action
-        self.release_calls: list[str] = []
-        self.press_calls: list[str] = []
-        self._lock = threading.Lock()
-
-    def handle_hotkey_press(self, action: str) -> None:
-        with self._lock:
-            self.press_calls.append(action)
-
-    def handle_hotkey_release(self, action: str) -> None:
-        with self._lock:
-            self.release_calls.append(action)
-            # 幂等：任务被取走则清 action（与真实 controller 行为一致）。
-            if self._current_action == action:
-                self._current_action = None
-
-    def current_dictation_action(self) -> str | None:
-        with self._lock:
-            return self._current_action
-
-
-def _make_auto_stop_app(ctrl: _FakeControllerWithAction) -> DictaShiftApplication:
-    """装配 _on_auto_stop 直接依赖的最小属性（无需消费线程）。"""
+def test_audio_events_keep_recording_sequence() -> None:
+    task = SimpleNamespace(action="dictate_en", seq=7)
+    calls = []
     app = DictaShiftApplication.__new__(DictaShiftApplication)
-    app._controller = ctrl
-    return app
+    app._hotkey_queue = queue.Queue()
+    app._audio_settings_pending = False
+    app._controller = SimpleNamespace(
+        current_dictation_task=lambda: task,
+        handle_hotkey_release=lambda action, *, expected_seq: calls.append(("release", action, expected_seq)),
+        _on_first_frame=lambda *, expected_seq: calls.append(("first_frame", expected_seq)),
+        _on_stream_error=lambda message, *, expected_seq: calls.append(("stream_error", message, expected_seq)),
+    )
+
+    app._on_recorder_first_frame()
+    app._on_stream_error("device error")
+    app._on_auto_stop()
+    app._hotkey_queue.put(None)
+    app._hotkey_consumer_loop()
+
+    assert calls == [("first_frame", 7), ("stream_error", "device error", 7), ("release", "dictate_en", 7)]
 
 
-def _drain_release(ctrl: _FakeControllerWithAction, expected: int, timeout: float = 2.0) -> None:
-    deadline = time.perf_counter() + timeout
-    while time.perf_counter() < deadline:
-        if len(ctrl.release_calls) >= expected:
-            return
-        time.sleep(0.005)
+def test_audio_events_after_recording_ended_are_ignored() -> None:
+    app = DictaShiftApplication.__new__(DictaShiftApplication)
+    app._hotkey_queue = queue.Queue()
+    app._audio_settings_pending = False
+    app._controller = SimpleNamespace(current_dictation_task=lambda: None)
+    app._on_recorder_first_frame()
+    app._on_stream_error("device error")
+    app._on_auto_stop()
+
+    assert app._hotkey_queue.empty()
 
 
-class TestAutoStopQueriesController:
-    def test_auto_stop_queries_controller_action_and_calls_release(self) -> None:
-        """controller 当前有 dictation 任务时，_on_auto_stop 查询到 action 并调
-        handle_hotkey_release(action)。"""
-        ctrl = _FakeControllerWithAction(action="dictate_zh")
-        app = _make_auto_stop_app(ctrl)
-        app._on_auto_stop()
-        _drain_release(ctrl, 1)
-        assert ctrl.release_calls == ["dictate_zh"]
+def test_instant_recording_turns_off_on_pause_and_back_on_on_resume() -> None:
+    app, ctrl = _make_app()
+    app.settings.asr.instant_recording = True
+    app._hotkey_queue.put(("audio_settings", True))
+    app._on_tray_toggle()
+    app._on_tray_toggle()
+    app._hotkey_queue.put(None)
+    app._hotkey_exec_thread.join(timeout=2)
 
-    def test_auto_stop_no_action_noop(self) -> None:
-        """controller 无当前任务（current_dictation_action 返回 None）时，
-        _on_auto_stop 直接 return，不调 handle_hotkey_release。"""
-        ctrl = _FakeControllerWithAction(action=None)
-        app = _make_auto_stop_app(ctrl)
-        app._on_auto_stop()
-        # 短暂等待确认后台线程未调用 release。
-        time.sleep(0.1)
-        assert ctrl.release_calls == []
-
-    def test_auto_stop_release_idempotent_when_task_taken(self) -> None:
-        """release 先到（任务被取走，current_dictation_action 返回 None）后
-        auto-stop 触发：查询到 None，不重复调 release（幂等）。
-
-        这覆盖真实场景：release 已结束录音、controller 清空 _current_task，
-        随后 recorder 的 auto-stop 回调到达。"""
-        ctrl = _FakeControllerWithAction(action=None)  # 已被 release 清空
-        app = _make_auto_stop_app(ctrl)
-        app._on_auto_stop()
-        time.sleep(0.1)
-        assert ctrl.release_calls == []
-
-    def test_rejected_press_does_not_steal_action_for_auto_stop(self) -> None:
-        """被 controller 拒绝的 press 不影响后续 auto-stop（修复 C 核心竞态）。
-
-        旧行为：_on_hotkey_press 无条件覆盖 _current_action，即使 controller 拒绝了
-        press（如已在 RECORDING），真正在录的 action 会被抢走；release 后 _current_action
-        被清空 -> auto-stop 漏触发。修复后：press 不在本层跟踪 action，auto-stop 直接
-        查 controller，不受被拒绝 press 影响。
-
-        本测试只验证 application 层不再有 _current_action 覆盖逻辑——_on_hotkey_press
-        不再写任何 action 字段，_on_auto_stop 完全依赖 controller 查询。
-        """
-        # application 层已无 _current_action / _action_lock 属性。
-        app = _make_auto_stop_app(_FakeControllerWithAction())
-        assert not hasattr(app, "_current_action")
-        assert not hasattr(app, "_action_lock")
-
+    assert ctrl.enabled
+    assert app._recorder.set_warm_enabled.call_args_list == [call(True), call(False), call(True)]

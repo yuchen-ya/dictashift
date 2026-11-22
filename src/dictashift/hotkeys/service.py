@@ -93,10 +93,8 @@ class HotkeyService:
         self._lock = threading.Lock()
         # 已按下的归一化键名集合；由 _on_key_down / _on_key_up 维护。
         self._pressed: set[str] = set()
-        # 当前已“满配”的 binding action 集合，用于做 on_press / on_release 边沿检测。
-        # key = HotkeyBinding (因 frozenset 可哈希)，value 无所谓，用 set 存 action 亦可；
-        # 为清晰起见直接记录“哪些 binding 当前处于满足状态”。
-        self._satisfied: set[HotkeyBinding] = set()
+        # 已发出按下边沿的绑定保留到物理松手，包括设置重载时移除的绑定。
+        self._satisfied: dict[HotkeyBinding, None] = {}
 
         self._bindings: list[HotkeyBinding] = list(bindings)
         self._listener: keyboard.Listener | None = None
@@ -106,13 +104,10 @@ class HotkeyService:
     def update_bindings(self, bindings: list[HotkeyBinding]) -> None:
         """运行时热更新绑定，不需要重启 listener。
 
-        实现说明：替换 binding 列表后，重置内部按下集合与满足集合，避免旧 binding
-        的残留状态污染新配置。重置是保守策略——更新瞬间不会触发任何 on_release。
+        新配置只影响后续按下边沿。已经开始的按住动作仍由原组合键的松开结束。
         """
         with self._lock:
             self._bindings = list(bindings)
-            self._pressed.clear()
-            self._satisfied.clear()
 
     # ==================== 生命周期 ====================
 
@@ -178,7 +173,8 @@ class HotkeyService:
         Windows 按住键不放会重复触发 on_press，但因为该 binding 已在 _satisfied 中，
         重复事件不会再次触发回调。
         """
-        was_new = name not in self._pressed
+        if name in self._pressed:
+            return
         self._pressed.add(name)
 
         for binding in self._bindings:
@@ -189,7 +185,12 @@ class HotkeyService:
             if binding in self._satisfied:
                 continue
             if binding.keys.issubset(self._pressed):
-                self._satisfied.add(binding)
+                # 改绑后的新组合不能抢走同一动作中尚未松手的录音。
+                if binding.action not in _PRESS_ONLY_ACTIONS and any(
+                    active.action == binding.action for active in self._satisfied
+                ):
+                    continue
+                self._satisfied[binding] = None
                 # 在锁外回调以避免回调内若取锁造成死锁；这里先收集 action，
                 # 锁外逐个调用。但为简化并保持边沿原子性，回调约定“不得再次进入
                 # 本 service 的任何持锁路径”，因此直接在锁内调用是安全的且更简单。
@@ -206,14 +207,12 @@ class HotkeyService:
             return
         self._pressed.discard(name)
 
-        for binding in self._bindings:
+        for binding in tuple(self._satisfied):
             if name not in binding.keys:
-                continue
-            if binding not in self._satisfied:
                 continue
             # 该 binding 之前是满配状态；现在 name 被移除，必然不再满配
             # (因为 name 是其构成键之一)。
-            self._satisfied.discard(binding)
+            del self._satisfied[binding]
             # toggle_enabled / cancel 只触发 on_press，不触发 on_release。
             if binding.action in _PRESS_ONLY_ACTIONS:
                 continue

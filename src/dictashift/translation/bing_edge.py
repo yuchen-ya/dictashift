@@ -135,13 +135,13 @@ class BingEdgeBackend(TranslationBackend):
             raise TranslationError(
                 f"Bing auth 请求超时：{type(e).__name__}",
                 status_code=None,
-            ) from e
+            ) from None
         except httpx.TransportError as e:
             logger.warning(f"[Translation/Bing] auth 网络错误：{type(e).__name__}")
             raise TranslationError(
                 f"Bing auth 网络错误：{type(e).__name__}",
                 status_code=None,
-            ) from e
+            ) from None
 
         if response.status_code != 200:
             raise TranslationError(
@@ -214,13 +214,13 @@ class BingEdgeBackend(TranslationBackend):
             raise TranslationError(
                 f"Bing 翻译请求超时：{type(e).__name__}",
                 status_code=None,
-            ) from e
+            ) from None
         except httpx.TransportError as e:
             logger.warning(f"[Translation/Bing] 翻译网络错误：{type(e).__name__}")
             raise TranslationError(
                 f"Bing 翻译网络错误：{type(e).__name__}",
                 status_code=None,
-            ) from e
+            ) from None
 
         if response.status_code == 401:
             # 信号给调用方重试，不在此抛出
@@ -229,10 +229,6 @@ class BingEdgeBackend(TranslationBackend):
         if response.status_code != 200:
             # 安全（开源审查 H1）：错误消息不回显响应体，避免服务端错误页
             # 回显的用户转写文本进入异常消息/日志。
-            logger.debug(
-                "[Translation/Bing] HTTP %s 响应体（截断）：%s",
-                response.status_code, response.text[:200],
-            )
             raise TranslationError(
                 f"Bing 翻译请求失败：HTTP {response.status_code}",
                 status_code=response.status_code,
@@ -244,16 +240,16 @@ class BingEdgeBackend(TranslationBackend):
             raise TranslationError(
                 f"Bing 翻译响应解析失败（非 JSON）：{type(e).__name__}",
                 status_code=None,
-            ) from e
+            ) from None
 
         # 期望结构：data[0].translations[0].text
         try:
             translated = data[0]["translations"][0]["text"]
-        except (IndexError, KeyError, TypeError) as e:
+        except (IndexError, KeyError, TypeError):
             raise TranslationError(
                 "Bing 翻译响应解析失败：结构不符",
                 status_code=None,
-            ) from e
+            ) from None
 
         if not isinstance(translated, str):
             raise TranslationError(

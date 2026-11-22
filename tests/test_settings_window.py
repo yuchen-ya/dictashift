@@ -178,10 +178,12 @@ class TestResetToDefaults:
 
     def test_asr_reset_to_defaults(self, win) -> None:
         s = AppSettings()
-        s.asr = AsrSettings(max_record_seconds=20, mic_device_index=None)
+        s.asr = AsrSettings(max_record_seconds=20, mic_device_index=None, instant_recording=True)
         win.load_from_settings(s)
+        assert win._instant_recording_check.isChecked()
         win.reset_to_defaults()
         assert win._max_record_spin.value() == 60  # AsrSettings 默认
+        assert not win._instant_recording_check.isChecked()
 
     def test_translation_profiles_untouched(self, win) -> None:
         s = AppSettings()
@@ -378,10 +380,12 @@ class TestModelDownloadUi:
         assert win._model_progress.isHidden()
 
     def test_refresh_model_status_shows_installed_when_ready(self, win) -> None:
-        # 仓库 assets 齐全（开发环境），应为"已安装"。
+        # 仓库 assets 齐全（开发环境），应为"已安装"；
+        # 已安装仍保留重新下载按钮（可修复加载失败/损坏的模型）。
         win.refresh_model_status()
         assert "已安装" in win._model_status_label.text()
-        assert win._download_model_btn.isHidden()
+        assert not win._download_model_btn.isHidden()
+        assert win._download_model_btn.text() == "重新下载模型"
 
     def test_refresh_model_status_shows_not_installed_when_missing(
         self, win, monkeypatch
@@ -419,7 +423,8 @@ class TestModelDownloadUi:
         win.on_model_download_complete()
         assert win._model_progress.isHidden()
         assert win._download_model_btn.isEnabled()
-        assert win._download_model_btn.text() == "下载模型"
+        # 开发环境 assets 齐全 -> 就绪态文案为「重新下载模型」。
+        assert win._download_model_btn.text() == "重新下载模型"
         # 状态刷新为已安装（开发环境 assets 齐全）。
         assert "已安装" in win._model_status_label.text()
 
@@ -431,6 +436,27 @@ class TestModelDownloadUi:
         assert win._model_progress.isHidden()
         assert win._download_model_btn.isEnabled()
         assert "网络错误" in win._model_status_label.text()
+        # 未就绪：按钮可见且文案为「下载模型」。
+        assert not win._download_model_btn.isHidden()
+        assert win._download_model_btn.text() == "下载模型"
+
+    def test_on_failed_keeps_redownload_when_models_present(self, win, monkeypatch) -> None:
+        """模型已存在但下载失败：仍显示「重新下载模型」可重试。"""
+        from dictashift.asr import providers as prov
+
+        monkeypatch.setattr(prov, "models_ready", lambda d: True)
+        win.on_model_download_failed("网络错误")
+        assert not win._download_model_btn.isHidden()
+        assert win._download_model_btn.text() == "重新下载模型"
+
+    def test_mark_model_load_failed_shows_redownload_hint(self, win) -> None:
+        """模型存在但加载失败：提示重新下载修复，按钮可用。"""
+        win.mark_model_load_failed("引擎初始化失败")
+        assert "重新下载" in win._model_status_label.text()
+        assert "引擎初始化失败" in win._model_status_label.text()
+        assert not win._download_model_btn.isHidden()
+        assert win._download_model_btn.isEnabled()
+        assert win._download_model_btn.text() == "重新下载模型"
 
 
 # ==================== 开机启动：勾选状态来自注册表 ====================

@@ -92,7 +92,7 @@ class OpenAICompatibleBackend(TranslationBackend):
 
         错误语义：
         - HTTP 状态码非 2xx：抛 TranslationError(status_code=...)；错误消息不含
-          响应体（防止服务端回显用户文本），响应体仅限量读取后写 DEBUG 日志。
+          响应体（防止服务端回显用户文本）。
         - httpx.TransportError / 超时：包装为 TranslationError(status_code=None)。
         - 任何异常信息中不含 api_key 或 Authorization 头内容。
         """
@@ -124,14 +124,6 @@ class OpenAICompatibleBackend(TranslationBackend):
             with httpx.Client(timeout=profile.timeout) as client:
                 with client.stream("POST", endpoint, json=body, headers=headers) as response:
                     if response.status_code >= 400:
-                        # 安全（开源审查 H1/M3）：错误消息不回显响应体
-                        # （服务端可能回显 messages 中的用户转写文本）；
-                        # 响应体仅限量读取后写 DEBUG 日志（默认不输出）。
-                        error_body = self._read_error_body(response)
-                        logger.debug(
-                            "[Translation] HTTP %s 响应体（截断）：%s",
-                            response.status_code, error_body,
-                        )
                         raise TranslationError(
                             f"翻译请求失败：HTTP {response.status_code}",
                             status_code=response.status_code,
@@ -151,14 +143,14 @@ class OpenAICompatibleBackend(TranslationBackend):
             raise TranslationError(
                 f"翻译请求超时：{type(e).__name__}",
                 status_code=None,
-            ) from e
+            ) from None
         except httpx.TransportError as e:
             # 网络错误包装；不含敏感信息
             logger.warning(f"[Translation] 网络错误：{type(e).__name__}")
             raise TranslationError(
                 f"翻译请求网络错误：{type(e).__name__}",
                 status_code=None,
-            ) from e
+            ) from None
 
     def _build_headers(self, profile: TranslationProfile) -> dict:
         """构造请求头。api_key 为空时不带 Authorization。"""
@@ -166,20 +158,3 @@ class OpenAICompatibleBackend(TranslationBackend):
         if profile.api_key:
             headers["Authorization"] = f"Bearer {profile.api_key}"
         return headers
-
-    def _read_error_body(self, response: httpx.Response) -> str:
-        """限量读取错误响应体（最多 1KB），仅用于 DEBUG 日志。
-
-        M3：不用 response.read() 全量读入，防止异常服务端返回超大响应体耗尽内存。
-        """
-        try:
-            chunks = []
-            remaining = 1024
-            for chunk in response.iter_bytes(chunk_size=1024):
-                chunks.append(chunk[:remaining])
-                remaining -= len(chunk)
-                if remaining <= 0:
-                    break
-            return b"".join(chunks).decode("utf-8", errors="replace")[:200]
-        except Exception:  # noqa: BLE001 - 读取错误体失败不应掩盖原始 HTTP 错误
-            return ""

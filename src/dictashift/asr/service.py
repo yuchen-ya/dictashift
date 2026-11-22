@@ -29,7 +29,7 @@ class ASRService:
     """
 
     def __init__(self, model_dir: Path | None = None):
-        self._model_dir = Path(model_dir) if model_dir is not None else default_model_dir()
+        self._model_dir = Path(model_dir) if model_dir is not None else None
         self._lock = threading.Lock()
         self._engine: SenseVoiceInference | None = None
         self._user_device: AsrDevice | None = None
@@ -69,7 +69,7 @@ class ASRService:
         第一版只支持 CPU 推理 (int8 模型)，AUTO 与 CPU 等价，均构建 CPU 引擎。
         warmup 失败时显式释放已创建的 Session，避免遗留资源。
         """
-        model_dir = self._model_dir
+        model_dir = self._model_dir if self._model_dir is not None else default_model_dir()
         encoder_path, decoder_path, tokenizer_path = model_paths(model_dir)
         providers = resolve_providers(device, device_id=device_id)
         config = ASREngineConfig(
