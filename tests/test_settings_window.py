@@ -146,6 +146,96 @@ class TestTranslationPage:
         names = [p.name for p in out.translation.profiles]
         assert "myLLM" in names
 
+    def test_no_temperature_spin_control(self, win) -> None:
+        """翻译页已移除 Temperature 参数控件。"""
+        assert not hasattr(win, "_temperature_spin")
+
+    def test_builtin_hides_custom_form_and_custom_shows_it(self, win) -> None:
+        _load_with_user(win)
+        win._profile_combo.setCurrentIndex(0)  # 内置 Google
+        assert win._custom_form_container.isHidden()
+        assert win._save_new_btn.isHidden()
+        assert not win._builtin_hint_label.isHidden()
+
+        win._profile_combo.setCurrentText("myLLM")
+        assert not win._custom_form_container.isHidden()
+        assert not win._save_new_btn.isHidden()
+        assert win._builtin_hint_label.isHidden()
+
+        win._profile_combo.setCurrentIndex(0)
+        win._new_profile_btn.click()
+        assert not win._custom_form_container.isHidden()
+        assert not win._save_new_btn.isHidden()
+        assert win._builtin_hint_label.isHidden()
+
+    def test_model_combo_manual_fetch_and_fill(self, win) -> None:
+        """点击「获取模型」发出信号、显示加载态；回填模型保留现有输入或自动选第一项。"""
+        _load_with_user(win)
+        win._profile_combo.setCurrentText("myLLM")
+        assert win._model_combo.isEditable()
+
+        seen: list[tuple[str, str, bool]] = []
+        win.fetch_models_requested.connect(lambda u, k, s: seen.append((u, k, s)))
+
+        win._fetch_models_btn.click()
+        assert seen == [("http://x/v1", "k", False)]
+        assert not win._fetch_models_btn.isEnabled()
+
+        # 原模型非空 ("m")：保留现有输入，同时填充下拉选项
+        win.set_fetched_models(True, ["gpt-4o-mini", "gpt-5"], "", silent=False)
+        assert win._fetch_models_btn.isEnabled()
+        assert win._model_edit.text() == "m"
+        assert [win._model_combo.itemText(i) for i in range(win._model_combo.count())] == [
+            "gpt-4o-mini",
+            "gpt-5",
+        ]
+        assert "已获取 2 个模型" in win._test_result_label.text()
+
+        # 原模型为空：自动选中首个可用模型
+        win._model_edit.clear()
+        win.set_fetched_models(True, ["deepseek-chat", "deepseek-reasoner"], "", silent=False)
+        assert win._model_edit.text() == "deepseek-chat"
+
+        # 手动拉取失败：给出友好提示并保留用户手动输入
+        win._model_edit.setText("custom-model")
+        win.set_fetched_models(False, [], "HTTP 404", silent=False)
+        assert "HTTP 404" in win._test_result_label.text()
+        assert win._model_edit.text() == "custom-model"
+
+    def test_auto_silent_fetch_on_endpoint_editing_finished(self, win) -> None:
+        """Base URL / API Key 编辑完成时按条件自动静默拉取，且失败不打扰用户。"""
+        _load_with_user(win)
+        win._new_profile_btn.click()
+        seen: list[tuple[str, str, bool]] = []
+        win.fetch_models_requested.connect(lambda u, k, s: seen.append((u, k, s)))
+
+        # 非法 URL 不触发
+        win._base_url_edit.setText("not-a-url")
+        win._base_url_edit.editingFinished.emit()
+        assert seen == []
+
+        # 合法 URL 触发 silent=True
+        win._base_url_edit.setText("https://api.openai.com/v1")
+        win._api_key_edit.setText("sk-abc")
+        win._base_url_edit.editingFinished.emit()
+        assert seen == [("https://api.openai.com/v1", "sk-abc", True)]
+
+        # 静默失败不显示错误打扰用户
+        prev_text = win._test_result_label.text()
+        win.set_fetched_models(False, [], "连接失败", silent=True)
+        assert win._test_result_label.text() == prev_text
+
+        # 成功后同一 (base_url, api_key) 不重复触发
+        win.set_fetched_models(True, ["gpt-5"], "", silent=True)
+        assert win._model_edit.text() == "gpt-5"
+        win._api_key_edit.editingFinished.emit()
+        assert len(seen) == 1
+
+        # 更改 API Key 后再次触发
+        win._api_key_edit.setText("sk-new")
+        win._api_key_edit.editingFinished.emit()
+        assert seen[-1] == ("https://api.openai.com/v1", "sk-new", True)
+
 
 # ==================== reset_to_defaults ====================
 
@@ -522,12 +612,14 @@ def test_autostart_checkbox_label_has_no_future_version_note(win) -> None:
 
 class TestClearDataButton:
     def test_button_exists_with_danger_style(self, win) -> None:
-        """按钮存在、文案正确、含危险（红色）样式。"""
+        """按钮存在、文案正确、含危险（红色）样式标记。"""
+        from dictashift.ui.theme import DANGER_TEXT, app_stylesheet
+
         assert hasattr(win, "_clear_data_btn")
         btn = win._clear_data_btn
         assert btn.text() == "清除全部数据并退出…"
-        style = btn.styleSheet()
-        assert "#c0392b" in style or "#ff6b6b" in style  # 红色边框/文字
+        assert btn.property("variant") == "danger"
+        assert DANGER_TEXT in app_stylesheet()
 
     def test_cancel_does_not_emit(self, win, monkeypatch) -> None:
         """确认框返回 Cancel -> 不 emit clear_data_requested。"""

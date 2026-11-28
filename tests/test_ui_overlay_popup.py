@@ -97,11 +97,13 @@ class TestOverlayStructureSingleLine:
         assert ov.minimumWidth() <= ov.maximumWidth()
 
     def test_card_has_dark_rounded_stylesheet(self, qapp) -> None:
-        """card 仍保留深色圆角背景；新版 stylesheet 不再含 QPushButton 规则。"""
+        """card 保留现代深色圆角背景与描边；stylesheet 不含 QPushButton 规则。"""
+        from dictashift.ui.theme import CARD_BG
+
         ov = StateOverlay()
         ss = ov._card.styleSheet()
         assert "#overlayCard" in ss
-        assert "rgba(30, 30, 30, 200)" in ss
+        assert CARD_BG in ss
         assert "border-radius: 12px" in ss
         # QLabel 文字色规则保留。
         assert "QLabel" in ss
@@ -385,15 +387,18 @@ class TestResultPopupCardContainer:
 
 
 class TestResultPopupTextColor:
-    def test_text_edit_has_dark_text_color(self, qapp) -> None:
-        """QTextEdit stylesheet 显式指定深色文字（浅底可读）。"""
-        popup = ResultPopup()
-        # 注意：card 容器的 stylesheet 才含 QTextEdit 规则；_text_edit 本身无独立 ss。
+    def test_text_edit_has_dark_surface_and_readable_text(self, qapp) -> None:
+        """QTextEdit 采用深色融洽背景与高对比度浅色文字（无刺眼白底）。"""
         from PySide6.QtWidgets import QWidget
+
+        from dictashift.ui.theme import POPUP_TEXT_BG, POPUP_TEXT_COLOR
+
+        popup = ResultPopup()
         card = [c for c in popup.findChildren(QWidget) if c.objectName() == "popupCard"][0]
         card_ss = card.styleSheet()
         assert "QTextEdit" in card_ss
-        assert "color: #1f2937" in card_ss
+        assert f"background-color: {POPUP_TEXT_BG}" in card_ss
+        assert f"color: {POPUP_TEXT_COLOR}" in card_ss
 
 
 class TestResultPopupAdaptiveSize:

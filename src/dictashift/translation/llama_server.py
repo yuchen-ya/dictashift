@@ -32,5 +32,4 @@ class LlamaServerBackend(OpenAICompatibleBackend):
             base_url=f"http://127.0.0.1:{port}/v1",
             model=model,
             api_key=None,
-            temperature=0.3,
         )

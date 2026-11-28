@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication
 
 from .application import DictaShiftApplication
 from .resources import load_app_icon
+from .ui.theme import app_stylesheet
 
 
 def _default_log_dir() -> Path:
@@ -60,6 +61,8 @@ def main() -> int:
     app.setOrganizationName("DictaShift")
     # 避免在最后一个窗口关闭时退出（托盘常驻）。
     app.setQuitOnLastWindowClosed(False)
+    # 全局现代暗色主题（覆盖设置窗口、托盘 QMenu、QMessageBox、QToolTip 等）。
+    app.setStyleSheet(app_stylesheet())
     # 统一窗口图标（标题栏 + 任务栏）；图标文件缺失时保持 Qt 默认，不阻塞启动。
     icon = load_app_icon()
     if not icon.isNull():

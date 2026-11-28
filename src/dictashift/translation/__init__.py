@@ -11,7 +11,11 @@ from .profiles import (
     builtin_profile_by_name,
     builtin_profile_names,
 )
-from .openai_compatible import OpenAICompatibleBackend
+from .openai_compatible import (
+    OpenAICompatibleBackend,
+    build_no_think_candidates,
+    fetch_available_models,
+)
 from .llama_server import LlamaServerBackend, DEFAULT_LLAMA_PORT
 from .google_free import GoogleFreeBackend
 from .bing_edge import BingEdgeBackend
@@ -26,6 +30,8 @@ __all__ = [
     "TranslationBackend",
     "TranslationError",
     "OpenAICompatibleBackend",
+    "build_no_think_candidates",
+    "fetch_available_models",
     "LlamaServerBackend",
     "GoogleFreeBackend",
     "BingEdgeBackend",

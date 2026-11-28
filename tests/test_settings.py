@@ -11,10 +11,7 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-
-import pytest
 
 from dictashift.settings import (
     AppSettings,
@@ -82,6 +79,20 @@ def test_profile_to_from_dict_round_trip() -> None:
     d = profile_to_dict(p)
     p2 = profile_from_dict(d)
     assert p2 == p
+
+
+def test_profile_default_temperature_none_omitted_in_dict() -> None:
+    """新配置默认 temperature=None，序列化省略该键；旧配置数值仍可兼容读取。"""
+    p = TranslationProfile(name="n", base_url="http://b/v1", model="m")
+    assert p.temperature is None
+    d = profile_to_dict(p)
+    assert "temperature" not in d
+    assert profile_from_dict(d) == p
+    # 兼容旧配置中的数值与非法类型
+    legacy = profile_from_dict({"name": "old", "base_url": "http://b/v1", "model": "m", "temperature": 0.3})
+    assert legacy.temperature == 0.3
+    bad = profile_from_dict({"name": "bad", "base_url": "http://b/v1", "model": "m", "temperature": True})
+    assert bad.temperature is None
 
 
 # ==================== from_dict 缺键 / 忽略未知键 ====================

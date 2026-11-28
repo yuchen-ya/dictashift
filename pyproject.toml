@@ -1,7 +1,7 @@
 [project]
 name = "dictashift"
-version = "0.7.0"
-description = "DictaShift - Windows 常驻桌面语音输入工具（按住 F8 中文听写、按住 F9 中文转英文输入）"
+version = "0.8.0"
+description = "DictaShift - Windows 常驻语音输入与翻译工具（F8 中文听写、F9 中译英、F7 划词翻译、Alt+Q 快速查词）"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11,<3.12"
@@ -10,6 +10,8 @@ authors = [
 ]
 dependencies = [
     "pyside6>=6.7,<7.0",
+    "qtawesome>=1.4,<2.0",
+    "pywinstyles>=1.8,<2.0",
     "sounddevice>=0.5,<1.0",
     "numpy>=1.26,<3.0",
     "sentencepiece>=0.2,<1.0",

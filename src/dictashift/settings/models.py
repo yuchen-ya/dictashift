@@ -28,27 +28,36 @@ def profile_to_dict(profile: TranslationProfile) -> dict:
     """把 TranslationProfile (frozen dataclass) 序列化为 dict。
 
     单独抽出便于 settings 窗口与 repository 共用。
+    temperature 为 None 时省略，保持配置干净；非 None 时保留以兼容旧数据往返。
     """
-    return {
+    data: dict = {
         "name": profile.name,
         "base_url": profile.base_url,
         "model": profile.model,
         "api_key": profile.api_key,
-        "temperature": profile.temperature,
         "timeout": profile.timeout,
         "backend_type": profile.backend_type,
         "direction": profile.direction,
     }
+    if profile.temperature is not None:
+        data["temperature"] = profile.temperature
+    return data
 
 
 def profile_from_dict(d: dict) -> TranslationProfile:
     """从 dict 构造 TranslationProfile，缺失键使用 TranslationProfile 默认值。"""
+    raw_temp = d.get("temperature")
+    temperature = (
+        float(raw_temp)
+        if isinstance(raw_temp, (int, float)) and not isinstance(raw_temp, bool)
+        else None
+    )
     return TranslationProfile(
         name=d.get("name", ""),
         base_url=d.get("base_url", ""),
         model=d.get("model", ""),
         api_key=d.get("api_key"),
-        temperature=d.get("temperature", 0.3),
+        temperature=temperature,
         timeout=d.get("timeout", 60.0),
         # 缺失时默认 openai_compatible（旧配置无感迁移）
         backend_type=d.get("backend_type", "openai_compatible"),
@@ -68,7 +77,6 @@ def default_cloud_profile() -> TranslationProfile:
         base_url="https://api.openai.com/v1",
         model="gpt-4o-mini",
         api_key=None,
-        temperature=0.3,
         timeout=60.0,
     )
 
@@ -81,7 +89,8 @@ class HotkeySettings:
     """快捷键配置（归一化前的配置字符串）。
 
     默认值：dictate_zh=f8, dictate_en=f9, toggle_enabled=ctrl+alt+f12, cancel=esc,
-    selection_translate=f7（划词翻译开关；旧配置缺该键时回退 f7）。
+    selection_translate=f7（划词翻译开关；旧配置缺该键时回退 f7）,
+    quick_lookup=alt+q（快速查词；旧配置缺该键时回退 alt+q）。
     """
 
     dictate_zh: str = "f8"
@@ -89,6 +98,7 @@ class HotkeySettings:
     toggle_enabled: str = "ctrl+alt+f12"
     cancel: str = "esc"
     selection_translate: str = "f7"
+    quick_lookup: str = "alt+q"
 
     def to_dict(self) -> dict:
         return {
@@ -97,6 +107,7 @@ class HotkeySettings:
             "toggle_enabled": self.toggle_enabled,
             "cancel": self.cancel,
             "selection_translate": self.selection_translate,
+            "quick_lookup": self.quick_lookup,
         }
 
     @classmethod
@@ -109,6 +120,7 @@ class HotkeySettings:
             toggle_enabled=d.get("toggle_enabled", "ctrl+alt+f12"),
             cancel=d.get("cancel", "esc"),
             selection_translate=d.get("selection_translate", "f7"),
+            quick_lookup=d.get("quick_lookup", "alt+q"),
         )
 
 

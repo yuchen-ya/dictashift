@@ -33,8 +33,10 @@ logger = logging.getLogger(__name__)
 
 # 只触发 on_press、不触发 on_release 的 action 集合。
 # 这些是“瞬时切换/取消/单次触发”语义，松开边沿没有业务意义。
-# selection_translate：划词翻译手动触发，按一次执行一次，无按住/松开语义。
-_PRESS_ONLY_ACTIONS = frozenset({"toggle_enabled", "cancel", "selection_translate"})
+# selection_translate：划词翻译开关；quick_lookup：快速查词唤起/关闭。
+_PRESS_ONLY_ACTIONS = frozenset(
+    {"toggle_enabled", "cancel", "selection_translate", "quick_lookup"}
+)
 
 
 def _normalize_from_pynput(key) -> str | None:

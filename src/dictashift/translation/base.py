@@ -17,7 +17,8 @@ class TranslationProfile:
     base_url: str          # 例如 http://127.0.0.1:19120/v1 或云端地址
     model: str
     api_key: str | None = None
-    temperature: float = 0.3
+    # 向后兼容保留字段（默认 None，且 OpenAI 兼容请求不再默认发送 temperature）
+    temperature: float | None = None
     timeout: float = 60.0
     # 后端类型路由：openai_compatible | google | bing
     # 默认 openai_compatible 保证旧配置/旧代码构造不受影响。

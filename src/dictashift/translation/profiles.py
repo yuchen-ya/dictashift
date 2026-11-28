@@ -73,11 +73,10 @@ def build_translate_en_profile(
     api_key: str | None = None,
     name: str = "中译英",
 ) -> TranslationProfile:
-    """构造中译英档案（temperature=0.3）。"""
+    """构造中译英档案。"""
     return TranslationProfile(
         name=name,
         base_url=base_url,
         model=model,
         api_key=api_key,
-        temperature=0.3,
     )

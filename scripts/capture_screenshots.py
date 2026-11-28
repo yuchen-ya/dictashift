@@ -30,6 +30,11 @@ _POPUP_RESULT_TEXT = (
     "这是一次语音识别的结果文本。直输失败时会弹出此卡片，"
     "点击「复制」按钮将文本写入剪贴板。"
 )
+# 快速查词示例文本（中译英真实使用场景）。
+_QUICK_LOOKUP_SOURCE = "请帮我把这段技术方案整理成简洁的英文摘要"
+_QUICK_LOOKUP_RESULT = (
+    "Please organize this technical proposal into a concise English summary."
+)
 
 
 def _grab(widget, name: str) -> None:
@@ -126,12 +131,33 @@ def capture_result_popup() -> None:
     popup.close()
 
 
+def capture_quick_lookup() -> None:
+    """快速查词居中浮窗（中译英完成态）。"""
+    from dictashift.ui.quick_lookup_popup import QuickLookupPopup
+
+    popup = QuickLookupPopup()
+    popup.open_lookup(_QUICK_LOOKUP_SOURCE)
+    popup._input.deselect()
+    popup.show_result(
+        popup.request_seq,
+        _QUICK_LOOKUP_RESULT,
+        actual_direction="zh2en",
+    )
+    QTest.qWait(250)
+    _grab(popup, "quick-lookup.png")
+    popup.close()
+
+
 def main() -> int:
+    from dictashift.ui.theme import app_stylesheet
+
     app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyleSheet(app_stylesheet())
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
     capture_settings_tabs()
     capture_overlays()
     capture_result_popup()
+    capture_quick_lookup()
     app.quit()
     print("全部截图完成 ->", IMAGES_DIR)
     return 0

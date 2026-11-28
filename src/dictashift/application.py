@@ -3,7 +3,7 @@
 职责 (AGENTS.md 5.1 / 5.3 / 5.5 / 11)：
 - 持有 QApplication、SettingsRepository、AppSettings、ASRService、AudioRecorder、
   DispatcherBackend、ApplicationController、HotkeyService、TrayIcon、Overlay、
-  SettingsWindow、ResultPopup、SelectionService、SelectionPopup。
+  SettingsWindow、ResultPopup、SelectionService、SelectionPopup、QuickLookupPopup。
 - ControllerCallbacks 在 worker/pynput 线程触发，必须用 Qt queued signal 桥接到
   主线程；本层用内部 _Bridge QObject 定义 signals，回调 emit 这些 signal，
   并以 Qt.QueuedConnection 连接到主线程槽。
@@ -24,10 +24,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import dataclasses
 import logging
 import queue
 import shutil
+import sys
 import threading
 import time
 
@@ -42,15 +44,24 @@ from .hotkeys.matcher import HotkeyBinding, parse_hotkey
 from .hotkeys.service import HotkeyService
 from .output.typing import type_text_at_cursor
 from .personalize import build_personalize_processor
-from .selection import CaptureResult, CaptureStatus, SelectionService
+from .selection import CaptureResult, CaptureStatus, SelectionService, capture_selection
 from .settings import AppSettings, SettingsRepository
 from .settings.repository import app_data_dir
-from .translation import DispatcherBackend, TranslationError, TranslationProfile, builtin_free_profiles
+from .translation import (
+    BUILTIN_GOOGLE,
+    DispatcherBackend,
+    TranslationError,
+    TranslationProfile,
+    builtin_free_profiles,
+    fetch_available_models,
+)
 from .translation.langdetect import detect_direction
 from .ui.overlay import StateOverlay
+from .ui.quick_lookup_popup import QuickLookupPopup
 from .ui.result_popup import ResultPopup
 from .ui.selection_popup import SelectionPopup
 from .ui.settings_window import SettingsWindow
+from .ui.theme import app_stylesheet
 from .ui.tray import TrayIcon
 
 logger = logging.getLogger(__name__)
@@ -59,6 +70,53 @@ logger = logging.getLogger(__name__)
 # 首次失败后间隔重试一次，再失败才弹错误卡片。
 _SELECTION_RETRY_DELAY_S = 0.8
 _MAX_SELECTION_WORKERS = 2
+# 快速查词热键取词等待上限（秒）：无选区时尽快回退空白输入框，保持响应轻快。
+_QUICK_LOOKUP_CAPTURE_TIMEOUT_S = 0.25
+# 快速查词并发翻译上限（与划词翻译一致，超出时保留最新待执行请求，丢弃中间过期请求）。
+_MAX_QUICK_LOOKUP_WORKERS = 2
+
+# 修饰键虚拟键码：Alt / Ctrl / Shift / Left Win / Right Win。
+# 触发快速查词（如 Alt+Q）时等待物理修饰键松开再模拟 Ctrl+C，防止污染成 Ctrl+Alt+C。
+_MODIFIER_VKS: tuple[int, ...] = (
+    0x12,  # VK_MENU (Alt)
+    0x11,  # VK_CONTROL (Ctrl)
+    0x10,  # VK_SHIFT (Shift)
+    0x5B,  # VK_LWIN
+    0x5C,  # VK_RWIN
+)
+
+
+# ==================== Win32 修饰键辅助（可 mock） ====================
+
+if sys.platform == "win32":
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)  # type: ignore[attr-defined]
+    _user32.GetAsyncKeyState.restype = ctypes.c_short
+    _user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+else:  # pragma: no cover
+    _user32 = None
+
+
+def _wait_modifiers_released(
+    timeout_s: float = 0.35,
+    poll_interval_s: float = 0.01,
+) -> bool:
+    """轮询等待物理修饰键（Alt/Ctrl/Shift/Win）全部释放，避免污染模拟 Ctrl+C。
+
+    返回 True 表示全部已释放（或非 Windows 平台无需等待），False 表示超时仍有键按下。
+    """
+    if _user32 is None:
+        return True
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        try:
+            all_up = all((_user32.GetAsyncKeyState(vk) & 0x8000) == 0 for vk in _MODIFIER_VKS)
+        except Exception:  # noqa: BLE001
+            return True
+        if all_up:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval_s)
 
 
 # ==================== 回调 -> 主线程桥接 ====================
@@ -78,24 +136,30 @@ class _Bridge(QObject):
     mic_warmup_failed = Signal()
     asr_ready = Signal(bool)               # ASR 后台 initialize 完成（无论成败）
     test_conn_result = Signal(bool, str)  # 翻译测试连接结果（ok, message）
+    models_fetched = Signal(int, bool, object, str, bool, str)  # seq, ok, models, message, silent, base_url
     model_progress = Signal(int)       # 模型下载进度百分比（<0 表示总大小未知）
     model_download_done = Signal(bool, str)  # 模型下载完成（ok, message）
     selection_toggle = Signal()      # 划词翻译开关热键按下（pynput 线程 emit）
     press_activity = Signal()        # 任意左键按下（用于立即收起划词弹窗）
     selection_result = Signal(int, str)     # 划词翻译译文
     selection_error = Signal(int, str)      # 划词翻译错误提示（简短脱敏）
+    quick_lookup_trigger = Signal()         # 快速查词热键按下（pynput 线程 emit）
+    quick_lookup_captured = Signal(int, str)       # 后台取词结果（token, text）
+    quick_lookup_result = Signal(int, str, str)    # 快速查词译文（req_id, translated, direction）
+    quick_lookup_error = Signal(int, str)          # 快速查词错误（req_id, message）
 
 
 # ==================== action 名称 <-> settings hotkeys 字段 ====================
 
 # controller 约定的 action 名 <-> AppSettings.hotkeys 字段名。
-# selection_translate 不进 controller：由 application 层直接路由到 SelectionService。
+# selection_translate / quick_lookup 不进 controller：由 application 层直接路由。
 _ACTION_HOTKEY_FIELD = {
     "dictate_zh": "dictate_zh",
     "dictate_en": "dictate_en",
     "toggle_enabled": "toggle_enabled",
     "cancel": "cancel",
     "selection_translate": "selection_translate",
+    "quick_lookup": "quick_lookup",
 }
 
 
@@ -112,6 +176,8 @@ class DictaShiftApplication:
 
     def __init__(self, app: QApplication) -> None:
         self._app = app
+        if not app.styleSheet():
+            app.setStyleSheet(app_stylesheet())
         self._repo = SettingsRepository()
         self.settings: AppSettings = self._repo.load()
 
@@ -170,10 +236,20 @@ class DictaShiftApplication:
         # ---- UI ----
         self._overlay = StateOverlay()
         self._tray = TrayIcon()
+        self._tray.set_quick_lookup_hotkey(self.settings.hotkeys.quick_lookup)
         self._settings_window = SettingsWindow()
         self._settings_window.load_from_settings(self.settings)
         # 直输失败的结果弹窗：主线程创建，经 queued signal 调用 show_result。
         self._result_popup = ResultPopup()
+        # 快速查词居中浮窗：主线程创建，与后台取词/翻译协同工作。
+        self._quick_lookup_popup = QuickLookupPopup()
+        self._quick_lookup_lock = threading.Lock()
+        self._quick_lookup_visible = False
+        self._quick_lookup_capturing = False
+        self._quick_lookup_capture_seq = 0
+        self._quick_lookup_req_seq = 0
+        self._quick_lookup_workers = 0
+        self._quick_lookup_pending: tuple[int, str, str] | None = None
 
         # ---- 划词翻译：取词服务 + 悬浮卡片 ----
         # 悬浮卡片在主线程创建，经 queued signal 驱动（show_result/show_error）。
@@ -197,9 +273,11 @@ class DictaShiftApplication:
         self._selection_workers = 0
         self._selection_pending: tuple[str, int] | None = None
 
-        # ---- ASR 初始化/重检测/翻译测试 的线程引用（daemon，不 join）----
+        # ---- ASR 初始化/重检测/翻译测试/模型拉取 的线程引用与防乱序状态 ----
         self._asr_init_thread: threading.Thread | None = None
         self._model_install_lock = threading.Lock()
+        self._fetch_models_seq = 0
+        self._fetch_models_lock = threading.Lock()
 
         # 「清除全部数据并退出」流程标记：True 时 shutdown 跳过 repo.save（避免重建
         # settings.json）。
@@ -220,6 +298,9 @@ class DictaShiftApplication:
         self._bridge.test_conn_result.connect(
             self._settings_window.set_test_connection_result, Qt.QueuedConnection
         )
+        self._bridge.models_fetched.connect(
+            self._on_models_fetched, Qt.QueuedConnection
+        )
         self._bridge.model_progress.connect(
             self._settings_window.set_model_download_progress, Qt.QueuedConnection
         )
@@ -239,11 +320,38 @@ class DictaShiftApplication:
         self._bridge.selection_error.connect(
             self._on_selection_error_ready, Qt.QueuedConnection
         )
+        # 快速查词：热键/取词/翻译线程 -> 主线程居中浮窗。
+        self._bridge.quick_lookup_trigger.connect(
+            self._on_quick_lookup_hotkey, Qt.QueuedConnection
+        )
+        self._bridge.quick_lookup_captured.connect(
+            self._on_quick_lookup_captured, Qt.QueuedConnection
+        )
+        self._bridge.quick_lookup_result.connect(
+            self._on_quick_lookup_result_ready, Qt.QueuedConnection
+        )
+        self._bridge.quick_lookup_error.connect(
+            self._on_quick_lookup_error_ready, Qt.QueuedConnection
+        )
 
         # 托盘
+        self._tray.quick_lookup_requested.connect(
+            self._on_tray_quick_lookup, Qt.QueuedConnection
+        )
         self._tray.toggle_enabled_requested.connect(self._on_tray_toggle, Qt.QueuedConnection)
         self._tray.settings_requested.connect(self._open_settings, Qt.QueuedConnection)
         self._tray.quit_requested.connect(self._app.quit, Qt.QueuedConnection)
+
+        # 快速查词浮窗
+        self._quick_lookup_popup.translate_requested.connect(
+            self._on_quick_lookup_translate
+        )
+        self._quick_lookup_popup.request_cancelled.connect(
+            self._on_quick_lookup_cancelled
+        )
+        self._quick_lookup_popup.visibility_changed.connect(
+            self._on_quick_lookup_visibility_changed
+        )
 
         # 设置窗口
         self._settings_window.applied.connect(self._on_settings_applied, Qt.QueuedConnection)
@@ -252,6 +360,9 @@ class DictaShiftApplication:
         )
         self._settings_window.test_connection_requested.connect(
             self._on_test_connection, Qt.QueuedConnection
+        )
+        self._settings_window.fetch_models_requested.connect(
+            self._on_fetch_models_requested, Qt.QueuedConnection
         )
         self._settings_window.model_download_requested.connect(
             self._on_model_download_requested, Qt.QueuedConnection
@@ -304,6 +415,13 @@ class DictaShiftApplication:
             self._stop_selection_service()
         except Exception:  # noqa: BLE001
             logger.exception("[DictaShiftApplication] selection stop 异常")
+        try:
+            popup = getattr(self, "_quick_lookup_popup", None)
+            if popup is not None:
+                popup.close()
+            self._set_quick_lookup_visible(False)
+        except Exception:  # noqa: BLE001
+            logger.exception("[DictaShiftApplication] quick_lookup_popup close 异常")
         # 投递哨兵并等待消费线程处理完排队事件（尤其 release），保证在
         # controller shutdown 前已结束录音/启动 worker；2s 超时兜底避免卡死。
         try:
@@ -367,6 +485,13 @@ class DictaShiftApplication:
             self._stop_selection_service()
         except Exception:  # noqa: BLE001
             logger.exception("[DictaShiftApplication] clear_data: selection stop 异常")
+        try:
+            popup = getattr(self, "_quick_lookup_popup", None)
+            if popup is not None:
+                popup.close()
+            self._set_quick_lookup_visible(False)
+        except Exception:  # noqa: BLE001
+            logger.exception("[DictaShiftApplication] clear_data: quick_lookup_popup close 异常")
         try:
             self._controller.shutdown()
         except Exception:  # noqa: BLE001
@@ -559,6 +684,16 @@ class DictaShiftApplication:
         if action == "selection_translate":
             self._bridge.selection_toggle.emit()
             return
+        if action == "quick_lookup":
+            self._bridge.quick_lookup_trigger.emit()
+            return
+        if action == "cancel":
+            # 查词浮窗可见时 Esc 由浮窗自身消费以关闭弹窗，避免穿透误取消后台听写流水线。
+            ql_lock = getattr(self, "_quick_lookup_lock", None)
+            if ql_lock is not None:
+                with ql_lock:
+                    if getattr(self, "_quick_lookup_visible", False):
+                        return
         self._hotkey_queue.put(("press", action))
 
     def _on_hotkey_release(self, action: str) -> None:
@@ -567,10 +702,10 @@ class DictaShiftApplication:
         松开事件及时入队（不阻塞），消费线程随后按序调 controller.handle_hotkey_release
         结束录音，避免松手后仍在录音。
 
-        selection_translate 无按住/松开语义（press-only action，正常不会收到
-        release；防御性忽略，绝不进入 controller）。
+        selection_translate / quick_lookup 无按住/松开语义（press-only action，
+        正常不会收到 release；防御性忽略，绝不进入 controller）。
         """
-        if action == "selection_translate":
+        if action in ("selection_translate", "quick_lookup"):
             return
         self._hotkey_queue.put(("release", action))
 
@@ -598,6 +733,178 @@ class DictaShiftApplication:
         UI 主线程调用会卡顿；统一走队列由消费线程执行。
         """
         self._hotkey_queue.put(("press", "toggle_enabled"))
+
+    # ==================== 快速查词 ====================
+
+    def _set_quick_lookup_visible(self, visible: bool) -> None:
+        ql_lock = getattr(self, "_quick_lookup_lock", None)
+        if ql_lock is None:
+            return
+        with ql_lock:
+            self._quick_lookup_visible = bool(visible)
+
+    def _on_quick_lookup_visibility_changed(self, visible: bool) -> None:
+        """浮窗显隐变化（主线程槽）：同步线程安全标志，供 pynput 线程抑制 Esc 穿透。"""
+        self._set_quick_lookup_visible(visible)
+
+    def _on_quick_lookup_cancelled(self, seq: int) -> None:
+        """浮窗清空输入或隐藏（主线程槽）：推进请求序号并清掉排队任务，使重试线程提前退出。"""
+        with self._quick_lookup_lock:
+            if seq > self._quick_lookup_req_seq:
+                self._quick_lookup_req_seq = seq
+            else:
+                self._quick_lookup_req_seq += 1
+            self._quick_lookup_pending = None
+
+    def _on_quick_lookup_hotkey(self) -> None:
+        """快速查词热键（主线程槽）：已可见则隐藏 toggle；否则后台尝试取词。"""
+        if self._quick_lookup_popup.isVisible():
+            with self._quick_lookup_lock:
+                self._quick_lookup_capture_seq += 1
+                self._quick_lookup_capturing = False
+                self._quick_lookup_visible = False
+            self._quick_lookup_popup.hide()
+            return
+
+        with self._quick_lookup_lock:
+            if self._quick_lookup_capturing:
+                return
+            self._quick_lookup_capturing = True
+            self._quick_lookup_capture_seq += 1
+            token = self._quick_lookup_capture_seq
+
+        threading.Thread(
+            target=self._run_quick_lookup_capture,
+            args=(token,),
+            name="dictashift-quick-lookup-capture",
+            daemon=True,
+        ).start()
+
+    def _run_quick_lookup_capture(self, token: int) -> None:
+        """后台线程先等修饰键释放，再尝试抓取当前选中文本（无损剪贴板与终端安全）。"""
+        text = ""
+        stale = False
+        try:
+            _wait_modifiers_released()
+            with self._quick_lookup_lock:
+                if token != self._quick_lookup_capture_seq:
+                    stale = True
+                    return
+            result = capture_selection(wait_timeout_s=_QUICK_LOOKUP_CAPTURE_TIMEOUT_S)
+            if result.status is CaptureStatus.SUCCESS and result.text and result.text.strip():
+                text = result.text.strip()
+        except Exception:  # noqa: BLE001 - 取词异常降级为空白打开
+            logger.exception("[DictaShiftApplication] 快速查词取词异常，降级空白打开")
+        finally:
+            with self._quick_lookup_lock:
+                if token == self._quick_lookup_capture_seq:
+                    self._quick_lookup_capturing = False
+        if not stale:
+            self._bridge.quick_lookup_captured.emit(token, text)
+
+    def _on_quick_lookup_captured(self, token: int, text: str) -> None:
+        """取词完成（queued 主线程）：校验代次后打开查词浮窗。"""
+        with self._quick_lookup_lock:
+            if token != self._quick_lookup_capture_seq:
+                return
+            self._quick_lookup_visible = True
+        self._quick_lookup_popup.open_lookup(initial_text=text or None)
+
+    def _on_tray_quick_lookup(self) -> None:
+        """托盘菜单「快速查词」（主线程槽）：跳过选区抓取，直接打开空白查词浮窗。"""
+        with self._quick_lookup_lock:
+            self._quick_lookup_capture_seq += 1
+            self._quick_lookup_capturing = False
+            self._quick_lookup_visible = True
+        self._quick_lookup_popup.open_lookup(initial_text=None)
+
+    def _quick_lookup_is_current(self, request_id: int) -> bool:
+        with self._quick_lookup_lock:
+            return request_id == self._quick_lookup_req_seq
+
+    def _on_quick_lookup_translate(
+        self, request_id: int, text: str, direction: str
+    ) -> None:
+        """浮窗请求查词翻译（主线程槽）：受并发上限保护的后台线程执行，绝不阻塞 UI。"""
+        with self._quick_lookup_lock:
+            self._quick_lookup_req_seq = max(self._quick_lookup_req_seq, request_id)
+            self._quick_lookup_pending = None
+            if self._quick_lookup_workers >= _MAX_QUICK_LOOKUP_WORKERS:
+                self._quick_lookup_pending = (request_id, text, direction)
+                return
+            self._quick_lookup_workers += 1
+        threading.Thread(
+            target=self._run_quick_lookup_worker,
+            args=(request_id, text, direction),
+            name="dictashift-quick-lookup-translate",
+            daemon=True,
+        ).start()
+
+    def _run_quick_lookup_worker(
+        self, request_id: int, text: str, direction: str
+    ) -> None:
+        while True:
+            if self._quick_lookup_is_current(request_id):
+                translated, message = self._translate_quick_lookup(
+                    request_id, text, direction
+                )
+                if self._quick_lookup_is_current(request_id):
+                    if translated is not None:
+                        self._bridge.quick_lookup_result.emit(
+                            request_id, translated, direction
+                        )
+                    elif message is not None:
+                        self._bridge.quick_lookup_error.emit(request_id, message)
+            with self._quick_lookup_lock:
+                pending = self._quick_lookup_pending
+                self._quick_lookup_pending = None
+                if pending is None:
+                    self._quick_lookup_workers -= 1
+                    return
+            request_id, text, direction = pending
+
+    def _translate_quick_lookup(
+        self, request_id: int, text: str, direction: str
+    ) -> tuple[str | None, str | None]:
+        """复用当前翻译后端执行查词翻译；未配置付费档案时无缝回退免费 Google/Bing 互切。"""
+        try:
+            profile = self._controller.get_active_profile()
+            if profile is None:
+                profile = BUILTIN_GOOGLE
+            directed = dataclasses.replace(profile, direction=direction)
+            try:
+                translated = self._backend.translate(text, directed)
+            except Exception as exc:
+                logger.warning(
+                    "[DictaShiftApplication] 快速查词翻译首次失败: %s", type(exc).__name__
+                )
+                if not self._quick_lookup_is_current(request_id):
+                    return None, None
+                time.sleep(_SELECTION_RETRY_DELAY_S)
+                if not self._quick_lookup_is_current(request_id):
+                    return None, None
+                translated = self._backend.translate(text, directed)
+        except Exception as exc:
+            logger.warning("[DictaShiftApplication] 快速查词翻译失败: %s", type(exc).__name__)
+            message = (
+                str(exc)
+                if isinstance(exc, TranslationError)
+                else "请检查翻译服务配置或网络连接"
+            )
+            return None, f"翻译失败：{message}"
+        if not translated or not translated.strip():
+            return None, "翻译失败：空响应"
+        return translated.strip(), None
+
+    def _on_quick_lookup_result_ready(
+        self, request_id: int, translated: str, direction: str
+    ) -> None:
+        if self._quick_lookup_is_current(request_id):
+            self._quick_lookup_popup.show_result(request_id, translated, direction)
+
+    def _on_quick_lookup_error_ready(self, request_id: int, message: str) -> None:
+        if self._quick_lookup_is_current(request_id):
+            self._quick_lookup_popup.show_error(request_id, message)
 
     # ==================== 划词翻译 ====================
 
@@ -778,8 +1085,10 @@ class DictaShiftApplication:
         except Exception:  # noqa: BLE001
             logger.exception("[DictaShiftApplication] 保存设置失败")
 
-        # 更新热键绑定（无需重启 listener）
+        # 更新热键绑定（无需重启 listener）并同步托盘快捷键提示
         self._hotkeys.update_bindings(self._bindings_from_settings(self.settings))
+        if hasattr(self._tray, "set_quick_lookup_hotkey"):
+            self._tray.set_quick_lookup_hotkey(self.settings.hotkeys.quick_lookup)
 
         # 更新翻译 profiles：内置免登录项 + 用户 LLM profiles
         self._controller.set_translation_profiles(
@@ -841,6 +1150,65 @@ class DictaShiftApplication:
 
         t = threading.Thread(target=_worker, name="dictashift-test-conn", daemon=True)
         t.start()
+
+    def _on_fetch_models_requested(
+        self, base_url: str, api_key: str, silent: bool
+    ) -> None:
+        """设置窗口拉取可用模型：后台请求 /models，递增序号防止过期结果覆盖最新结果。"""
+        lock = getattr(self, "_fetch_models_lock", None)
+        if lock is not None:
+            with lock:
+                self._fetch_models_seq = getattr(self, "_fetch_models_seq", 0) + 1
+                seq = self._fetch_models_seq
+        else:
+            self._fetch_models_seq = getattr(self, "_fetch_models_seq", 0) + 1
+            seq = self._fetch_models_seq
+
+        def _worker() -> None:
+            try:
+                models = fetch_available_models(base_url, api_key or None)
+                ok = True
+                msg = ""
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[DictaShiftApplication] 获取模型列表失败: %s", type(e).__name__
+                )
+                models = []
+                ok = False
+                msg = (
+                    str(e)
+                    if isinstance(e, TranslationError)
+                    else "请检查 Base URL 或网络连接"
+                )
+            self._bridge.models_fetched.emit(seq, ok, models, msg, silent, base_url)
+
+        t = threading.Thread(
+            target=_worker, name="dictashift-fetch-models", daemon=True
+        )
+        t.start()
+
+    def _on_models_fetched(
+        self,
+        seq: int,
+        ok: bool,
+        models: object,
+        message: str,
+        silent: bool,
+        base_url: str = "",
+    ) -> None:
+        """可用模型拉取结果（queued 主线程）：仅回填最新请求序号的结果。"""
+        lock = getattr(self, "_fetch_models_lock", None)
+        if lock is not None:
+            with lock:
+                current = getattr(self, "_fetch_models_seq", 0)
+        else:
+            current = getattr(self, "_fetch_models_seq", 0)
+        if seq != current:
+            return
+        model_list = list(models) if isinstance(models, (list, tuple)) else []
+        self._settings_window.set_fetched_models(
+            ok, model_list, message, silent=silent, base_url=base_url or None
+        )
 
     def _on_model_download_requested(self) -> None:
         """设置窗口「下载模型」：后台线程下载到 user_model_dir()。

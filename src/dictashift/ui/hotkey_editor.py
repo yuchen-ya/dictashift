@@ -13,6 +13,7 @@ QKeySequence 文本格式（Qt 默认 PortableSeries）：
 
 from __future__ import annotations
 
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (
     QBoxLayout,
@@ -21,6 +22,9 @@ from PySide6.QtWidgets import (
     QPushButton,
     QWidget,
 )
+
+from .icons import get_icon
+from .theme import TEXT_PRIMARY, TEXT_SECONDARY
 
 # QKeySequence 文本中的修饰键前缀 -> 配置格式名称。
 # 顺序无关：我们按 '+' 拆分后逐个 token 映射。
@@ -86,7 +90,7 @@ def sequence_to_config(seq: QKeySequence) -> str:
 
 
 class HotkeyEdit(QWidget):
-    """快捷键编辑控件：QKeySequenceEdit + 「清除」按钮。
+    """现代胶囊风格快捷键编辑控件：QKeySequenceEdit + 矢量图标清除按钮。
 
     用法：
         edit = HotkeyEdit()
@@ -96,12 +100,28 @@ class HotkeyEdit(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setObjectName("hotkeyEdit")
+
         self._seq_edit = QKeySequenceEdit(self)
-        self._clear_btn = QPushButton("清除", self)
+        self._seq_edit.setMinimumWidth(148)
+        self._seq_edit.setFixedHeight(32)
+
+        self._clear_btn = QPushButton("", self)
+        self._clear_btn.setProperty("variant", "icon")
+        self._clear_btn.setToolTip("清除快捷键")
+        self._clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._clear_btn.setFixedSize(32, 32)
+        clear_icon = get_icon("clear", color=TEXT_SECONDARY, color_active=TEXT_PRIMARY)
+        if not clear_icon.isNull():
+            self._clear_btn.setIcon(clear_icon)
+            self._clear_btn.setIconSize(QSize(14, 14))
+        else:
+            self._clear_btn.setText("×")
         self._clear_btn.clicked.connect(self._on_clear)
 
         layout: QBoxLayout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
         layout.addWidget(self._seq_edit, stretch=1)
         layout.addWidget(self._clear_btn)
 

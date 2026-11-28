@@ -19,8 +19,6 @@ import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import pytest
-
 from dictashift.application import DictaShiftApplication
 from dictashift.core.state import AppState
 from dictashift.settings.models import AppSettings, UiSettings
@@ -168,6 +166,22 @@ class _FakeSignal:
 class _FakeBridge:
     def __init__(self) -> None:
         self.test_conn_result = _FakeSignal()
+        self.models_fetched = _FakeSignal()
+
+
+class _FakeSettingsWindow:
+    def __init__(self) -> None:
+        self.fetched_calls: list[tuple[bool, list[str], str, bool, str | None]] = []
+
+    def set_fetched_models(
+        self,
+        ok: bool,
+        models: list[str],
+        message: str,
+        silent: bool = False,
+        base_url: str | None = None,
+    ) -> None:
+        self.fetched_calls.append((ok, models, message, silent, base_url))
 
 
 def test_on_test_connection_runs_worker_and_emits_result() -> None:
@@ -191,3 +205,74 @@ def test_on_test_connection_runs_worker_and_emits_result() -> None:
     ok, msg = app._bridge.test_conn_result.emitted[0]
     assert ok is True
     assert msg == "hello"
+
+
+def test_fetch_models_runs_in_background_and_drops_stale_seq(monkeypatch) -> None:
+    """后台拉取可用模型并通过递增序号丢弃乱序过期结果。"""
+    import threading
+    from dictashift import application as app_mod
+
+    monkeypatch.setattr(
+        app_mod,
+        "fetch_available_models",
+        lambda base_url, api_key=None: ["gpt-4o-mini", "gpt-5"],
+    )
+
+    app = DictaShiftApplication.__new__(DictaShiftApplication)
+    app._bridge = _FakeBridge()
+    app._settings_window = _FakeSettingsWindow()
+    app._fetch_models_seq = 0
+    app._fetch_models_lock = threading.Lock()
+
+    app._on_fetch_models_requested("https://api.openai.com/v1", "sk-x", False)
+    assert app._bridge.models_fetched.event.wait(timeout=5.0)
+    seq, ok, models, msg, silent, base_url = app._bridge.models_fetched.emitted[0]
+    assert seq == 1
+    assert ok is True
+    assert models == ["gpt-4o-mini", "gpt-5"]
+    assert silent is False
+    assert base_url == "https://api.openai.com/v1"
+
+    # 模拟旧序号迟到：推进当前序号到 2 后，seq=1 应被丢弃
+    app._fetch_models_seq = 2
+    app._on_models_fetched(seq, ok, models, msg, silent, base_url)
+    assert app._settings_window.fetched_calls == []
+
+    # 最新序号 2 正常回填（附带 base_url）
+    app._on_models_fetched(2, True, ["qwen3-8b"], "", True, "http://127.0.0.1:19120/v1")
+    assert app._settings_window.fetched_calls == [
+        (True, ["qwen3-8b"], "", True, "http://127.0.0.1:19120/v1")
+    ]
+
+
+def test_settings_window_set_fetched_models_ignores_mismatched_base_url() -> None:
+    """快速切换自定义档案时，旧 Base URL 迟到的 /models 结果不应污染当前下拉框。"""
+    from PySide6.QtWidgets import QApplication
+    from dictashift.translation import TranslationProfile
+    from dictashift.ui.settings_window import SettingsWindow
+
+    _app = QApplication.instance() or QApplication([])
+    win = SettingsWindow()
+    s = AppSettings()
+    s.translation.profiles = [
+        TranslationProfile(name="A", base_url="https://api-a.example/v1", model="model-a"),
+        TranslationProfile(name="B", base_url="https://api-b.example/v1", model="model-b"),
+    ]
+    s.translation.active_profile = "B"
+    win.load_from_settings(s)
+
+    # 迟到的 A 档案结果应被忽略
+    win.set_fetched_models(
+        True, ["stale-model-a"], "", silent=True, base_url="https://api-a.example/v1"
+    )
+    items = [win._model_combo.itemText(i) for i in range(win._model_combo.count())]
+    assert "stale-model-a" not in items
+    assert win._model_edit.text() == "model-b"
+
+    # 匹配 B 档案的结果正常填充
+    win.set_fetched_models(
+        True, ["model-b", "model-b-pro"], "", silent=True, base_url="https://api-b.example/v1"
+    )
+    items = [win._model_combo.itemText(i) for i in range(win._model_combo.count())]
+    assert items == ["model-b", "model-b-pro"]
+    win.close()
